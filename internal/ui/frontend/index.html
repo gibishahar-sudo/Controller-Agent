@@ -1,0 +1,967 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Controller Client</title>
+<style>
+:root{
+  --bg-dark:#1A1A1A; --bg-medium:#252525; --bg-light:#333333; --bg-input:#1E1E1E;
+  --border:#555555; --border-light:#444; --fg:#CCCCCC; --fg-dim:#888888; --fg-bright:#E8E8E8;
+  --accent:#0E639C; --accent-hover:#1177BB; --success:#8BC34A; --warn:#FFC107; --error:#FF6B6B; --offline:#FF6B6B;
+  --term-bg:#0C0C0C; --blue:#569CD6; --green:#8BC34A; --gold:#FFD700; --cyan:#4EC9B0; --purple:#C586C0;
+}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0;padding:0;background:var(--bg-dark);color:var(--fg);font-family:Consolas, 'Cascadia Code', monospace;font-size:13px;overflow:hidden}
+a{color:#6EC1FF;text-decoration:none}
+a:hover{text-decoration:underline}
+::-webkit-scrollbar{width:8px;height:8px}
+::-webkit-scrollbar-track{background:var(--bg-dark)}
+::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px}
+::-webkit-scrollbar-thumb:hover{background:#666}
+
+/* Layout */
+.app{display:flex;height:100vh;width:100vw}
+.sidebar{width:260px;min-width:260px;background:var(--bg-medium);border-right:1px solid var(--border);display:flex;flex-direction:column;padding:10px;gap:8px;overflow:hidden}
+.sidebar h2{margin:4px 0 8px 0;font-size:16px;font-weight:700;letter-spacing:0.5px;display:flex;align-items:center;gap:8px}
+.sidebar h2::before{content:"◈";color:var(--accent);font-size:14px}
+.filter{position:relative}
+.filter input{width:100%;background:var(--bg-input);border:1px solid var(--border);color:var(--fg);padding:6px 8px 6px 28px;border-radius:6px;outline:none;font-family:inherit;font-size:12px}
+.filter input:focus{border-color:var(--accent)}
+.filter::before{content:"⌕";position:absolute;left:8px;top:50%;transform:translateY(-50%);color:var(--fg-dim);font-size:14px}
+.conn-list{flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:4px;padding:2px}
+.conn-item{display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:8px;border:1px solid transparent;cursor:pointer;transition:all .15s;background:rgba(255,255,255,0.02)}
+.conn-item:hover{background:rgba(255,255,255,0.06);border-color:var(--border-light)}
+.conn-item.active{background:rgba(14,99,156,0.15);border-color:var(--accent)}
+.conn-dot{width:10px;height:10px;border-radius:50%;flex-shrink:0;box-shadow:0 0 6px currentColor}
+.dot-online{background:var(--success);color:var(--success)}
+.dot-offline{background:var(--offline);color:var(--offline)}
+.dot-busy{background:var(--warn);color:var(--warn)}
+.conn-meta{flex:1;min-width:0}
+.conn-name{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:12px}
+.conn-sub{font-size:11px;color:var(--fg-dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.conn-lat{font-size:11px;color:var(--success);margin-left:auto}
+.btn-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+.btn{padding:7px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg-light);color:var(--fg);cursor:pointer;font-family:inherit;font-size:12px;transition:all .15s;display:flex;align-items:center;justify-content:center;gap:6px}
+.btn:hover{background:#3a3a3a;border-color:#666;transform:translateY(-1px)}
+.btn:active{transform:translateY(0)}
+.btn-primary{background:var(--accent);border-color:var(--accent);color:#fff}
+.btn-primary:hover{background:var(--accent-hover)}
+.btn:disabled{opacity:.45;cursor:not-allowed;transform:none}
+.btn-small{padding:5px 8px;font-size:11px}
+.quick{display:flex;gap:6px}
+.quick input{flex:1;background:var(--bg-input);border:1px solid var(--border);color:var(--fg);padding:6px 8px;border-radius:6px;outline:none;font-family:inherit;font-size:12px}
+.status-bar{padding:8px 10px;background:var(--bg-input);border:1px solid var(--border);border-radius:6px;font-size:11px;color:var(--fg-dim);display:flex;align-items:center;gap:6px}
+.status-dot{width:8px;height:8px;border-radius:50%;background:var(--offline);display:inline-block}
+.status-dot.on{background:var(--success);box-shadow:0 0 8px var(--success)}
+
+/* Main */
+.main{flex:1;display:flex;flex-direction:column;overflow:hidden;background:var(--bg-dark)}
+.topbar{height:44px;background:var(--bg-medium);border-bottom:1px solid var(--border);display:flex;align-items:center;padding:0 16px;gap:12px}
+.topbar .label{color:var(--fg-dim);font-size:12px}
+.device-switch{min-width:240px;background:var(--bg-input);border:1px solid var(--border);color:var(--fg);padding:6px 10px;border-radius:6px;font-family:inherit;font-size:12px;outline:none}
+.device-switch:focus{border-color:var(--accent)}
+.active-label{font-size:12px;color:var(--fg-dim)}
+.active-label.on{color:var(--success)}
+.latency{margin-left:auto;font-size:11px;padding:4px 8px;background:rgba(139,195,74,0.12);border:1px solid rgba(139,195,74,0.3);border-radius:20px;color:var(--success)}
+.latency.warn{background:rgba(255,193,7,0.12);border-color:rgba(255,193,7,0.3);color:var(--warn)}
+.latency.bad{background:rgba(255,107,107,0.12);border-color:rgba(255,107,107,0.3);color:var(--error)}
+
+.tabs{display:flex;gap:2px;padding:8px 12px 0 12px;background:var(--bg-dark)}
+.tab{padding:8px 16px;border-radius:8px 8px 0 0;border:1px solid transparent;border-bottom:none;background:transparent;color:var(--fg-dim);cursor:pointer;font-family:inherit;font-size:12px;transition:all .15s}
+.tab:hover{background:rgba(255,255,255,0.04);color:var(--fg)}
+.tab.active{background:var(--bg-medium);border-color:var(--border);color:var(--fg-bright);font-weight:600}
+.tab-content{flex:1;overflow:hidden;display:none;padding:12px;background:var(--bg-medium);border-top:1px solid var(--border);margin:0 12px 12px 12px;border-radius:0 8px 8px 8px}
+.tab-content.active{display:flex;flex-direction:column;gap:10px;overflow:hidden}
+
+/* Screen */
+.toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:8px;background:var(--bg-input);border:1px solid var(--border);border-radius:8px;flex:0 0 auto}
+.toolbar .sep{width:1px;height:20px;background:var(--border);margin:0 4px}
+.toolbar label{font-size:11px;color:var(--fg-dim)}
+.select{background:var(--bg-input);border:1px solid var(--border);color:var(--fg);padding:5px 8px;border-radius:6px;font-family:inherit;font-size:11px;outline:none}
+.screen-wrap{flex:1 1 auto;min-height:0;background:var(--bg-input);border:1px solid var(--border);border-radius:8px;overflow:hidden;position:relative;display:flex;align-items:center;justify-content:center}
+.screen-wrap img{max-width:100%;max-height:100%;object-fit:contain;display:block}
+.screen-wrap .placeholder{color:var(--fg-dim);font-size:13px;text-align:center;padding:20px}
+.screen-dual{display:flex;gap:8px;flex-wrap:wrap;justify-content:center;padding:8px;overflow:auto;width:100%;height:100%}
+.screen-dual img{max-width:48%;border:1px solid var(--border);border-radius:6px}
+.console{flex:0 0 auto;height:110px;max-height:110px;background:var(--term-bg);border:1px solid var(--border);border-radius:8px;padding:8px;overflow:auto;font-size:11px;line-height:1.5;display:none}
+.console.on{display:block}
+.console pre{margin:0;white-space:pre-wrap;word-break:break-word;color:var(--fg)}
+.toggle{position:relative;display:inline-flex;align-items:center;gap:6px;padding:6px 10px;background:var(--bg-light);border:1px solid var(--border);border-radius:20px;cursor:pointer;font-size:11px;user-select:none;transition:all .15s}
+.toggle.on{background:rgba(139,195,74,0.15);border-color:var(--success);color:var(--success)}
+.toggle input{display:none}
+
+/* Files */
+.pathbar{display:flex;gap:6px;align-items:center;padding:8px;background:var(--bg-light);border:1px solid var(--border);border-radius:8px}
+.pathbar .tag{padding:4px 8px;border-radius:6px;font-size:11px;font-weight:700;background:var(--bg-input);border:1px solid var(--border)}
+.pathbar .tag.local{color:var(--green);border-color:rgba(139,195,74,0.3)}
+.pathbar .tag.remote{color:var(--blue);border-color:rgba(86,156,214,0.3)}
+.pathbar input{flex:1;background:var(--bg-input);border:1px solid var(--border);color:var(--fg);padding:6px 8px;border-radius:6px;outline:none;font-family:inherit;font-size:12px}
+.file-panes{display:flex;gap:8px;flex:1;overflow:hidden;min-height:0}
+.file-pane{flex:1;display:flex;flex-direction:column;gap:6px;overflow:hidden;background:var(--bg-input);border:1px solid var(--border);border-radius:8px;padding:8px}
+.file-pane .filter input{font-size:11px;padding:4px 8px 4px 24px}
+.file-list{flex:1;overflow:auto;border:1px solid var(--border);border-radius:6px;background:var(--bg-dark)}
+.file-row{display:flex;align-items:center;gap:8px;padding:6px 8px;border-bottom:1px solid rgba(255,255,255,0.04);cursor:pointer;font-size:11px}
+.file-row:hover{background:rgba(255,255,255,0.04)}
+.file-row.selected{background:rgba(14,99,156,0.2)}
+.file-row .name{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.file-row .size{width:70px;text-align:right;color:var(--fg-dim);font-size:10px}
+.file-row .mod{width:110px;color:var(--fg-dim);font-size:10px;text-align:right}
+.transfer-mid{display:flex;flex-direction:column;gap:8px;align-items:center;justify-content:center;padding:10px}
+.transfer-mid .btn{width:36px;height:36px;padding:0;border-radius:10px;font-size:16px}
+.progress{height:4px;background:rgba(255,255,255,0.06);border-radius:10px;overflow:hidden}
+.progress-bar{height:100%;background:var(--accent);width:0%;transition:width .2s}
+
+/* Commands */
+.cmd-favs{display:flex;gap:6px;flex-wrap:wrap;padding:8px;background:rgba(255,255,255,0.02);border:1px dashed var(--border);border-radius:8px}
+.chip{padding:4px 8px;background:var(--bg-light);border:1px solid var(--border);border-radius:20px;font-size:11px;cursor:pointer;transition:all .15s}
+.chip:hover{background:var(--accent);border-color:var(--accent);color:#fff}
+.searchbar{display:flex;gap:6px;align-items:center;padding:6px;background:var(--bg-input);border:1px solid var(--border);border-radius:8px}
+.searchbar input{flex:1;background:transparent;border:none;outline:none;color:var(--fg);font-family:inherit;font-size:12px}
+.terminal{flex:1;background:var(--term-bg);border:1px solid var(--border);border-radius:8px;padding:12px;overflow:auto;font-size:12px;line-height:1.6;white-space:pre-wrap;word-break:break-word}
+.terminal .line{margin:2px 0}
+.terminal .prompt{color:var(--blue)}
+.terminal .out{color:var(--fg)}
+.terminal .err{color:var(--error)}
+.terminal .help-title{color:var(--blue);font-weight:700}
+.terminal .help-desc{color:var(--fg-dim)}
+.suggest{max-height:160px;overflow:auto;background:var(--bg-input);border:1px solid var(--border);border-radius:8px;display:none}
+.suggest.on{display:block}
+.suggest-item{padding:7px 10px;cursor:pointer;display:flex;justify-content:space-between;gap:10px;font-size:12px;border-bottom:1px solid rgba(255,255,255,0.03)}
+.suggest-item:hover,.suggest-item.active{background:var(--accent);color:#fff}
+.suggest-item .desc{color:var(--fg-dim);font-size:11px}
+.suggest-item.active .desc{color:rgba(255,255,255,0.8)}
+.inputbar{display:flex;align-items:center;gap:8px;padding:10px;background:var(--term-bg);border:1px solid var(--border);border-radius:8px}
+.inputbar .gt{color:var(--blue);font-weight:700;font-size:14px}
+.inputbar input{flex:1;background:transparent;border:none;outline:none;color:var(--fg);font-family:inherit;font-size:13px}
+.history-hint{font-size:10px;color:var(--fg-dim);padding:2px 6px;background:rgba(255,255,255,0.06);border-radius:20px}
+
+/* Audio placeholder */
+.audio-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.audio-card{padding:16px;background:var(--bg-input);border:1px solid var(--border);border-radius:8px}
+.audio-card h4{margin:0 0 10px 0;font-size:12px;color:var(--fg-bright)}
+.notice{padding:10px 12px;background:rgba(255,193,7,0.1);border:1px solid rgba(255,193,7,0.3);border-radius:8px;color:var(--warn);font-size:11px}
+
+@media(max-width:900px){
+  .sidebar{width:200px;min-width:200px}
+  .file-panes{flex-direction:column}
+  .audio-grid{grid-template-columns:1fr}
+}
+
+/* Touch-first (phones/tablets): 44px targets, no tap delay, no focus zoom */
+@media (pointer:coarse), (max-width:700px){
+  body{font-size:14px}
+  .btn{min-height:44px;font-size:13px}
+  .btn-small{min-height:40px;font-size:12px}
+  .tab{padding:12px 16px;font-size:13px;white-space:nowrap}
+  .tabs{overflow-x:auto}
+  .conn-item{padding:12px 10px}
+  .file-row{padding:10px 8px;font-size:12px}
+  .chip{padding:8px 12px;font-size:12px}
+  .toggle{padding:10px 14px;font-size:12px}
+  .device-switch{min-width:0;flex:1}
+  .topbar{flex-wrap:wrap;height:auto;padding:8px 12px;row-gap:8px}
+  .inputbar input, .quick input, .filter input, .pathbar input, .searchbar input{font-size:16px}
+  .screen-wrap{touch-action:none}
+  #screenImg{touch-action:none;user-select:none;-webkit-user-select:none}
+}
+html{touch-action:manipulation}
+
+/* Toasts (replaces blocking alert()) */
+#toasts{position:fixed;bottom:16px;right:16px;display:flex;flex-direction:column;gap:8px;z-index:9999;max-width:340px}
+.toast{padding:10px 14px;border-radius:8px;font-size:12px;border:1px solid var(--border);background:var(--bg-light);color:var(--fg);box-shadow:0 4px 16px rgba(0,0,0,.5);animation:toastIn .2s ease-out}
+.toast.err{border-color:var(--error);background:rgba(255,107,107,.12)}
+.toast.ok{border-color:var(--success);background:rgba(139,195,74,.12)}
+@keyframes toastIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <h2>Connections</h2>
+    <div class="filter"><input id="connFilter" placeholder="Filter connections..."/></div>
+    <div id="connList" class="conn-list"></div>
+    <div class="btn-grid">
+      <button class="btn" id="addBtn">＋ Add</button>
+      <button class="btn" id="discoverBtn">🔍 Discover</button>
+      <button class="btn" id="refreshBtn">🔄 Refresh</button>
+      <button class="btn" id="installBtn">⬇ Install</button>
+      <button class="btn btn-primary" id="connectBtn" disabled>Connect</button>
+      <button class="btn" id="disconnectBtn" disabled>Disconnect</button>
+      <button class="btn" id="editBtn" disabled>Edit</button>
+      <button class="btn" id="removeBtn" disabled>Remove</button>
+    </div>
+    <div class="quick">
+      <input id="quickInput" placeholder="host:port or DeviceId"/>
+      <button class="btn btn-primary btn-small" id="quickBtn">Go</button>
+    </div>
+    <div class="status-bar"><span id="statusDot" class="status-dot"></span><span id="statusText">Disconnected</span><span style="margin-left:auto;font-size:10px;opacity:.6" id="agentCount">0 agents</span><span style="font-size:10px;opacity:.6" id="ctrlVersion" title="Local controller version">—</span></div>
+  </aside>
+
+  <main class="main">
+    <div class="topbar">
+      <span class="label">Device:</span>
+      <select id="deviceSwitch" class="device-switch"><option value="">— No device —</option></select>
+      <span id="activeLabel" class="active-label">— Not connected</span>
+      <span id="latency" class="latency" style="display:none">-- ms</span>
+      <button class="btn btn-small" id="reconnectBtn" style="margin-left:auto">⟳ Reconnect</button>
+      <button class="btn btn-small" id="settingsBtn">⚙ Settings</button>
+    </div>
+
+    <div class="tabs">
+      <button class="tab active" data-tab="screen">🖥 Screen</button>
+      <button class="tab" data-tab="files">📁 Files</button>
+      <button class="tab" data-tab="commands">⌨ Commands</button>
+      <button class="tab" data-tab="audio">🔊 Audio</button>
+    </div>
+
+    <!-- Screen -->
+    <section id="tab-screen" class="tab-content active">
+      <div class="toolbar">
+        <button class="btn btn-primary btn-small" id="screenStart">▶ Start Stream</button>
+        <button class="btn btn-small" id="screenStop" disabled>■ Stop</button>
+        <div class="sep"></div>
+        <label>Monitor:</label><select id="monitorSel" class="select"><option value="0">Primary (0)</option><option value="1">Monitor 1</option><option value="-1">All</option></select>
+        <button class="btn btn-small" id="monRefresh">⟳</button>
+        <span id="screenRes" style="font-size:11px;color:#888">--</span>
+        <div class="sep"></div>
+        <label class="toggle" id="mirrorToggle"><input type="checkbox"/> 🪞 Mirror: OFF</label>
+        <label class="toggle" id="dualToggle"><input type="checkbox"/> Dual: OFF</label>
+        <label class="toggle" id="consoleToggle"><input type="checkbox"/> Console: OFF</label>
+        <span style="margin-left:auto;font-size:11px;color:var(--fg-dim)">FPS: <select id="fpsSel" class="select"><option value="0">On-demand</option><option value="1" selected>1</option><option value="5">5</option><option value="10">10</option></select></span>
+        <span style="font-size:11px;color:var(--fg-dim)">Quality: <select id="qualitySel" class="select" title="PNG is lossless (desktop); JPEG saves mobile data"><option value="0">PNG</option><option value="90">JPEG 90</option><option value="70" selected>JPEG 70</option><option value="50">JPEG 50</option></select></span>
+      </div>
+      <div id="screenWrap" class="screen-wrap"><div class="placeholder">No stream — Click “Start Stream”<br/><span style="font-size:11px;opacity:.6">Screenshots are TLS-encrypted and forwarded via relay</span></div></div>
+      <div style="display:flex;gap:8px;justify-content:center;padding:6px;background:var(--bg-input);border:1px solid var(--border);border-radius:8px">
+        <button class="btn btn-small" id="scrollUp">↑ Scroll Up</button>
+        <button class="btn btn-small" id="scrollDown">↓ Scroll Down</button>
+        <span style="font-size:11px;color:var(--fg-dim)">Mouse: <span id="mousePos">--</span></span>
+      </div>
+      <div id="screenConsole" class="console"><pre id="screenConsoleOut"></pre></div>
+      <div class="toolbar" style="justify-content:space-between">
+        <div style="display:flex;gap:6px;align-items:center"><span style="font-size:11px;color:#888">Audio:</span>
+          <button class="btn btn-small" id="audioStart">▶ Audio</button><button class="btn btn-small" id="audioStop" disabled>■ Stop</button>
+          <button class="btn btn-small" id="muteBtn">🔇 Mute</button>
+        </div>
+        <div style="display:flex;gap:6px;align-items:center"><label style="font-size:11px;color:#888">Vol</label><input id="volSlider" type="range" min="0" max="100" value="80" style="width:100px"/><span id="volLabel" style="font-size:11px">80%</span></div>
+      </div>
+    </section>
+
+    <!-- Files -->
+    <section id="tab-files" class="tab-content">
+      <div id="favBar" style="display:flex;gap:6px;flex-wrap:wrap;padding:6px;background:rgba(255,255,255,0.02);border:1px dashed #555;border-radius:8px"><span style="font-size:11px;color:#888">Favorites:</span><span class="chip" data-path="C:\">C:\</span><span class="chip" data-path="C:\Users">Users</span><span class="chip" data-path="D:\">D:\</span><button class="btn btn-small" id="addFav">＋ Add</button></div>
+      <div class="file-panes">
+        <div class="file-pane">
+          <div class="pathbar"><span class="tag local">Local:</span><input id="localPath" value="C:\Users"/><button class="btn btn-small" id="localRefresh">⟳</button><button class="btn btn-small" id="localUp">↑</button></div>
+          <div class="filter"><input id="localFilter" placeholder="Filter local..."/></div>
+          <div id="localList" class="file-list"></div>
+        </div>
+        <div class="transfer-mid">
+          <button class="btn btn-primary" id="toRemote" title="Copy to remote">→</button>
+          <button class="btn" id="toLocal" title="Copy to local">←</button>
+          <div class="progress" style="width:80px"><div id="transferBar" class="progress-bar"></div></div>
+          <span id="transferLabel" style="font-size:10px;color:#888"></span>
+        </div>
+        <div class="file-pane">
+          <div class="pathbar"><span class="tag remote">Remote:</span><input id="remotePath" value="C:\"/><button class="btn btn-small" id="remoteRefresh">⟳</button><button class="btn btn-small" id="remoteUp">↑</button></div>
+          <div class="filter"><input id="remoteFilter" placeholder="Filter remote..."/></div>
+          <div id="remoteList" class="file-list"></div>
+        </div>
+      </div>
+      <div style="display:flex;gap:8px"><button class="btn btn-small" id="deleteBtn">🗑 Delete Selected</button><button class="btn btn-small" id="queueBtn">☰ Queue</button><span style="margin-left:auto;font-size:11px;color:#888" id="fileStatus">Ready</span></div>
+    </section>
+
+    <!-- Commands -->
+    <section id="tab-commands" class="tab-content">
+      <div id="cmdFavs" class="cmd-favs"><span style="font-size:11px;color:#888">Favorites:</span>
+        <span class="chip" data-cmd="version">version</span><span class="chip" data-cmd="get-system-info">get-system-info</span><span class="chip" data-cmd="list-directory C:\">list-directory</span><span class="chip" data-cmd="get-processes">get-processes</span><span class="chip" data-cmd="get-ip-address">get-ip-address</span><button class="btn btn-small" id="addCmdFav">＋ Add</button>
+      </div>
+      <div class="searchbar" id="searchBar" style="display:none"><input id="searchInput" placeholder="Search output..."/><button class="btn btn-small" id="searchPrev">↑</button><button class="btn btn-small" id="searchNext">↓</button><button class="btn btn-small" id="searchClose">✕</button></div>
+      <div id="terminal" class="terminal"><div class="line" style="color:#569CD6">[System] Connected — type <span style="color:#CE9178">help</span> for commands, <span style="color:#CE9178">Tab</span> for autocomplete</div></div>
+      <div id="suggest" class="suggest"></div>
+      <div class="inputbar">
+        <span class="gt">❯</span><input id="cmdInput" placeholder="Enter command… (help, list-directory, get-system-info)" autocomplete="off"/>
+        <button class="btn btn-primary btn-small" id="cmdSend">Send</button>
+        <span id="historyHint" class="history-hint">↑↓ history • Tab complete • Ctrl+K focus • Ctrl+1-4 tabs</span>
+      </div>
+    </section>
+
+    <!-- Audio -->
+    <section id="tab-audio" class="tab-content">
+      <div class="notice">Live level meter for the remote PC — green bars move with its speaker output and microphone. “Desktop/Mic/Both” and mute send real commands to the agent.</div>
+      <div class="audio-card" style="margin-bottom:12px">
+        <h4>🔊 Live Level <span id="audioLiveDot" style="font-size:11px;color:#666">● idle</span></h4>
+        <div style="display:flex;flex-direction:column;gap:8px;margin-top:8px">
+          <div style="display:flex;align-items:center;gap:8px"><span style="font-size:11px;width:64px;color:#888">Speakers</span><div class="progress" style="flex:1;height:12px"><div id="masterBar" class="progress-bar" style="width:0%;background:linear-gradient(90deg,#8BC34A,#FFD700)"></div></div><span id="masterPct" style="font-size:11px;width:44px;text-align:right">—</span></div>
+          <div style="display:flex;align-items:center;gap:8px"><span style="font-size:11px;width:64px;color:#888">Mic</span><div class="progress" style="flex:1;height:12px"><div id="micBar" class="progress-bar" style="width:0%;background:linear-gradient(90deg,#569CD6,#C586C0)"></div></div><span id="micPct" style="font-size:11px;width:44px;text-align:right">—</span></div>
+        </div>
+        <div style="margin-top:10px;display:flex;gap:8px;align-items:center"><label class="toggle" id="audioMonToggle"><input type="checkbox"/> 👁 Monitor: OFF</label><span style="font-size:10px;color:#666">polls get-audio-level 2×/s</span></div>
+      </div>
+      <div class="audio-grid">
+        <div class="audio-card">
+          <h4>Input Source</h4>
+          <div style="display:flex;gap:8px"><button class="btn btn-primary btn-small" data-src="desktop">🖥 Desktop</button><button class="btn btn-small" data-src="mic">🎤 Mic</button><button class="btn btn-small" data-src="both">Both</button></div>
+          <div style="margin-top:12px"><label style="font-size:11px;color:#888">Device</label><select id="audioDev" class="select" style="width:100%;margin-top:6px"><option value="">Default</option></select><button class="btn btn-small" id="audioRefresh" style="margin-top:6px">⟳ Refresh</button></div>
+          <div style="margin-top:12px;display:flex;gap:8px"><button class="btn btn-primary btn-small" id="aStart">▶ Start</button><button class="btn btn-small" id="aStop" disabled>■ Stop</button><button class="btn btn-small" id="aMute">🔇 Mute</button></div>
+        </div>
+        <div class="audio-card">
+          <h4>Output</h4>
+          <div style="display:flex;gap:8px;align-items:center"><label style="font-size:11px;color:#888">Volume</label><input type="range" id="aVol" min="0" max="100" value="80" style="flex:1"/><span id="aVolL" style="font-size:11px">80%</span></div>
+          <div style="margin-top:12px"><label style="font-size:11px;color:#888">Output Device</label><select id="audioOutDev" class="select" style="width:100%;margin-top:6px"><option value="">Default</option></select></div>
+          <div id="audioStatus" style="margin-top:12px;font-size:11px;color:#888">Idle</div>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+<div id="toasts"></div>
+
+<script>
+const KNOWN = {
+"help":"Show help","list-commands":"List all","get-system-info":"System info","get-cpu-info":"CPU info","get-cpu-usage":"CPU %","get-memory-usage":"Memory","get-disk-usage":"Disk usage","get-disk-health":"Disk health","get-gpu-info":"GPU","get-bios-info":"BIOS","get-motherboard-info":"Motherboard","get-ram-slots":"RAM slots","get-battery":"Battery","get-display-info":"Display","get-monitors":"Monitors","get-screen-size":"Screen size","get-uptime":"Uptime","get-time":"Time","get-timezone":"TZ","get-services":"Services","get-processes":"Processes","get-installed-programs":"Installed","get-hostname":"Hostname","get-username":"User","get-os-version":"OS","get-status":"Status","get-version":"Version","list-directory":"List dir","read-file":"Read file","write-file":"Write file","delete-item":"Delete","create-directory":"Mkdir","copy-item":"Copy","move-item":"Move","rename-item":"Rename","get-file-info":"File info","get-file-hash":"Hash","get-directory-size":"Dir size","search-files":"Search","run-command":"Shell","run-powershell":"PS","launch-app":"Launch","open-url":"Open URL","get-ip-address":"IPs","get-network-info":"Net info","get-public-ip":"Public IP","resolve-dns":"DNS","test-connection":"Ping","check-port":"Port","flush-dns":"Flush DNS","get-arp-cache":"ARP","get-route-table":"Routes","mouse-move":"Mouse move","mouse-click":"Click","mouse-button":"Button","mouse-scroll":"Scroll","get-position":"Pos","send-text":"Send text","clipboard-get":"Clipboard get","clipboard-set":"Clipboard set","get-active-window":"Active win","reg-read":"Reg read","reg-write":"Reg write","reg-enum-keys":"Reg keys","reg-enum-values":"Reg values","get-firewall-status":"Firewall","get-defender-status":"Defender","get-go-version":"Go ver","get-dotnet-version":".NET","git-status":"Git status","git-log":"Git log","shutdown-restart":"Power","generate-password":"Pass","generate-uuid":"UUID","encode-base64":"B64 enc","decode-base64":"B64 dec","hash-text":"Hash","ping":"Ping","version":"Version","screenshot-now":"Screenshot"
+};
+let ws=null, agents=[], selected=null, latencyStart=0, history=[], hIdx=-1, screenTimer=null;
+const $ = id=>document.getElementById(id);
+function toast(msg, cls=""){
+  const t=document.createElement("div"); t.className="toast "+cls; t.textContent=msg;
+  $("toasts").appendChild(t);
+  setTimeout(()=>{ t.style.opacity="0"; t.style.transition="opacity .3s"; setTimeout(()=>t.remove(), 350); }, 3500);
+}
+function needAgent(){ if(!selected){ toast("No agent selected — connect one first", "err"); return false; } return true; }
+
+// Connects list (stable selection: keep current unless it vanished)
+function renderConns(filter=""){
+  if(selected && !agents.find(a=>a.id===selected.id)) selected = agents[0]||null;
+  const c = $("connList"); c.innerHTML="";
+  const f = filter.toLowerCase();
+  agents.forEach(a=>{
+    if(f && !a.hostname.toLowerCase().includes(f) && !a.id.toLowerCase().includes(f)) return;
+    const d = document.createElement("div");
+    d.className="conn-item"+(selected?.id===a.id?" active":"");
+    const lat = (a.latency==null||a.latency>900000) ? "--" : a.latency;
+    d.innerHTML=`<span class="conn-dot ${a.connected?"dot-online":"dot-offline"}"></span><div class="conn-meta"><div class="conn-name">${a.hostname}</div><div class="conn-sub">${a.id} • ${a.user}</div></div><span class="conn-lat">${lat}ms</span>`;
+    d.onclick=()=>{selected=a; renderConns($("connFilter").value); updateActive(); renderDeviceSwitch(); if(typeof updateConnButtons==="function") updateConnButtons();};
+    c.appendChild(d);
+  });
+  $("agentCount").textContent = agents.length+" agents";
+  if(agents.length===0) c.innerHTML='<div style="text-align:center;padding:20px;color:#666;font-size:11px">No agents connected<br/>Run agent.exe -controller '+location.hostname+':4444</div>';
+  if(typeof updateConnButtons==="function") updateConnButtons();
+}
+function renderDeviceSwitch(){
+  const s=$("deviceSwitch"); s.innerHTML='<option value="">— No device —</option>';
+  agents.forEach(a=>{const o=document.createElement("option");o.value=a.id;o.textContent=`${a.connected?"●":"○"} ${a.hostname} (${a.id})`;if(selected?.id===a.id)o.selected=true;s.appendChild(o);});
+}
+function updateActive(){
+  const l=$("activeLabel"), d=$("latency");
+  if(selected){l.textContent=`— ${selected.hostname} (connected)`;l.className="active-label on"; d.style.display=""; d.textContent=(selected.latency||"--")+" ms"; $("statusDot").className="status-dot on"; $("statusText").textContent=`Connected to ${selected.hostname}`;}
+  else{l.textContent="— Not connected";l.className="active-label"; d.style.display="none"; $("statusDot").className="status-dot"; $("statusText").textContent="Disconnected";}
+}
+
+// Tabs
+document.querySelectorAll(".tab").forEach(t=>t.onclick=()=>{
+  document.querySelectorAll(".tab").forEach(x=>x.classList.remove("active"));
+  document.querySelectorAll(".tab-content").forEach(x=>x.classList.remove("active"));
+  t.classList.add("active"); document.getElementById("tab-"+t.dataset.tab).classList.add("active");
+});
+
+// WebSocket
+function connectWS(){
+  const proto = location.protocol==="https:"?"wss:":"ws:";
+  ws = new WebSocket(proto+"//"+location.host+"/ws");
+  ws.onopen=()=>{ addTerm("Connected to controller","prompt"); fetchStatus(); };
+  ws.onclose=()=>{ addTerm("Disconnected — retrying...","err"); setTimeout(connectWS,2000); };
+  ws.onmessage=e=>{
+    try{ const m=JSON.parse(e.data);
+      if(m.type==="agents"){
+        const incoming=m.agents||[];
+        // Merge by id so manual entries survive server pushes
+        const byId={}; incoming.forEach(a=>byId[a.id]=a);
+        agents.forEach(a=>{ if(a.id.startsWith("manual-")||a.id.startsWith("conn-")){ if(!byId[a.id]) byId[a.id]=a; } });
+        agents=Object.values(byId);
+        if(!selected && agents[0]) selected=agents[0];
+        renderConns($("connFilter").value); renderDeviceSwitch(); updateActive();
+      }
+      else if(m.type==="output"){
+        const t = m.success?"out":"err";
+        // Meter unavailable on that PC: stop polling instead of spamming errors
+        const txt = `${m.data||""} ${m.error||""}`;
+        if(txt.includes("audio level unavailable")){
+          stopAudioMonitor(true);
+          $("audioStatus").textContent="Meter unavailable on this PC";
+          toast("Audio meter unavailable on this PC (COM blocked)", "err");
+          addTerm(`[${m.id||selected?.id||"agent"}] audio meter unavailable`, "err");
+        }
+        // Route audio-level JSON to the meter bars instead of spamming the terminal
+        else if(m.success && typeof m.data==="string" && m.data.includes('"master"') && m.data.includes('"mic"')){
+          try{ const lv=JSON.parse(m.data); if(typeof lv.master==="number"&&typeof lv.mic==="number"){ updateAudioMeter(lv.master, lv.mic); } else { addTerm(`[${m.id||selected?.id||"agent"}] ${m.data}`, t); } }
+          catch{ addTerm(`[${m.id||selected?.id||"agent"}] ${m.data}`, t); }
+        } else addTerm(`[${m.id||selected?.id||"agent"}] ${m.data||m.error||""}`, t);
+      }
+      else if(m.type==="screen"){
+        if(m.data){
+          const fmt=(m.format==="jpeg")?"jpeg":"png";
+          showScreen(m.data, fmt);
+          lastFrameAt=Date.now();
+          $("screenRes").textContent=m.width+"×"+m.height+" "+fmt.toUpperCase();
+          scheduleNextShot();
+        }
+      }
+      else if(m.type==="mouse"){ $("mousePos").textContent=m.x+","+m.y; }
+      else if(m.type==="filelist"){ renderFileList(m.isRemote?"remoteList":"localList", m.data);}
+      else if(m.type==="audiolist"){ renderAudioDevices(m.data); }
+      else if(m.type==="pong"){ const ms=Date.now()-latencyStart; if(selected) selected.latency=ms; $("latency").textContent=ms+" ms"; $("latency").className="latency"+(ms<80?"":ms<180?" warn":" bad");}
+    }catch(err){ console.error(err); }
+  };
+}
+function fetchStatus(){
+  fetch("/api/status").then(r=>r.json()).then(j=>{
+    if(j.controllerVersion) $("ctrlVersion").textContent="v"+j.controllerVersion;
+    if(j.connected){
+      const fresh={id:j.id,hostname:j.hostname,user:j.user,connected:true,latency:j.latency};
+      const i=agents.findIndex(a=>a.id===fresh.id);
+      if(i>=0) agents[i]=fresh; else agents.push(fresh);
+      if(!selected) selected=fresh;
+      renderConns($("connFilter").value); renderDeviceSwitch(); updateActive();
+    }
+  }).catch(()=>{});
+}
+// Pinch-zoom for touch: two fingers scale the screenshot, one finger tap moves.
+let screenZoom=1;
+function bindScreenPinch(){
+  const img=$("screenImg"); if(!img) return;
+  screenZoom=1; img.style.transform="";
+  let startDist=0, startZoom=1;
+  img.addEventListener("touchstart", e=>{
+    if(e.touches.length===2){
+      e.preventDefault();
+      startDist=Math.hypot(e.touches[0].clientX-e.touches[1].clientX, e.touches[0].clientY-e.touches[1].clientY);
+      startZoom=screenZoom;
+    }
+  }, {passive:false});
+  img.addEventListener("touchmove", e=>{
+    if(e.touches.length===2){
+      e.preventDefault();
+      const d=Math.hypot(e.touches[0].clientX-e.touches[1].clientX, e.touches[0].clientY-e.touches[1].clientY);
+      if(startDist>0) screenZoom=Math.min(4, Math.max(1, startZoom*d/startDist));
+      img.style.transform=`scale(${screenZoom})`;
+      img.style.transformOrigin="center center";
+    }
+  }, {passive:false});
+  img.addEventListener("touchend", e=>{
+    if(e.touches.length===0 && screenZoom>1.2){
+      // stay zoomed; double-tap resets handled below via dblclick fallback
+    }
+  });
+}
+// Click-to-control: click moves the remote mouse, double-click clicks.
+function bindScreenClick(){
+  const img=$("screenImg"); if(!img) return;
+  img.onclick=e=>{
+    if(!needAgent()) return;
+    const r=img.getBoundingClientRect();
+    const rx=Math.round((e.clientX-r.left)/r.width*1920), ry=Math.round((e.clientY-r.top)/r.height*1080);
+    sendCmdVal(`mouse-move ${rx},${ry}`); addConsole(`Click → ${rx},${ry} (scaled)`);
+  };
+  img.ondblclick=e=>{
+    if(!needAgent()) return;
+    sendCmdVal("mouse-click"); addConsole("Double-click → click");
+  };
+}
+
+// Commands
+const term=$("terminal"), input=$("cmdInput"), sugg=$("suggest");
+function addTerm(text, cls="out"){
+  const div=document.createElement("div"); div.className="line "+cls;
+  const time=new Date().toLocaleTimeString();
+  div.innerHTML=`<span style="opacity:.5">[${time}]</span> ${escapeHtml(text)}`;
+  term.appendChild(div); term.scrollTop=term.scrollHeight;
+}
+function escapeHtml(s){return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");}
+function updateSuggest(){
+  const v=input.value.trim().split(" ")[0].toLowerCase();
+  if(!v){sugg.classList.remove("on");return;}
+  const matches=Object.keys(KNOWN).filter(k=>k.startsWith(v)).slice(0,8);
+  if(matches.length===0 || (matches.length===1 && matches[0]===v)){sugg.classList.remove("on");return;}
+  sugg.innerHTML=matches.map((k,i)=>`<div class="suggest-item ${i===0?"active":""}" data-cmd="${k}"><span>${k}</span><span class="desc">${KNOWN[k]}</span></div>`).join("");
+  sugg.classList.add("on");
+  sugg.querySelectorAll(".suggest-item").forEach(el=>el.onclick=()=>{ acceptSuggest(el.dataset.cmd); });
+}
+function acceptSuggest(cmd){
+  const parts=input.value.split(" "); parts[0]=cmd; input.value=parts.join(" ")+" "; sugg.classList.remove("on"); input.focus();
+}
+input.addEventListener("input", updateSuggest);
+input.addEventListener("keydown", e=>{
+  const vis=sugg.classList.contains("on");
+  if(vis && (e.key==="ArrowDown"||e.key==="ArrowUp")){
+    e.preventDefault();
+    const items=[...sugg.querySelectorAll(".suggest-item")];
+    let idx=items.findIndex(x=>x.classList.contains("active"));
+    items[idx]?.classList.remove("active");
+    if(e.key==="ArrowDown") idx=(idx+1)%items.length; else idx=(idx-1+items.length)%items.length;
+    items[idx].classList.add("active");
+  } else if(e.key==="Tab" && vis){
+    e.preventDefault();
+    const act=sugg.querySelector(".suggest-item.active"); if(act) acceptSuggest(act.dataset.cmd);
+  } else if(e.key==="Enter"){
+    if(vis){ const act=sugg.querySelector(".suggest-item.active"); if(act){ acceptSuggest(act.dataset.cmd); return; } }
+    sendCmd();
+  } else if(e.key==="ArrowUp"){ if(history.length){ e.preventDefault(); hIdx=Math.min(hIdx+1, history.length-1); input.value=history[history.length-1-hIdx]; } }
+  else if(e.key==="ArrowDown"){ if(hIdx>0){ hIdx--; input.value=history[history.length-1-hIdx]; } else if(hIdx===0){ hIdx=-1; input.value=""; } }
+  else if(e.key==="Escape"){ sugg.classList.remove("on"); }
+});
+function sendCmd(){
+  const v=input.value.trim(); if(!v) return;
+  history.push(v); if(history.length>50) history.shift(); hIdx=-1;
+  addTerm("❯ "+v, "prompt");
+  if(ws && ws.readyState===1) ws.send(JSON.stringify({type:"command", cmd:v, target:selected?.id}));
+  else fetch("/api/cmd",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({cmd:v})});
+  input.value=""; sugg.classList.remove("on");
+}
+$("cmdSend").onclick=sendCmd;
+// Search in terminal
+$("searchInput")?.addEventListener("input", e=>{
+  const q=e.target.value.toLowerCase();
+  [...term.querySelectorAll(".line")].forEach(l=>{
+    l.style.display = !q || l.textContent.toLowerCase().includes(q) ? "" : "none";
+  });
+});
+$("searchPrev")?.addEventListener("click", ()=>{ addTerm("Search prev — use browser Ctrl+F for now", "out"); });
+$("searchNext")?.addEventListener("click", ()=>{ addTerm("Search next — use browser Ctrl+F", "out"); });
+$("searchClose")?.addEventListener("click", ()=>{
+  $("searchBar").style.display="none";
+  $("searchInput").value="";
+  [...term.querySelectorAll(".line")].forEach(l=>l.style.display="");
+});
+document.addEventListener("keydown", e=>{
+  if(e.ctrlKey && e.key==="f"){ e.preventDefault(); $("searchBar").style.display="flex"; $("searchInput").focus(); }
+});
+document.querySelectorAll(".chip[data-cmd]").forEach(c=>c.onclick=()=>{input.value=c.dataset.cmd+" "; input.focus(); updateSuggest();});
+$("addCmdFav").onclick=()=>{
+  const v=prompt("Favorite command:"); if(!v) return;
+  const s=document.createElement("span");s.className="chip";s.dataset.cmd=v;s.textContent=v; s.onclick=()=>{input.value=v+" "; input.focus(); updateSuggest();};
+  $("cmdFavs").insertBefore(s,$("addCmdFav"));
+  try{ localStorage.setItem("rmm_cmdFavs", JSON.stringify([...document.querySelectorAll("#cmdFavs .chip[data-cmd]")].map(x=>x.dataset.cmd))); }catch{}
+};
+
+// Screen — frame-driven streaming: each arriving frame schedules the next
+// one, so the stream self-paces to the real round-trip (no pile-ups, no
+// stalls). A 3s watchdog re-requests if a frame gets lost in transit.
+let streaming=false, lastFrameAt=0, streamWatch=null, nextShotTimer=null;
+function screenQuality(){ const q=parseInt($("qualitySel").value); return isNaN(q)?0:q; }
+function streamMonitor(){ return parseInt($("monitorSel").value)||0; }
+function streamAllMonitors(){ return $("monitorSel").value==="-1" || ($("dualToggle").querySelector("input")?.checked===true); }
+function streamInterval(){ const fps=parseInt($("fpsSel").value); return fps>0 ? Math.max(100, 1000/fps) : 1000; }
+function requestShot(){
+  if(!streaming||!selected||!ws||ws.readyState!==1) return;
+  ws.send(JSON.stringify({type:"screenshot_request", target:selected.id, quality:screenQuality(), monitor:streamMonitor(), allMonitors:streamAllMonitors()}));
+}
+function scheduleNextShot(){
+  if(!streaming) return;
+  if(nextShotTimer) clearTimeout(nextShotTimer);
+  nextShotTimer=setTimeout(requestShot, streamInterval());
+}
+$("screenStart").onclick=()=>{
+  if(!selected){ toast("No agent selected", "err"); return; }
+  if(!selected.connected){ toast("Agent not connected", "err"); return; }
+  streaming=true; lastFrameAt=Date.now();
+  requestShot();
+  if(streamWatch) clearInterval(streamWatch);
+  streamWatch=setInterval(()=>{ if(streaming && Date.now()-lastFrameAt>3000) requestShot(); },3000);
+  $("screenStart").disabled=true; $("screenStop").disabled=false;
+  addConsole("Stream started (monitor "+$("monitorSel").value+(streamAllMonitors()?", all":"")+", q="+$("qualitySel").value+")");
+};
+function stopStream(silent){
+  streaming=false;
+  if(nextShotTimer){ clearTimeout(nextShotTimer); nextShotTimer=null; }
+  if(streamWatch){ clearInterval(streamWatch); streamWatch=null; }
+  if(screenTimer){ clearInterval(screenTimer); screenTimer=null; }
+  $("screenStart").disabled=false; $("screenStop").disabled=true;
+  if(!silent) addConsole("Stream stopped");
+}
+$("screenStop").onclick=()=>stopStream(false);
+$("monRefresh").onclick=()=>{
+  if(!selected){ toast("No agent", "err"); return; }
+  addTerm("Refreshing monitors...", "out");
+  if(ws) ws.send(JSON.stringify({type:"command", cmd:"get-monitors", target:selected.id}));
+};
+// Persistent <img>: updated in place every frame (no re-parse, no re-bind).
+function showScreen(b64, fmt){
+  const wrap=$("screenWrap");
+  let img=$("screenImg");
+  if(!img || !wrap.contains(img)){
+    wrap.innerHTML="";
+    img=document.createElement("img");
+    img.id="screenImg";
+    img.style.cssText="max-width:100%;max-height:100%;cursor:crosshair";
+    img.title="Tap to move mouse, double-tap to click, pinch to zoom";
+    img.draggable=false;
+    wrap.appendChild(img);
+    bindScreenClick(); bindScreenPinch();
+  }
+  img.src=`data:image/${fmt};base64,${b64}`;
+}
+$("monitorSel").onchange=()=>{
+  const v=$("monitorSel").value;
+  addConsole("Monitor set to "+v);
+  $("screenRes").textContent = v==="-1"?"All": v==="0"?"Primary":"Monitor "+v;
+  if(streaming) requestShot();
+};
+$("fpsSel").onchange=()=>{
+  const fps=parseInt($("fpsSel").value);
+  addConsole(fps>0 ? "FPS "+fps : "FPS on-demand (single shots)");
+  if(streaming) scheduleNextShot();
+};
+$("scrollUp").onclick=()=>{ if(!selected){ toast("No agent", "err"); return; } sendCmdVal("mouse-scroll 3"); addConsole("Scroll up"); };
+$("scrollDown").onclick=()=>{ if(!selected){ toast("No agent", "err"); return; } sendCmdVal("mouse-scroll -3"); addConsole("Scroll down"); };
+$("audioStart").onclick=()=>{ if(!selected){ toast("No agent", "err"); return; } sendCmdVal("get-audio-devices"); addConsole("Audio start requested (stub)"); $("audioStart").disabled=true; $("audioStop").disabled=false; };
+$("audioStop").onclick=()=>{ sendCmdVal("set-mic-mute on"); addConsole("Audio stopped"); $("audioStart").disabled=false; $("audioStop").disabled=true; };
+$("muteBtn").onclick=()=>{ if(!selected) return; sendCmdVal("set-mic-mute on"); addConsole("Mute toggled"); };
+$("volSlider").oninput=e=>{ $("volLabel").textContent=e.target.value+"%"; };
+$("volSlider").onchange=e=>{ if(selected) sendCmdVal("set-volume "+e.target.value); };
+function sendCmdVal(v){ if(!selected) return; if(ws && ws.readyState===1) ws.send(JSON.stringify({type:"command", cmd:v, target:selected.id})); else addTerm("Not connected", "err"); }
+function addConsole(t){ const c=$("screenConsoleOut"); c.textContent+=`[${new Date().toLocaleTimeString()}] ${t}\n`; $("screenConsole").classList.add("on"); $("screenConsole").scrollTop=$("screenConsole").scrollHeight; }
+$("mirrorToggle").onclick=(e)=>{
+  const cb=e.currentTarget.querySelector("input"); cb.checked=!cb.checked; e.currentTarget.classList.toggle("on", cb.checked);
+  e.currentTarget.innerHTML=`<input type="checkbox" ${cb.checked?"checked":""}/> 🪞 Mirror: ${cb.checked?"ON":"OFF"}`;
+  addConsole("Mirror "+(cb.checked?"ON (30Hz hook)":"OFF"));
+  if(cb.checked && selected) sendCmdVal("get-position");
+};
+$("dualToggle").onclick=(e)=>{
+  const cb=e.currentTarget.querySelector("input"); cb.checked=!cb.checked; e.currentTarget.classList.toggle("on", cb.checked);
+  e.currentTarget.innerHTML=`<input type="checkbox" ${cb.checked?"checked":""}/> Dual: ${cb.checked?"ON":"OFF"}`;
+  addConsole("Dual view "+(cb.checked?"ON (all monitors)":"OFF"));
+  if(streaming) requestShot(); // switch view immediately
+};
+$("consoleToggle").onclick=(e)=>{
+  const cb=e.currentTarget.querySelector("input"); cb.checked=!cb.checked; e.currentTarget.classList.toggle("on", cb.checked);
+  e.currentTarget.innerHTML=`<input type="checkbox" ${cb.checked?"checked":""}/> Console: ${cb.checked?"ON":"OFF"}`;
+  $("screenConsole").classList.toggle("on", cb.checked);
+};
+
+// Files
+function renderFileList(id, data){
+  const el=$(id); el.innerHTML="";
+  try{
+    const j=JSON.parse(data); const entries=j.entries||[];
+    entries.forEach(e=>{
+      const row=document.createElement("div"); row.className="file-row";
+      row.innerHTML=`<span style="width:16px">${e.isDirectory?"📁":"📄"}</span><span class="name">${e.name}</span><span class="size">${e.isDirectory?"":(e.size>1024? (e.size/1024).toFixed(1)+"KB": e.size+" B")}</span><span class="mod">${e.lastModified? e.lastModified.slice(0,10):""}</span>`;
+      row.onclick=()=>{ row.classList.toggle("selected"); };
+      row.ondblclick=()=>{
+        const cur=$(id==="localList"?"localPath":"remotePath");
+        if(e.isDirectory){ cur.value = (cur.value.replace(/\\$/,"")+"\\"+e.name); refreshFiles(id==="localList"?false:true); }
+        else if(id==="remoteList"){ sendCmdVal(`read-file ${cur.value.replace(/\\$/,"")+"\\"+e.name}`); }
+      };
+      el.appendChild(row);
+    });
+  }catch{ el.textContent=data; }
+}
+function refreshFiles(isRemote){
+  const path=$(isRemote?"remotePath":"localPath").value;
+  if(isRemote){
+    if(ws) ws.send(JSON.stringify({type:"command", cmd:`list-directory ${path}`, target:selected?.id}));
+    $(isRemote?"remoteList":"localList").innerHTML='<div style="padding:20px;text-align:center;color:#666">Loading…</div>';
+  } else {
+    fetch(`/api/files?path=${encodeURIComponent(path)}`).then(r=>r.text()).then(t=>renderFileList("localList", t)).catch(()=>{});
+    // fallback via local list-directory if api fails, do via command to agent? local is just local controller fs, so use fetch
+  }
+}
+$("localRefresh").onclick=()=>refreshFiles(false);
+$("remoteRefresh").onclick=()=>{
+  if(!selected){ toast("No agent for remote", "err"); return; }
+  refreshFiles(true);
+};
+$("localUp").onclick=()=>{const p=$("localPath"); p.value=p.value.replace(/\\[^\\]+\\?$/,"")||"C:\\"; refreshFiles(false);};
+$("remoteUp").onclick=()=>{
+  if(!selected){ toast("No agent", "err"); return; }
+  const p=$("remotePath"); p.value=p.value.replace(/\\[^\\]+\\?$/,"")||"C:\\"; refreshFiles(true);
+};
+$("localFilter").oninput=e=>{const v=e.target.value.toLowerCase(); [...$("localList").children].forEach(r=>r.style.display=r.textContent.toLowerCase().includes(v)?"":"none");};
+$("remoteFilter").oninput=e=>{const v=e.target.value.toLowerCase(); [...$("remoteList").children].forEach(r=>r.style.display=r.textContent.toLowerCase().includes(v)?"":"none");};
+$("toRemote").onclick=()=>{
+  if(!selected){ toast("No agent", "err"); return; }
+  const sel=[...$("localList").querySelectorAll(".selected")]; if(!sel.length) toast("Select local file", "err"); return;
+  const name=sel[0].querySelector(".name").textContent; const src=$("localPath").value.replace(/\\$/,"")+"\\"+name; const dst=$("remotePath").value.replace(/\\$/,"")+"\\"+name;
+  addTerm(`Copy ${src} → ${dst}`, "out");
+  // For demo, send copy-item command to agent (agent will handle local->remote as copy on its own fs, but show placeholder)
+  sendCmdVal(`copy-item ${src}|${dst}`);
+  $("transferBar").style.width="30%"; $("transferLabel").textContent="Copying...";
+  setTimeout(()=>{ $("transferBar").style.width="100%"; $("transferLabel").textContent="Done"; setTimeout(()=>{$("transferBar").style.width="0%"; $("transferLabel").textContent="";},1500); refreshFiles(true); },800);
+};
+$("toLocal").onclick=()=>{
+  if(!selected){ toast("No agent", "err"); return; }
+  const sel=[...$("remoteList").querySelectorAll(".selected")]; if(!sel.length) toast("Select remote file", "err"); return;
+  const name=sel[0].querySelector(".name").textContent; const src=$("remotePath").value.replace(/\\$/,"")+"\\"+name;
+  addTerm(`Download ${src} — check terminal for read-file output`, "out");
+  sendCmdVal(`read-file ${src}`);
+};
+$("deleteBtn").onclick=()=>{
+  if(!selected){ toast("No agent", "err"); return; }
+  const selRemote=[...$("remoteList").querySelectorAll(".selected")];
+  const selLocal=[...$("localList").querySelectorAll(".selected")];
+  const target = selRemote.length ? $("remotePath").value.replace(/\\$/,"")+"\\"+selRemote[0].querySelector(".name").textContent : selLocal.length ? $("localPath").value.replace(/\\$/,"")+"\\"+selLocal[0].querySelector(".name").textContent : null;
+  if(!target) toast("Select a file", "err"); return;
+  if(!confirm("Delete "+target+"?")) return;
+  if(selRemote.length) sendCmdVal(`delete-item ${target}`);
+  else {
+    // local delete via fetch to controller? For now just via command to agent if remote, else local via API not implemented
+    addTerm("Local delete not implemented — use remote", "out");
+    return;
+  }
+  addTerm(`Delete ${target}`, "out");
+};
+$("queueBtn").onclick=()=>{
+  const q=$("transferLabel");
+  q.textContent = q.textContent ? "" : "Queue: 0 pending";
+  addTerm("Transfer queue (stub) — use →/← for now", "out");
+};
+$("addFav").onclick=()=>{
+  const p=prompt("Favorite path:", "C:\\Tools");
+  if(!p) return;
+  const chip=document.createElement("span"); chip.className="chip"; chip.dataset.path=p; chip.textContent=p.split("\\").pop()||p;
+  chip.onclick=()=>{ $("localPath").value=p; refreshFiles(false); };
+  $("favBar").insertBefore(chip, $("addFav"));
+  addTerm(`Added favorite ${p}`, "out");
+};
+document.querySelectorAll("#favBar .chip[data-path]").forEach(chip=>{
+  chip.onclick=()=>{ $("localPath").value=chip.dataset.path; refreshFiles(false); };
+});
+$("localPath").addEventListener("keydown", e=>{ if(e.key==="Enter") refreshFiles(false); });
+$("remotePath").addEventListener("keydown", e=>{ if(e.key==="Enter"){ if(!selected){ toast("No agent", "err"); return; } refreshFiles(true); } });
+
+// Quick connect & filters
+$("connFilter").oninput=e=>renderConns(e.target.value);
+$("deviceSwitch").onchange=e=>{ selected=agents.find(a=>a.id===e.target.value); updateActive(); updateConnButtons(); };
+function updateConnButtons(){
+  const hasSel = !!selected;
+  const connected = hasSel && selected.connected;
+  $("connectBtn").disabled = !hasSel || connected;
+  $("disconnectBtn").disabled = !hasSel || !connected;
+  $("editBtn").disabled = !hasSel;
+  $("removeBtn").disabled = !hasSel;
+}
+$("quickBtn").onclick=()=>{
+  const v=$("quickInput").value.trim(); if(!v) return;
+  // Add as manual connection for display
+  const id = "manual-"+Date.now();
+  const name = v.includes(":") ? v : "Device "+v.slice(0,6);
+  agents.push({id, hostname:name, user:"manual", connected:false, latency:0, remote:v});
+  selected = agents[agents.length-1];
+  renderConns($("connFilter").value); renderDeviceSwitch(); updateActive(); updateConnButtons();
+  addTerm(`Added manual connection ${name} (${v}) — use Agent to connect via TLS`, "out");
+  // Also try to save to localStorage
+  try{ localStorage.setItem("rmm_connections", JSON.stringify(agents)); }catch{}
+};
+$("addBtn").onclick=()=>{
+  const name = prompt("Connection name:", "My PC");
+  if(!name) return;
+  const host = prompt("Host:Port or DeviceId:", "176.229.98.54:4444");
+  if(!host) return;
+  const id = "conn-"+Date.now();
+  agents.push({id, hostname:name, user:"manual", connected:false, latency:0, remote:host});
+  renderConns($("connFilter").value); renderDeviceSwitch(); updateConnButtons();
+  try{ localStorage.setItem("rmm_connections", JSON.stringify(agents)); }catch{}
+  addTerm(`Added ${name} (${host})`, "out");
+};
+$("discoverBtn").onclick=()=>{
+  addTerm("Discovering agents via TLS heartbeat... (agents auto-register when they dial 176.229.98.54:4444 or 127.0.0.1:4444)", "out");
+  fetchStatus();
+  fetch("/api/agents").then(r=>r.json()).then(j=>{
+    if(j.agents && j.agents.length) { agents=j.agents; renderConns($("connFilter").value); renderDeviceSwitch(); updateConnButtons(); addTerm(`Found ${j.agents.length} agent(s)`, "out"); }
+    else addTerm("No agents yet — ensure Agent is running and can reach controller", "out");
+  });
+};
+$("refreshBtn").onclick=()=>{
+  addTerm("Refreshing...", "out");
+  fetchStatus();
+  fetch("/api/agents").then(r=>r.json()).then(j=>{
+    if(j.agents){ agents=j.agents; if(!selected && agents[0]) selected=agents[0]; renderConns($("connFilter").value); renderDeviceSwitch(); updateActive(); updateConnButtons(); }
+  });
+  if(ws && ws.readyState===1){ ws.send(JSON.stringify({type:"ping", target:selected?.id})); latencyStart=Date.now(); }
+  refreshFiles(false);
+};
+$("connectBtn").onclick=()=>{
+  if(!selected){ toast("Select a connection first", "err"); return; }
+  if(selected.connected) return addTerm(`${selected.hostname} already connected`, "out");
+  addTerm(`Connecting to ${selected.hostname} (${selected.remote||selected.id})...`, "out");
+  // For Go RMM, connections are inbound TLS from agent, not outbound from controller.
+  // So "Connect" just pings the agent if already connected, or shows help.
+  if(ws && ws.readyState===1) ws.send(JSON.stringify({type:"command", cmd:"get-status", target:selected.id}));
+  setTimeout(()=>addTerm("Note: Agents dial controller (reverse). Ensure agent is running: agent.exe -controller 176.229.98.54:4444", "help"), 500);
+};
+$("disconnectBtn").onclick=()=>{
+  if(!selected){ toast("No agent selected", "err"); return; }
+  const name=selected.hostname, id=selected.id;
+  addTerm(`Disconnecting ${name}...`, "out");
+  stopStream(true);
+  // End the session only: the agent is asked to go quiet, the remote PC
+  // itself is never touched (no logoff, no restart).
+  if(ws && ws.readyState===1) ws.send(JSON.stringify({type:"disconnect", target:id}));
+  selected=null;
+  renderConns($("connFilter").value); renderDeviceSwitch(); updateActive(); updateConnButtons();
+  toast(`Disconnected from ${name} — its agent service keeps running`, "ok");
+  addTerm(`Session ended. The agent on ${name} stays installed and will reappear on its own.`, "out");
+};
+$("editBtn").onclick=()=>{
+  if(!selected) return;
+  const n = prompt("Edit name:", selected.hostname);
+  if(n){ selected.hostname=n; renderConns($("connFilter").value); renderDeviceSwitch(); updateActive(); addTerm(`Renamed to ${n}`, "out"); }
+};
+$("removeBtn").onclick=()=>{
+  if(!selected) return;
+  if(!confirm(`Remove ${selected.hostname}?`)) return;
+  agents = agents.filter(a=>a.id!==selected.id);
+  selected = agents[0]||null;
+  renderConns($("connFilter").value); renderDeviceSwitch(); updateActive(); updateConnButtons();
+  try{ localStorage.setItem("rmm_connections", JSON.stringify(agents)); }catch{}
+  addTerm("Removed", "out");
+};
+$("installBtn").onclick=()=>{
+  addTerm("Install: copy Agent-Setup.exe to remote PC and run as Admin (silent). Or run: agent.exe -controller 176.229.98.54:4444 -ca server.crt", "out");
+  window.open("https://github.com/gibishahar-sudo/Controller-/releases/tag/v1.3.0", "_blank");
+};
+$("reconnectBtn").onclick=()=>{
+  addTerm("Reconnecting...", "out");
+  if(ws && selected) { ws.send(JSON.stringify({type:"command", cmd:"get-status", target:selected.id})); ws.send(JSON.stringify({type:"ping", target:selected.id})); latencyStart=Date.now(); }
+  fetchStatus();
+};
+$("settingsBtn").onclick=()=>{
+  const cur = location.host;
+  const port = prompt("Controller HTTP address (host:port):", cur);
+  if(port && port!==cur){ addTerm(`Settings: restart controller with -http ${port} and -addr 0.0.0.0:4444`, "out"); }
+  else addTerm(`Settings: TLS 176.229.98.54:4444, HTTP ${cur}, WebSocket ${ws?ws.url:"disconnected"}`, "out");
+};
+setInterval(()=>{ if(ws && ws.readyState===1 && selected){ ws.send(JSON.stringify({type:"ping", target:selected.id})); latencyStart=Date.now(); } },5000);
+// Audio tab
+document.querySelectorAll('[data-src]').forEach(btn=>{
+  btn.onclick=()=>{
+    document.querySelectorAll('[data-src]').forEach(b=>b.classList.remove("btn-primary"));
+    btn.classList.add("btn-primary");
+    const src=btn.dataset.src;
+    addTerm(`Audio source: ${src}`, "out");
+    if(selected) sendCmdVal(`get-audio-devices`);
+  };
+});
+$("audioRefresh")?.addEventListener("click", ()=>{
+  if(!selected){ toast("No agent", "err"); return; }
+  addTerm("Refreshing audio devices...", "out");
+  sendCmdVal("list-audio-endpoints");
+});
+// Fill the input/output device pickers from list-audio-endpoints JSON:
+// [{name,status,id,kind}] with kind input|output|unknown.
+function renderAudioDevices(data){
+  let list=[];
+  try{ list=JSON.parse(data); }catch{ return; }
+  if(!Array.isArray(list)) return;
+  const inp=$("audioDev"), out=$("audioOutDev");
+  const keepIn=inp.value, keepOut=out.value;
+  inp.innerHTML='<option value="">Default</option>';
+  out.innerHTML='<option value="">Default</option>';
+  let nIn=0, nOut=0;
+  list.forEach((d,i)=>{
+    if(!d||!d.name) return;
+    const o=document.createElement("option");
+    o.value=String(i); o.textContent=`${d.name} (${d.status||"?"})`;
+    o.dataset.name=d.name; o.dataset.status=d.status||""; o.dataset.kind=d.kind||"";
+    if(d.kind==="input"){ inp.appendChild(o); nIn++; }
+    else { out.appendChild(o); nOut++; }
+  });
+  if([...inp.options].some(o=>o.value===keepIn)) inp.value=keepIn;
+  if([...out.options].some(o=>o.value===keepOut)) out.value=keepOut;
+  $("audioStatus").textContent=`${nIn} input(s), ${nOut} output(s) found`;
+  addTerm(`Audio devices: ${nIn} input, ${nOut} output`, "out");
+}
+function audioDevDetails(selId, label){
+  const sel=$(selId); const o=sel.options[sel.selectedIndex];
+  if(!o||!o.value) return;
+  addTerm(`${label}: ${o.dataset.name} — status ${o.dataset.status||"?"} (${o.dataset.kind||"?"})`, "out");
+  $("audioStatus").textContent=`${label}: ${o.dataset.name} [${o.dataset.status||"?"}]`;
+  // Actually switch the remote default output/input to the chosen device
+  const id=o.dataset.status ? (o.textContent.split(" (")[0].trim()) : o.value;
+  // Use the InstanceId stored as value is index, so we need the name; the command does name-or-id lookup
+  sendCmdVal(`set-default-audio-device ${o.dataset.name}`);
+  addTerm(`Switching ${label.toLowerCase()} to ${o.dataset.name}...`, "out");
+}
+$("audioDev")?.addEventListener("change", ()=>audioDevDetails("audioDev","Input"));
+$("audioOutDev")?.addEventListener("change", ()=>audioDevDetails("audioOutDev","Output"));
+$("aStart")?.addEventListener("click", ()=>{
+  if(!selected){ toast("No agent", "err"); return; }
+  sendCmdVal("get-audio-devices");
+  if(!document.querySelector("#audioMonToggle input")?.checked) document.querySelector("#audioMonToggle")?.click();
+  addTerm("Audio monitor started — bars follow remote sound", "out");
+  $("aStart").disabled=true; $("aStop").disabled=false;
+});
+$("aStop")?.addEventListener("click", ()=>{
+  stopAudioMonitor();
+  addTerm("Audio monitor stopped", "out");
+  $("aStart").disabled=false; $("aStop").disabled=true;
+});
+$("aMute")?.addEventListener("click", ()=>{
+  if(!selected){ toast("No agent", "err"); return; }
+  sendCmdVal("set-mic-mute on");
+  addTerm("Mute toggled", "out");
+  $("audioStatus").textContent="Muted";
+});
+$("aVol")?.addEventListener("input", e=>{ $("aVolL").textContent=e.target.value+"%"; });
+$("aVol")?.addEventListener("change", e=>{ if(selected) sendCmdVal("set-volume "+e.target.value); });
+// Live level meter: polls get-audio-level 2x/s, bars move with remote sound
+let audioMonTimer=null;
+function updateAudioMeter(master, mic){
+  const mp=Math.round(Math.min(1,Math.max(0,master))*100), cp=Math.round(Math.min(1,Math.max(0,mic))*100);
+  $("masterBar").style.width=mp+"%"; $("masterPct").textContent=mp+"%";
+  $("micBar").style.width=cp+"%"; $("micPct").textContent=cp+"%";
+  $("audioLiveDot").textContent="● live"; $("audioLiveDot").style.color="var(--success)";
+  $("audioStatus").textContent="Monitoring…";
+}
+function stopAudioMonitor(silent){
+  if(audioMonTimer){ clearInterval(audioMonTimer); audioMonTimer=null; }
+  const t=$("audioMonToggle");
+  if(t){ t.classList.remove("on"); t.innerHTML=`<input type="checkbox"/> 👁 Monitor: OFF`; }
+  $("audioLiveDot").textContent="● idle"; $("audioLiveDot").style.color="";
+  if(!silent) $("audioStatus").textContent="Idle";
+}
+$("audioMonToggle").onclick=(e)=>{
+  const cb=e.currentTarget.querySelector("input"); cb.checked=!cb.checked;
+  e.currentTarget.classList.toggle("on", cb.checked);
+  e.currentTarget.innerHTML=`<input type="checkbox" ${cb.checked?"checked":""}/> 👁 Monitor: ${cb.checked?"ON":"OFF"}`;
+  if(cb.checked){
+    if(!selected){ toast("No agent selected", "err"); stopAudioMonitor(true); return; }
+    addTerm("Audio monitor on — bars follow remote speakers/mic", "out");
+    const poll=()=>{ if(ws && ws.readyState===1 && selected) ws.send(JSON.stringify({type:"command", cmd:"get-audio-level", target:selected.id})); };
+    poll(); audioMonTimer=setInterval(poll, 500);
+  } else stopAudioMonitor();
+};
+
+// Load saved connections on start
+try{
+  const saved = JSON.parse(localStorage.getItem("rmm_connections")||"[]");
+  if(saved.length && agents.length===0){ agents = saved.filter(a=>!a.id.startsWith("agent-")); renderConns($("connFilter").value); renderDeviceSwitch(); updateConnButtons(); }
+}catch{}
+// Load saved command favorites
+try{
+  const favs = JSON.parse(localStorage.getItem("rmm_cmdFavs")||"[]");
+  favs.forEach(v=>{
+    if([...document.querySelectorAll("#cmdFavs .chip[data-cmd]")].some(x=>x.dataset.cmd===v)) return;
+    const s=document.createElement("span"); s.className="chip"; s.dataset.cmd=v; s.textContent=v;
+    s.onclick=()=>{ input.value=v+" "; input.focus(); updateSuggest(); };
+    $("cmdFavs").insertBefore(s,$("addCmdFav"));
+  });
+}catch{}
+// Keyboard shortcuts: Ctrl+K focuses command input, Ctrl+1..4 switch tabs
+document.addEventListener("keydown", e=>{
+  if(e.ctrlKey && (e.key==="k"||e.key==="K")){ e.preventDefault(); document.querySelector('.tab[data-tab="commands"]')?.click(); input.focus(); }
+  if(e.ctrlKey && ["1","2","3","4"].includes(e.key)){
+    e.preventDefault();
+    const tabs=["screen","files","commands","audio"];
+    document.querySelector(`.tab[data-tab="${tabs[+e.key-1]}"]`)?.click();
+  }
+});
+
+// Init
+connectWS();
+refreshFiles(false);
+fetch("/api/commands").then(r=>r.json()).then(j=>{Object.assign(KNOWN,j);}).catch(()=>{});
+updateActive();
+</script>
+</body>
+</html>
