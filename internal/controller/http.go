@@ -215,7 +215,7 @@ func (s *Server) startHTTP(addr, dir string) {
 		if v := r.URL.Query().Get("len"); v != "" {
 			fmt.Sscanf(v, "%d", &length)
 		}
-		if length <= 0 || length > 1024*1024 {
+		if length <= 0 || length > 8*1024*1024 {
 			length = 512 * 1024
 		}
 		if offset < 0 {

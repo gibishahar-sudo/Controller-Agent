@@ -1559,14 +1559,17 @@ function renderPreview(kind, bytes, path){
 }
 async function previewLocal(full, kind){
   try{
-    // file-slice caps len at 1MB per call: page until the preview cap.
     const cap=previewCap(kind);
+    // Fetch in 4MB pages (was 1MB) — 4× fewer round trips for PNGs.
+    const page=4*1024*1024;
     const parts=[]; let off=0;
     while(off<cap){
-      const r=await (await fetch(`/api/file-slice?path=${encodeURIComponent(full)}&offset=${off}&len=${1048576}`)).json();
+      const want=Math.min(page, cap-off);
+      const r=await (await fetch(`/api/file-slice?path=${encodeURIComponent(full)}&offset=${off}&len=${want}`)).json();
       if(r.error){ $("previewBody").textContent="Cannot read file: "+r.error; return; }
       if(r.data===undefined||r.len===0) break;
       parts.push(b64ToBytes(r.data)); off+=r.len;
+      if(r.len < want) break; // EOF
     }
     let n=0; for(const b of parts) n+=b.length;
     const flat=new Uint8Array(n); let p=0; for(const b of parts){ flat.set(b,p); p+=b.length; }
@@ -1614,8 +1617,8 @@ function b64ToBytes(b64){ const s=atob(b64||""); const b=new Uint8Array(s.length
 async function sha256hex(bytes){ const d=await crypto.subtle.digest("SHA-256",bytes); return [...new Uint8Array(d)].map(x=>x.toString(16).padStart(2,"0")).join(""); }
 function setXfer(pct,label){ $("transferBar").style.width=pct+"%"; $("transferLabel").textContent=label; }
 // Chunk sizes mirror the controller's fileChunkRaw table — keep in sync.
-function xferChunkRaw(a){ const r=(a&&a.remote)||""; if(r==="mqtt") return 128*1024; if(r==="ntfy") return 4*1024; return 512*1024; }
-function xferPace(a){ const r=(a&&a.remote)||""; if(r==="ntfy") return 300; if(r==="mqtt") return 15; return 0; }
+function xferChunkRaw(a){ const r=(a&&a.remote)||""; if(r==="mqtt") return 256*1024; if(r==="ntfy") return 8*1024; return 512*1024; }
+function xferPace(a){ const r=(a&&a.remote)||""; if(r==="ntfy") return 150; if(r==="mqtt") return 5; return 0; }
 let dlSession=null; // {id,path,saveName,total,size,sha,chunks:Map,retries,timer,mode,kind}
 let dlQueue=[]; // queued browser downloads {path,saveName}
 let ulActive=0; // uploads currently streaming (for the queue readout)

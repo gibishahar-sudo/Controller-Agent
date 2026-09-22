@@ -687,13 +687,14 @@ func (s *Server) bundledAgentBin() string {
 }
 
 // fileChunkRaw sizes one file-transfer chunk per transport (mirrors the
-// update path: direct is roomy, relays are capped).
+// update path: direct is roomy, relays are capped). Bumped mqtt 128→256KB
+// in 1.41.2 so PNG previews (and all file transfers) need half the chunks.
 func fileChunkRaw(ac *AgentConn) int {
 	switch ac.transport() {
 	case "mqtt":
-		return 128 * 1024
+		return 256 * 1024
 	case "ntfy":
-		return 4 * 1024
+		return 8 * 1024
 	default:
 		return 512 * 1024
 	}
