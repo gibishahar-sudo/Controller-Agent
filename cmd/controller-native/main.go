@@ -13,6 +13,7 @@ import (
 
 	"github.com/jchv/go-webview2"
 	"rmm/internal/controller"
+	"rmm/internal/version"
 )
 
 func main() {
@@ -28,6 +29,7 @@ func main() {
 	flag.StringVar(&opts.ScreensDir, "screens", "screenshots", "directory to save screenshots")
 	flag.StringVar(&opts.NtfyTopic, "ntfy", "", "ntfy relay topic (empty = default)")
 	flag.StringVar(&opts.NtfyServer, "ntfy-server", "", "ntfy relay host (empty = default)")
+	flag.StringVar(&opts.House, "house", "", "house label shown in UI (e.g. Home)")
 	flag.BoolVar(&native, "native", true, "run as native WebView2 window (not browser)")
 	flag.BoolVar(&opts.AutoOpen, "open", false, "auto-open browser (ignored when --native)")
 	noNtfy := flag.Bool("no-ntfy", false, "disable ntfy relay")
@@ -58,11 +60,23 @@ func main() {
 		dataPath = filepath.Join(localApp, "RMM", "EBWebView")
 		_ = os.MkdirAll(dataPath, 0755)
 	}
-	url := "http://" + opts.HTTPAddr + "/"
+	// Navigate to THIS process's UI address: if the configured HTTP port
+	// was taken by another controller, the server fell back to an ephemeral
+	// port — opening the configured URL would show the other instance.
+	uiAddr := srv.HTTPAddr()
+	if uiAddr == "" {
+		uiAddr = opts.HTTPAddr
+	}
+	url := "http://" + uiAddr + "/"
 	fmt.Printf("[*] Starting native window -> %s\n", url)
+	title := "RMM Controller " + version.Version
+	if opts.House != "" {
+		title += " - " + opts.House
+		fmt.Printf("[*] House: %s\n", opts.House)
+	}
 	w := webview2.NewWithOptions(webview2.WebViewOptions{
 		Debug: false, AutoFocus: true, DataPath: dataPath,
-		WindowOptions: webview2.WindowOptions{Title: "Controller Client", Width: 1000, Height: 700, Center: true},
+		WindowOptions: webview2.WindowOptions{Title: title, Width: 1000, Height: 700, Center: true},
 	})
 	if w == nil {
 		log.Printf("[!] WebView2 failed, falling back to browser")

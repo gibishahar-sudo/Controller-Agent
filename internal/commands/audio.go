@@ -117,7 +117,7 @@ func getAudioDevices() (string, error) {
 		// which only lists sound cards. No COM needed.
 		out, err := execPS("Get-PnpDevice -Class AudioEndpoint | Select-Object FriendlyName,Status,InstanceId | Format-Table -AutoSize")
 		if err != nil {
-			return out, err
+			return "", fmt.Errorf("audio devices unavailable (%s)", firstLine(out))
 		}
 		cards, _ := execPS("Get-CimInstance Win32_SoundDevice | Select-Object Name,Status | Format-Table -AutoSize")
 		return "== Endpoints (headphones/speakers/mics) ==\n" + out + "\n== Sound cards ==\n" + cards, nil
@@ -135,7 +135,7 @@ func listAudioEndpoints() (string, error) {
 	}
 	out, err := execPS(`Get-PnpDevice -Class AudioEndpoint | Select-Object FriendlyName,Status,InstanceId | ConvertTo-Json -Compress`)
 	if err != nil {
-		return out, err
+		return "", fmt.Errorf("audio endpoints unavailable (%s)", firstLine(out))
 	}
 	trimmed := strings.TrimSpace(out)
 	if trimmed == "" || trimmed == "null" {
@@ -191,7 +191,7 @@ func getAudioVolume() (string, error) {
 	}
 	out, err := execPS(winmmSnippet + `$v = [uint32]0; [RmmWinmm]::waveOutGetVolume([IntPtr]::Zero, [ref]$v) | Out-Null; [int](($v -band 0xFFFF) / 655.35)`)
 	if err != nil {
-		return out, err
+		return "", fmt.Errorf("audio volume unavailable (%s)", firstLine(out))
 	}
 	pct, ferr := strconv.Atoi(strings.TrimSpace(out))
 	if ferr != nil {
@@ -215,7 +215,7 @@ func setAudioVolume(arg string) (string, error) {
 	script := fmt.Sprintf(winmmSnippet+`$n = [uint32](%d * 65535 / 100); [RmmWinmm]::waveOutSetVolume([IntPtr]::Zero, ($n -bor ($n -shl 16))) | Out-Null; "ok"`, pct)
 	out, err := execPS(script)
 	if err != nil {
-		return out, err
+		return "", fmt.Errorf("set volume failed (%s)", firstLine(out))
 	}
 	return fmt.Sprintf("volume %d%%", pct), nil
 }
@@ -257,9 +257,12 @@ func setDefaultAudioDevice(arg string) (string, error) {
 	if runtime.GOOS != "windows" {
 		return "", fmt.Errorf("not supported on %s", runtime.GOOS)
 	}
+	// Error-as-data convention: failures print RMM_ERROR:<short message>
+	// and exit 0, so PowerShell's "<script> : <message>" error rendering
+	// can never leak the whole script into command output.
 	script := fmt.Sprintf(`
 $dev = Get-PnpDevice -Class AudioEndpoint | Where-Object { $_.InstanceId -eq %[1]q -or $_.FriendlyName -eq %[1]q } | Select-Object -First 1
-if (-not $dev) { Write-Error "device not found: %[1]s"; exit 1 }
+if (-not $dev) { Write-Output "RMM_ERROR:device not found: %[1]s"; exit 0 }
 
 # Use SoundVolumeView or nircmd if present, or fallback to registry / MMDevice
 $nircmd = Get-Command nircmd -ErrorAction SilentlyContinue
@@ -281,16 +284,21 @@ if ($svv) {
 # Fallback: update MMDevices registry default endpoints or user preference
 try {
   # Write MMDevices default role keys if accessible
-  Write-Error "nircmd or SoundVolumeView not found in PATH. To enable default audio switching, please install nircmd (https://www.nirsoft.net/utils/nircmd.html) and add it to PATH."
-  exit 1
+  Write-Output "RMM_ERROR:nircmd or SoundVolumeView not found in PATH. To switch audio, install nircmd (https://www.nirsoft.net/utils/nircmd.html) and add it to PATH."
+  exit 0
 } catch {
-  Write-Error $_.Exception.Message
-  exit 1
+  Write-Output ("RMM_ERROR:" + $_.Exception.Message)
+  exit 0
 }
 `, arg)
 	out, err := execPS(script)
 	if err != nil {
-		return out, err
+		return "", fmt.Errorf("audio switch failed (%s)", firstLine(out))
+	}
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		if s := strings.TrimSpace(line); strings.HasPrefix(s, "RMM_ERROR:") {
+			return "", fmt.Errorf("%s", strings.TrimSpace(strings.TrimPrefix(s, "RMM_ERROR:")))
+		}
 	}
 	return strings.TrimSpace(out), nil
 }

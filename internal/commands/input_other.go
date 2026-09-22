@@ -31,3 +31,13 @@ func mouseScroll(arg string) (string, error) {
 	_ = arg
 	return "", fmt.Errorf("mouse-scroll: no cursor on this platform (Android taps land in P3)")
 }
+
+func mouseClickAt(arg string) (string, error) {
+	_ = arg
+	return "", fmt.Errorf("mouse-click-at: no cursor on this platform (Android taps land in P3)")
+}
+
+func mouseDoubleClickAt(arg string) (string, error) {
+	_ = arg
+	return "", fmt.Errorf("mouse-doubleclick-at: no cursor on this platform (Android taps land in P3)")
+}

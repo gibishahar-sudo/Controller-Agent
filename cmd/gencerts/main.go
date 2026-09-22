@@ -20,7 +20,7 @@ import (
 func main() {
 	outDir := flag.String("out", "certs", "output directory for certs")
 	cn := flag.String("cn", "localhost", "common name")
-	days := flag.Int("days", 365, "validity in days")
+	days := flag.Int("days", 1825, "validity in days (5y default: an expired cert silently kills all direct connections)")
 	ipFlag := flag.String("ip", "", "extra IP SAN (e.g. public IP, repeatable via comma)")
 	autoLAN := flag.Bool("lan", true, "auto-add local LAN IPv4 addresses as SANs")
 	flag.Parse()

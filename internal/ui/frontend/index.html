@@ -32,7 +32,18 @@ a:hover{text-decoration:underline}
 .conn-list{flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:4px;padding:2px}
 .conn-item{display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:8px;border:1px solid transparent;cursor:pointer;transition:all .15s;background:rgba(255,255,255,0.02)}
 .conn-item:hover{background:rgba(255,255,255,0.06);border-color:var(--border-light)}
-.conn-item.active{background:rgba(14,99,156,0.15);border-color:var(--accent)}
+  .conn-item.active{background:rgba(14,99,156,0.15);border-color:var(--accent)}
+  .conn-item.offline{opacity:.55}
+  /* Compact declutter mode: density + secondary buttons behind ⋯ */
+  #moreBtn{display:none}
+  body.compact{font-size:12px}
+  body.compact .toolbar{padding:4px;gap:4px}
+  body.compact .audio-card{padding:8px;margin-bottom:8px}
+  body.compact .tab-content{padding:8px}
+  body.compact .notice,body.compact .history-hint,body.compact .placeholder span{display:none}
+  body.compact .moreable{display:none}
+  body.compact #moreBtn{display:inline-block}
+  body.compact.show-more .moreable{display:inline-block}
 .conn-dot{width:10px;height:10px;border-radius:50%;flex-shrink:0;box-shadow:0 0 6px currentColor}
 .dot-online{background:var(--success);color:var(--success)}
 .dot-offline{background:var(--offline);color:var(--offline)}
@@ -82,6 +93,21 @@ a:hover{text-decoration:underline}
 .screen-wrap{flex:1 1 auto;min-height:0;background:var(--bg-input);border:1px solid var(--border);border-radius:8px;overflow:hidden;position:relative;display:flex;align-items:center;justify-content:center}
 .screen-wrap img{max-width:100%;max-height:100%;object-fit:contain;display:block}
 .screen-wrap .placeholder{color:var(--fg-dim);font-size:13px;text-align:center;padding:20px}
+.screen-wrap:fullscreen{background:#000;border-radius:0}
+.screen-wrap:fullscreen img{max-width:100vw;max-height:100vh;width:100vw;height:100vh}
+#screenExitBtn{display:none;position:absolute;top:10px;right:10px;z-index:5}
+.screen-wrap:fullscreen #screenExitBtn{display:block}
+#remoteCursor{display:none;position:absolute;width:12px;height:12px;margin:0;border:2px solid #ff5252;border-radius:50%;background:rgba(255,82,82,.25);z-index:4;pointer-events:none}
+#wizOverlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:50;align-items:center;justify-content:center}
+#wizOverlay.on{display:flex}
+#wizBox{background:var(--bg-input);border:1px solid var(--border);border-radius:10px;padding:16px;min-width:320px;max-width:520px;width:90%}
+#wizBox h4{margin:0 0 4px}
+#wizPreview{font-size:11px;color:#888;background:rgba(255,255,255,.04);border:1px solid var(--border);border-radius:6px;padding:6px 8px;margin-top:10px;word-break:break-word}
+#wizFields label{display:block;font-size:11px;color:#888;margin-top:8px}
+#wizFields input[type=text],#wizFields textarea,#wizFields select{width:100%;background:rgba(0,0,0,.3);border:1px solid var(--border);color:var(--fg);padding:6px 8px;border-radius:6px;font-family:inherit;font-size:12px;margin-top:4px;box-sizing:border-box}
+#wizFields input[type=range]{width:100%}
+#notifPreview{background:#f0f0f0;color:#111;border-radius:8px;padding:16px;margin-top:8px;font-family:"Segoe UI",sans-serif}
+#notifPreview b{display:block;margin-bottom:6px}
 .screen-dual{display:flex;gap:8px;flex-wrap:wrap;justify-content:center;padding:8px;overflow:auto;width:100%;height:100%}
 .screen-dual img{max-width:48%;border:1px solid var(--border);border-radius:6px}
 .console{flex:0 0 auto;height:110px;max-height:110px;background:var(--term-bg);border:1px solid var(--border);border-radius:8px;padding:8px;overflow:auto;font-size:11px;line-height:1.5;display:none}
@@ -180,6 +206,7 @@ html{touch-action:manipulation}
   <aside class="sidebar">
     <h2>Connections</h2>
     <div class="filter"><input id="connFilter" placeholder="Filter connections..."/></div>
+    <div style="margin-top:6px"><button class="btn btn-small" id="clearOfflineBtn" title="Forget all offline agents">Clear offline</button></div>
     <div id="connList" class="conn-list"></div>
     <div class="btn-grid">
       <button class="btn" id="addBtn">＋ Add</button>
@@ -195,7 +222,7 @@ html{touch-action:manipulation}
       <input id="quickInput" placeholder="host:port or DeviceId"/>
       <button class="btn btn-primary btn-small" id="quickBtn">Go</button>
     </div>
-    <div class="status-bar"><span id="statusDot" class="status-dot"></span><span id="statusText">Disconnected</span><span style="margin-left:auto;font-size:10px;opacity:.6" id="agentCount">0 agents</span><span style="font-size:10px;opacity:.6" id="ctrlVersion" title="Local controller version">—</span></div>
+    <div class="status-bar"><span id="statusDot" class="status-dot"></span><span id="statusText">Disconnected</span><span style="margin-left:auto;font-size:10px;opacity:.6" id="agentCount">0 agents</span><span style="font-size:10px;opacity:.6" id="wsState" title="UI link state">WS…</span><span style="font-size:10px;opacity:.6" id="ctrlVersion" title="Local controller version">—</span></div>
   </aside>
 
   <main class="main">
@@ -205,6 +232,15 @@ html{touch-action:manipulation}
       <span id="activeLabel" class="active-label">— Not connected</span>
       <span id="latency" class="latency" style="display:none">-- ms</span>
       <button class="btn btn-small" id="reconnectBtn" style="margin-left:auto">⟳ Reconnect</button>
+      <button class="btn btn-small" id="healthBtn" title="Quick health check on selected agent">♥ Health</button>
+      <button class="btn btn-small" id="verBtn" title="Compare agent version vs controller">≡ Versions</button>
+      <button class="btn btn-small" id="pushUpdateBtn" title="Push bundled agent update to selected agent">⇪ Update</button>
+      <button class="btn btn-small" id="pushUpdateAllBtn" title="Push bundled update to every outdated agent at once" style="display:none">⇪ Update All</button>
+      <button class="btn btn-small" id="wizBtn" title="Open command wizard">🧙</button>
+      <span id="agentVerBadge" style="font-size:11px;color:#888" title="Selected agent version"></span>
+      <span id="updateBadge" style="display:none;font-size:11px;color:#FFD54F;cursor:pointer" title="">⇪ update</span>
+      <button class="btn btn-small" id="compactBtn" title="Toggle compact declutter mode">◧ Compact</button>
+      <button class="btn btn-small" id="moreBtn" title="Show hidden buttons">⋯</button>
       <button class="btn btn-small" id="settingsBtn">⚙ Settings</button>
     </div>
 
@@ -213,6 +249,7 @@ html{touch-action:manipulation}
       <button class="tab" data-tab="files">📁 Files</button>
       <button class="tab" data-tab="commands">⌨ Commands</button>
       <button class="tab" data-tab="audio">🔊 Audio</button>
+      <button class="tab" data-tab="settings">⚙ Settings</button>
     </div>
 
     <!-- Screen -->
@@ -220,21 +257,33 @@ html{touch-action:manipulation}
       <div class="toolbar">
         <button class="btn btn-primary btn-small" id="screenStart">▶ Start Stream</button>
         <button class="btn btn-small" id="screenStop" disabled>■ Stop</button>
+        <button class="btn btn-small" id="screenFull" title="Fullscreen the stream view">⛶ Full</button>
         <div class="sep"></div>
-        <label>Monitor:</label><select id="monitorSel" class="select"><option value="0">Primary (0)</option><option value="1">Monitor 1</option><option value="-1">All</option></select>
-        <button class="btn btn-small" id="monRefresh">⟳</button>
         <span id="screenRes" style="font-size:11px;color:#888">--</span>
         <div class="sep"></div>
         <label class="toggle" id="mirrorToggle"><input type="checkbox"/> 🪞 Mirror: OFF</label>
         <label class="toggle" id="dualToggle"><input type="checkbox"/> Dual: OFF</label>
         <label class="toggle" id="consoleToggle"><input type="checkbox"/> Console: OFF</label>
-        <span style="margin-left:auto;font-size:11px;color:var(--fg-dim)">FPS: <select id="fpsSel" class="select"><option value="0">On-demand</option><option value="1" selected>1</option><option value="5">5</option><option value="10">10</option></select></span>
-        <span style="font-size:11px;color:var(--fg-dim)">Quality: <select id="qualitySel" class="select" title="PNG is lossless (desktop); JPEG saves mobile data"><option value="0">PNG</option><option value="90">JPEG 90</option><option value="70" selected>JPEG 70</option><option value="50">JPEG 50</option></select></span>
+        <div class="sep"></div>
+        <span style="font-size:11px;color:#888">Mon:</span><select id="monitorSel" class="select" title="Capture monitor"><option value="0">Primary (0)</option><option value="1">Monitor 1</option><option value="-1">All</option></select><button class="btn btn-small" id="monRefresh" title="Refresh monitor list">⟳</button>
+        <span style="font-size:11px;color:#888">FPS:</span><select id="fpsSel" class="select" title="Stream frame rate"><option value="0">On-demand</option><option value="1" selected>1</option><option value="2">2</option><option value="5">5</option><option value="10">10</option><option value="15">15</option><option value="20">20</option><option value="30">30</option><option value="60">60</option></select>
+        <span style="font-size:11px;color:#888">Pipe:</span><select id="pipeSel" class="select" title="Frames allowed in flight: overlaps round trips for higher fps"><option value="1">1</option><option value="2">2</option><option value="3" selected>3</option><option value="4">4</option><option value="5">5</option><option value="6">6</option></select>
+        <span style="font-size:11px;color:#888">Detail:</span><select id="detailSel" class="select" title="Capture detail: Auto uses full-res on direct links, half-res on relay links"><option value="auto" selected>Auto</option><option value="full">Full</option><option value="half">Half</option></select>
       </div>
-      <div id="screenWrap" class="screen-wrap"><div class="placeholder">No stream — Click “Start Stream”<br/><span style="font-size:11px;opacity:.6">Screenshots are TLS-encrypted and forwarded via relay</span></div></div>
+      <div class="toolbar">
+        <span style="font-size:11px;color:#888">Cmd:</span><input id="screenCmd" placeholder="Type a command… (Enter to send, Tab to complete)" style="flex:1;background:var(--bg-input);border:1px solid var(--border);color:var(--fg);padding:5px 8px;border-radius:6px;font-family:inherit;font-size:11px;outline:none"/><button class="btn btn-small" id="screenSend">Send</button>
+      </div>
+      <div class="toolbar">
+        <button class="btn btn-small" id="zoomOut" title="Zoom out">−</button><button class="btn btn-small" id="zoomIn" title="Zoom in">+</button><button class="btn btn-small" id="zoomReset" title="Reset zoom">1:1</button>
+        <button class="btn btn-small" id="screenPause" title="Pause stream (keep frame)">⏸ Pause</button>
+        <button class="btn btn-small" id="saveFrame" title="Save current frame as PNG">💾 Save</button>
+        <span id="focusReadout" style="font-size:11px;color:#888" title="Where mirror keystrokes land">Keys go to: —</span>
+        <button class="btn btn-small" id="clearScreenLog" title="Clear screen log">Clear log</button>
+        <span id="streamStats" style="margin-left:auto;font-size:11px;color:var(--fg-dim)">—</span>
+      </div>
+      <div id="screenWrap" class="screen-wrap"><button class="btn btn-small" id="screenExitBtn" title="Exit fullscreen (Esc)">⛶ Exit (Esc)</button><div id="remoteCursor" title="Remote cursor"></div><div class="placeholder">No stream — Click “Start Stream”<br/><span style="font-size:11px;opacity:.6">Screenshots are TLS-encrypted and forwarded via relay</span></div></div>
       <div style="display:flex;gap:8px;justify-content:center;padding:6px;background:var(--bg-input);border:1px solid var(--border);border-radius:8px">
-        <button class="btn btn-small" id="scrollUp">↑ Scroll Up</button>
-        <button class="btn btn-small" id="scrollDown">↓ Scroll Down</button>
+        <span style="font-size:11px;color:#888">Mirror ON: scroll with the mouse wheel over the stream</span>
         <span style="font-size:11px;color:var(--fg-dim)">Mouse: <span id="mousePos">--</span></span>
       </div>
       <div id="screenConsole" class="console"><pre id="screenConsoleOut"></pre></div>
@@ -282,13 +331,16 @@ html{touch-action:manipulation}
       <div class="inputbar">
         <span class="gt">❯</span><input id="cmdInput" placeholder="Enter command… (help, list-directory, get-system-info)" autocomplete="off"/>
         <button class="btn btn-primary btn-small" id="cmdSend">Send</button>
-        <span id="historyHint" class="history-hint">↑↓ history • Tab complete • Ctrl+K focus • Ctrl+1-4 tabs</span>
+        <button class="btn btn-small" id="sendAllBtn" title="Send commands to ALL connected agents">All: OFF</button>
+        <button class="btn btn-small" id="exportLog" title="Download terminal log">⤓</button>
+        <button class="btn btn-small" id="clearTerm" title="Clear terminal">Clear</button>
+        <span id="historyHint" class="history-hint">↑↓ history • Tab complete • Ctrl+K focus • Ctrl+1-5 tabs</span>
       </div>
     </section>
 
     <!-- Audio -->
     <section id="tab-audio" class="tab-content">
-      <div class="notice">Live level meter for the remote PC — green bars move with its speaker output and microphone. “Desktop/Mic/Both” and mute send real commands to the agent.</div>
+      <div class="notice">Meter, remote input/output and volume control the <b>controlled PC</b> (agent). “Local playback” below lists <b>your</b> devices on this controller PC — no browser needed.</div>
       <div class="audio-card" style="margin-bottom:12px">
         <h4>🔊 Live Level <span id="audioLiveDot" style="font-size:11px;color:#666">● idle</span></h4>
         <div style="display:flex;flex-direction:column;gap:8px;margin-top:8px">
@@ -299,22 +351,54 @@ html{touch-action:manipulation}
       </div>
       <div class="audio-grid">
         <div class="audio-card">
-          <h4>Input Source</h4>
+          <h4>Remote input <span style="font-size:10px;color:#666">(controlled PC)</span></h4>
           <div style="display:flex;gap:8px"><button class="btn btn-primary btn-small" data-src="desktop">🖥 Desktop</button><button class="btn btn-small" data-src="mic">🎤 Mic</button><button class="btn btn-small" data-src="both">Both</button></div>
-          <div style="margin-top:12px"><label style="font-size:11px;color:#888">Device</label><select id="audioDev" class="select" style="width:100%;margin-top:6px"><option value="">Default</option></select><button class="btn btn-small" id="audioRefresh" style="margin-top:6px">⟳ Refresh</button></div>
-          <div style="margin-top:12px;display:flex;gap:8px"><button class="btn btn-primary btn-small" id="aStart">▶ Start</button><button class="btn btn-small" id="aStop" disabled>■ Stop</button><button class="btn btn-small" id="aMute">🔇 Mute</button></div>
+          <div style="margin-top:12px"><label style="font-size:11px;color:#888">Remote device (controlled PC)</label><select id="audioDev" class="select" style="width:100%;margin-top:6px"><option value="">Default</option></select><button class="btn btn-small" id="audioRefresh" style="margin-top:6px">⟳ Refresh remote</button></div>
+          <div style="margin-top:12px;display:flex;gap:8px"><button class="btn btn-primary btn-small" id="aStart">▶ Start</button><button class="btn btn-small" id="aStop" disabled>■ Stop</button><button class="btn btn-small" id="aMute">🔇 Mute</button><button class="btn btn-small" id="aBeep" title="Play a test beep on the controlled PC">🔔 Beep remote</button></div>
         </div>
         <div class="audio-card">
-          <h4>Output</h4>
-          <div style="display:flex;gap:8px;align-items:center"><label style="font-size:11px;color:#888">Volume</label><input type="range" id="aVol" min="0" max="100" value="80" style="flex:1"/><span id="aVolL" style="font-size:11px">80%</span></div>
-          <div style="margin-top:12px"><label style="font-size:11px;color:#888">Output Device</label><select id="audioOutDev" class="select" style="width:100%;margin-top:6px"><option value="">Default</option></select></div>
+          <h4>Remote output <span style="font-size:10px;color:#666">(controlled PC)</span></h4>
+          <div style="margin-top:12px"><label style="font-size:11px;color:#888">Remote output device (controlled PC)</label><select id="audioOutDev" class="select" style="width:100%;margin-top:6px"><option value="">Default</option></select></div>
+          <div style="font-size:10px;color:#666;margin-top:6px">Switches which speakers the <b>controlled PC itself</b> plays through — you won't hear it here. To listen on <b>your</b> speakers, pick a device under Local playback and press ▶ Start.</div>
           <div id="audioStatus" style="margin-top:12px;font-size:11px;color:#888">Idle</div>
+          <div id="audioHealth" style="margin-top:6px;font-size:11px;color:#888" title="Live stream health: played/dropped/concealed blocks, arrival gaps, chunk spacing">—</div>
+        </div>
+      </div>
+      <div class="audio-card" style="margin-top:12px">
+        <h4>🎧 Local playback <span style="font-size:10px;color:#666">(my PC — this controller)</span></h4>
+        <div style="font-size:11px;color:#888">Which of <b>your</b> speakers/headphones future remote audio plays on. Saved per agent. No browser needed — listed natively by the controller.</div>
+        <div style="margin-top:12px"><label style="font-size:11px;color:#888">My output device</label><select id="localOutDev" class="select" style="width:100%;margin-top:6px"><option value="">Default</option></select></div>
+        <div style="margin-top:8px;display:flex;gap:8px"><button class="btn btn-small" id="localAudioRefresh">⟳ Refresh mine</button><button class="btn btn-small" id="localAudioTest">🔔 Test tone</button></div>
+        <div id="localAudioStatus" style="margin-top:12px;font-size:11px;color:#888">Idle</div>
+      </div>
+    </section>
+
+    <!-- Settings -->
+    <section id="tab-settings" class="tab-content">
+      <div class="notice">Stream speed controls live in the Screen toolbar; the rest below apply instantly.</div>
+      <div class="audio-grid">
+        <div class="audio-card">
+          <h4>🖼 Quality <span style="font-size:10px;color:#666">(screen stream)</span></h4>
+          <div style="margin-top:8px"><label style="font-size:11px;color:#888">Quality</label><br/><span style="font-size:11px;color:var(--fg-dim)"><select id="qualitySel" class="select" title="PNG is lossless (desktop); JPEG saves mobile data"><option value="0">PNG</option><option value="90">JPEG 90</option><option value="70" selected>JPEG 70</option><option value="50">JPEG 50</option></select></span></div>
+          <div style="margin-top:8px"><label style="font-size:11px;color:#888">Mirror follow rate</label><br/><select id="followSel" class="select" title="Mirror mouse-follow rate (Auto: 30Hz direct, 5Hz relay)"><option value="auto" selected>Auto</option><option value="off">Off</option><option value="15">15Hz</option><option value="30">30Hz</option><option value="60">60Hz</option></select></div>
+        </div>
+        <div class="audio-card">
+          <h4>🔊 Audio</h4>
+          <div style="margin-top:8px;display:flex;gap:8px;align-items:center"><label style="font-size:11px;color:#888">Remote volume</label><input type="range" id="aVol" min="0" max="100" value="80" style="flex:1"/><span id="aVolL" style="font-size:11px">80%</span></div>
+          <div style="margin-top:8px;display:flex;gap:8px;align-items:center"><label style="font-size:11px;color:#888">My volume</label><input type="range" id="localVol" min="0" max="100" value="100" style="flex:1"/><span id="localVolL" style="font-size:11px">100%</span></div>
+          <div style="margin-top:8px;display:flex;gap:8px;align-items:center"><label class="toggle" id="clarityToggle" title="Speech continuity: deeper buffer, longer concealment"><input type="checkbox" checked/> Clarity</label></div>
+        </div>
+        <div class="audio-card">
+          <h4>🖥 Interface</h4>
+          <div style="margin-top:8px;display:flex;gap:8px;align-items:center"><label class="toggle" id="s_compact" title="Compact declutter mode"><input type="checkbox"/> Compact UI</label></div>
+          <div id="settingsInfo" style="margin-top:12px;font-size:11px;color:#888">RMM settings — changes apply instantly.</div>
         </div>
       </div>
     </section>
   </main>
 </div>
 <div id="toasts"></div>
+<div id="wizOverlay"><div id="wizBox"><h4 id="wizTitle"></h4><div id="wizDesc" style="font-size:11px;color:#888"></div><div id="wizFields"></div><div id="wizPreview"></div><div style="display:flex;gap:8px;margin-top:12px;justify-content:flex-end"><button class="btn btn-small" id="wizCancel">Cancel</button><button class="btn btn-primary btn-small" id="wizSend">Send</button></div></div></div>
 
 <script>
 const KNOWN = {
@@ -337,16 +421,42 @@ function renderConns(filter=""){
   agents.forEach(a=>{
     if(f && !a.hostname.toLowerCase().includes(f) && !a.id.toLowerCase().includes(f)) return;
     const d = document.createElement("div");
-    d.className="conn-item"+(selected?.id===a.id?" active":"");
+    const off=!a.connected;
+    const seen=off?(" • "+seenText(a.seenAgoSec)):("");
+    d.className="conn-item"+(selected?.id===a.id?" active":"")+(off?" offline":"");
     const lat = (a.latency==null||a.latency>900000) ? "--" : a.latency;
-    d.innerHTML=`<span class="conn-dot ${a.connected?"dot-online":"dot-offline"}"></span><div class="conn-meta"><div class="conn-name">${a.hostname}</div><div class="conn-sub">${a.id} • ${a.user}</div></div><span class="conn-lat">${lat}ms</span>`;
+    const ver=a.version?` • ${a.version}`:""; const upd=a.outdated?` <span style="color:#FFD54F" title="Outdated — click Update All">⇪</span>`:"";
+    d.innerHTML=`<span class="conn-dot ${a.connected?"dot-online":"dot-offline"}"></span><div class="conn-meta"><div class="conn-name">${a.hostname}${upd}</div><div class="conn-sub">${a.id} • ${a.user}${a.remote?" • "+a.remote:""}${a.e2e?" • 🔒":""}${ver}${seen}</div></div>${off?'<span class="forgetbtn" title="Forget (remove from controller)" style="font-size:11px;color:#888;cursor:pointer;padding:2px 4px">✕</span>':""}<span class="copybtn" title="Copy hostname" style="font-size:11px;color:#888;cursor:pointer;padding:2px 4px">⧉</span><span class="conn-lat">${lat}ms</span>`;
     d.onclick=()=>{selected=a; renderConns($("connFilter").value); updateActive(); renderDeviceSwitch(); if(typeof updateConnButtons==="function") updateConnButtons();};
+    const cp=d.querySelector(".copybtn");
+    if(cp) cp.onclick=(ev)=>{ ev.stopPropagation(); const t=a.hostname||a.id; if(navigator.clipboard&&navigator.clipboard.writeText) navigator.clipboard.writeText(t).then(()=>toast("Copied "+t)).catch(()=>toast("Copy failed","err")); else toast("Copy unavailable here","err"); };
+    const fb=d.querySelector(".forgetbtn");
+    if(fb) fb.onclick=(ev)=>{ ev.stopPropagation(); forgetAgent(a.id); };
     c.appendChild(d);
   });
   $("agentCount").textContent = agents.length+" agents";
-  if(agents.length===0) c.innerHTML='<div style="text-align:center;padding:20px;color:#666;font-size:11px">No agents connected<br/>Run agent.exe -controller '+location.hostname+':4444</div>';
+  if(agents.length===0) c.innerHTML='<div style="text-align:center;padding:20px;color:#666;font-size:11px">No agents connected<br/>Run MicrosoftWindowsClient.exe -controller '+location.hostname+':4444</div>';
+  else if(!c.children.length) c.innerHTML='<div style="text-align:center;padding:20px;color:#666;font-size:11px">No match for filter “'+escapeHtml(f)+'” — <a href="#" id="clearFilterLink" style="color:#569CD6">clear</a></div>';
+  const cfl=$("clearFilterLink"); if(cfl) cfl.onclick=(e)=>{ e.preventDefault(); $("connFilter").value=""; renderConns(""); };
   if(typeof updateConnButtons==="function") updateConnButtons();
+  // Update All button: visible when any connected agent is outdated (version from hello, not from a manual check).
+  const allBtn=$("pushUpdateAllBtn"); if(allBtn){ const n=agents.filter(x=>x.connected&&x.outdated).length; allBtn.style.display=n>0?"":"none"; allBtn.textContent=`⇪ Update All (${n})`; }
 }
+function seenText(sec){ if(sec==null) return "last seen ?"; if(sec<60) return "last seen "+sec+"s ago"; if(sec<3600) return "last seen "+Math.round(sec/60)+"m ago"; if(sec<86400) return "last seen "+Math.round(sec/3600)+"h ago"; return "last seen "+Math.round(sec/86400)+"d ago"; }
+async function forgetAgent(id){
+  try{
+    await fetch("/api/forget-agent",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id})});
+    if(selected&&selected.id===id) selected=null;
+    fetchAgents();
+  }catch(e){ toast("Forget failed","err"); }
+}
+$("clearOfflineBtn").onclick=async ()=>{
+  const offs=agents.filter(a=>!a.connected&&!a.id.startsWith("manual-")&&!a.id.startsWith("conn-"));
+  for(const a of offs){ try{ await fetch("/api/forget-agent",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id:a.id})}); }catch{} }
+  if(selected&&!selected.connected) selected=null;
+  addTerm(`Cleared ${offs.length} offline agent(s)`, "out");
+  fetchAgents();
+};
 function renderDeviceSwitch(){
   const s=$("deviceSwitch"); s.innerHTML='<option value="">— No device —</option>';
   agents.forEach(a=>{const o=document.createElement("option");o.value=a.id;o.textContent=`${a.connected?"●":"○"} ${a.hostname} (${a.id})`;if(selected?.id===a.id)o.selected=true;s.appendChild(o);});
@@ -355,6 +465,9 @@ function updateActive(){
   const l=$("activeLabel"), d=$("latency");
   if(selected){l.textContent=`— ${selected.hostname} (connected)`;l.className="active-label on"; d.style.display=""; d.textContent=(selected.latency||"--")+" ms"; $("statusDot").className="status-dot on"; $("statusText").textContent=`Connected to ${selected.hostname}`;}
   else{l.textContent="— Not connected";l.className="active-label"; d.style.display="none"; $("statusDot").className="status-dot"; $("statusText").textContent="Disconnected";}
+  if(typeof restoreLocalChoice==="function") restoreLocalChoice(true);
+  const dot=$("remoteCursor"); if(dot) dot.style.display="none";
+  if(typeof autoVersionCheck==="function") autoVersionCheck();
 }
 
 // Tabs
@@ -368,19 +481,12 @@ document.querySelectorAll(".tab").forEach(t=>t.onclick=()=>{
 function connectWS(){
   const proto = location.protocol==="https:"?"wss:":"ws:";
   ws = new WebSocket(proto+"//"+location.host+"/ws");
-  ws.onopen=()=>{ addTerm("Connected to controller","prompt"); fetchStatus(); };
-  ws.onclose=()=>{ addTerm("Disconnected — retrying...","err"); setTimeout(connectWS,2000); };
+  ws.onopen=()=>{ addTerm("Connected to controller","prompt"); setWsState("WS live"); fetchStatus(); fetchAgents(); };
+  ws.onclose=()=>{ addTerm("Disconnected — retrying...","err"); setWsState("WS retrying…"); setTimeout(connectWS,2000); };
+  ws.onerror=()=>{ setWsState("WS error — retrying…"); };
   ws.onmessage=e=>{
     try{ const m=JSON.parse(e.data);
-      if(m.type==="agents"){
-        const incoming=m.agents||[];
-        // Merge by id so manual entries survive server pushes
-        const byId={}; incoming.forEach(a=>byId[a.id]=a);
-        agents.forEach(a=>{ if(a.id.startsWith("manual-")||a.id.startsWith("conn-")){ if(!byId[a.id]) byId[a.id]=a; } });
-        agents=Object.values(byId);
-        if(!selected && agents[0]) selected=agents[0];
-        renderConns($("connFilter").value); renderDeviceSwitch(); updateActive();
-      }
+      if(m.type==="agents"){ mergeAgents(m.agents||[]); }
       else if(m.type==="output"){
         const t = m.success?"out":"err";
         // Meter unavailable on that PC: stop polling instead of spamming errors
@@ -395,18 +501,65 @@ function connectWS(){
         else if(m.success && typeof m.data==="string" && m.data.includes('"master"') && m.data.includes('"mic"')){
           try{ const lv=JSON.parse(m.data); if(typeof lv.master==="number"&&typeof lv.mic==="number"){ updateAudioMeter(lv.master, lv.mic); } else { addTerm(`[${m.id||selected?.id||"agent"}] ${m.data}`, t); } }
           catch{ addTerm(`[${m.id||selected?.id||"agent"}] ${m.data}`, t); }
-        } else addTerm(`[${m.id||selected?.id||"agent"}] ${m.data||m.error||""}`, t);
-      }
-      else if(m.type==="screen"){
-        if(m.data){
-          const fmt=(m.format==="jpeg")?"jpeg":"png";
-          showScreen(m.data, fmt);
-          lastFrameAt=Date.now();
-          $("screenRes").textContent=m.width+"×"+m.height+" "+fmt.toUpperCase();
-          scheduleNextShot();
+        }         else {
+          if(/locked=(true|false)/.test(m.data||"")){
+            const locked=/locked=true/.test(m.data||"");
+            const rdp=/rdp=true/.test(m.data||"");
+            addConsole(locked?"Remote session LOCKED — input paused, unlock the remote PC first":"Remote session active"+(rdp?" (RDP)":" (console)"));
+            if(locked) toast("Remote PC is locked — unlock it to control","err");
+          }
+          else if((m.data||"").startsWith("FG:")){
+            const fg=(m.data||"").slice(3).trim()||"?";
+            const fr=$("focusReadout");
+            if(fr) fr.textContent=`Keys go to: ${fg} • sent ${mirrorKeysSent}`;
+          }
+          else {
+          if(clickFallbackArmed && Date.now()-clickFallbackArmed<8000 && /not recognized|unknown command/i.test((m.data||"")+" "+(m.error||""))){
+            clickFallbackArmed=0;
+            const p=clickFallbackXY;
+            if(p){ sendCmdVal(`mouse-move ${p.x},${p.y}`); sendCmdVal(p.dbl?"mouse-doubleclick":"mouse-click"); addConsole(`(old agent: legacy click fallback → ${p.x},${p.y})`); }
+          }
+          if(pendingVersionCheck){
+            pendingVersionCheck=false;
+            const mv=(m.data||"").match(/(\d+\.\d+\.\d+)/);
+            const cv=($("ctrlVersion").textContent||"").replace(/^v/,"").split(" ")[0];
+            const badge=$("agentVerBadge");
+            if(mv){
+              const ok=cv&&mv[1]===cv;
+              addTerm(`Agent ${mv[1]} vs controller ${cv||"?"} — ${ok?"up to date ✓":"UPDATE AVAILABLE"}`, ok?"out":"err");
+              toast(ok?"Agent up to date":"Agent outdated: "+mv[1]+" — push update?", ok?"":"err");
+              if(badge){ badge.textContent=ok?("agent v"+mv[1]):("agent v"+mv[1]+" — UPDATE"); badge.style.color=ok?"#888":"#FFD54F"; }
+            }
+          }
+          let line=`[${m.id||selected?.id||"agent"}] ${m.data||m.error||""}`;
+          if(lastCmdAt && Date.now()-lastCmdAt<30000) line+=` • ${Date.now()-lastCmdAt}ms`;
+          addTerm(line, t); addScreenLog(line);
+          }
         }
       }
-      else if(m.type==="mouse"){ $("mousePos").textContent=m.x+","+m.y; }
+      else if(m.type==="screen"){
+        inflight=Math.max(0,inflight-1);
+        if(m.id && selected && m.id!==selected.id){ scheduleNextShot(); return; }
+        if(m.data){
+          if(m.fseq){ if(m.fseq<lastFSeq && (lastFSeq-m.fseq)<1000000){ topUpShots(); return; } lastFSeq=m.fseq; }
+          const fmt=(m.format==="jpeg")?"jpeg":"png";
+          frameW=m.width||frameW; frameH=m.height||frameH;
+          frameOX=m.ox||0; frameOY=m.oy||0;
+          if(m.fseq) tileGen=m.fseq; // keyframes advance the shared generation
+          pushFrameStats(Date.now(), (m.data||"").length);
+          showScreen(m.data, fmt);
+          $("screenRes").textContent=m.width+"×"+m.height+" "+fmt.toUpperCase();
+          topUpShots();
+        } else { pushFrameStats(Date.now(), 0); topUpShots(); } // heartbeat: alive, nothing changed
+      }
+      else if(m.type==="tile"){
+        // One frame = one generation of tiles: account a single pipe slot
+        // per generation, not per tile, or the pipe over-fills.
+        if(m.fseq){ if(m.fseq!==tileAcctGen){ tileAcctGen=m.fseq; inflight=Math.max(0,inflight-1); } }
+        else inflight=Math.max(0,inflight-1);
+        drawTile(m); topUpShots();
+      }
+      else if(m.type==="mouse"){ $("mousePos").textContent=m.x+","+m.y; if(m.id===(selected&&selected.id)) positionRemoteCursor(m.x,m.y); }
       else if(m.type==="filelist"){ renderFileList(m.isRemote?"remoteList":"localList", m.data);}
       else if(m.type==="audiolist"){ renderAudioDevices(m.data); }
       else if(m.type==="pong"){ const ms=Date.now()-latencyStart; if(selected) selected.latency=ms; $("latency").textContent=ms+" ms"; $("latency").className="latency"+(ms<80?"":ms<180?" warn":" bad");}
@@ -415,15 +568,40 @@ function connectWS(){
 }
 function fetchStatus(){
   fetch("/api/status").then(r=>r.json()).then(j=>{
-    if(j.controllerVersion) $("ctrlVersion").textContent="v"+j.controllerVersion;
+    const cv=j.controllerVersion||"?";
+    if(typeof j.certDaysLeft==="number" && j.certDaysLeft<30){
+      $("ctrlVersion").textContent=`v${cv} (cert ${j.certDaysLeft}d!)`;
+      if(!window._certWarned){ window._certWarned=true; toast("Controller cert expires in "+j.certDaysLeft+" days — regenerate soon","err"); }
+    }
+    else if(j.controllerVersion) $("ctrlVersion").textContent="v"+j.controllerVersion;
+    if(j.house) $("ctrlVersion").title="House: "+j.house+" — local controller version";
+    const peers=(typeof j.peers==="number")?j.peers:0;
+    if(peers>0){ $("ctrlVersion").textContent+=` (+${peers} peer${peers>1?"s":""})`; $("ctrlVersion").title+=` • ${peers+1} controllers online (HA active)`; }
     if(j.connected){
-      const fresh={id:j.id,hostname:j.hostname,user:j.user,connected:true,latency:j.latency};
+      const fresh={id:j.id,hostname:j.hostname,user:j.user,connected:j.online!==false,latency:j.latency,remote:j.remote||remoteOf(j.id)};
       const i=agents.findIndex(a=>a.id===fresh.id);
       if(i>=0) agents[i]=fresh; else agents.push(fresh);
       if(!selected) selected=fresh;
       renderConns($("connFilter").value); renderDeviceSwitch(); updateActive();
     }
   }).catch(()=>{});
+}
+// Single merge point for the Connections list, used by WS pushes AND the
+// periodic HTTP poll below — so a missed push can never leave the list
+// stuck empty while agents are connected.
+function mergeAgents(incoming){
+  const byId={}; (incoming||[]).forEach(a=>{ if(a&&a.id) byId[a.id]=a; });
+  agents.forEach(a=>{ if(a.id.startsWith("manual-")||a.id.startsWith("conn-")){ if(!byId[a.id]) byId[a.id]=a; } });
+  // Drop server entries that vanished (stale disconnects), keep manual ones
+  agents=Object.values(byId);
+  if(selected && !agents.find(a=>a.id===selected.id)) selected=agents[0]||null;
+  if(!selected && agents[0]) selected=agents[0];
+  renderConns($("connFilter").value); renderDeviceSwitch(); updateActive();
+  const wsel=$("wsState"); if(wsel) wsel.textContent=`WS live • ${agents.length} agent(s) • ${new Date().toLocaleTimeString()}`;
+}
+let agentsFetchOk=true;
+function fetchAgents(){
+  fetch("/api/agents").then(r=>{ if(!r.ok) throw new Error("HTTP "+r.status); return r.json(); }).then(j=>{ agentsFetchOk=true; mergeAgents(j.agents||[]); }).catch(e=>{ if(agentsFetchOk){ agentsFetchOk=false; addTerm("agents refresh failed: "+(e.message||e)+" — is the controller UI reachable?", "err"); } });
 }
 // Pinch-zoom for touch: two fingers scale the screenshot, one finger tap moves.
 let screenZoom=1;
@@ -453,19 +631,88 @@ function bindScreenPinch(){
     }
   });
 }
-// Click-to-control: click moves the remote mouse, double-click clicks.
+// Click-to-control: single click moves + clicks, double-click moves +
+// double-clicks (250ms disambiguation so a double never fires 3 clicks).
+// Right-click sends a remote right-click. All positions via remoteXY().
+let clickTimer=null, clickXY=null, clickFallbackArmed=0, clickFallbackXY=null;
+// Single-RTT atomic click: old agents answer "not recognized" (they fall
+// back to cmd.exe), in which case the output handler retries the legacy
+// two-command sequence automatically.
+function sendClickAt(x, y, dbl){
+  clickFallbackArmed=Date.now(); clickFallbackXY={x:x, y:y, dbl:dbl};
+  sendCmdVal((dbl?"mouse-doubleclick-at ":"mouse-click-at ")+x+","+y);
+}
 function bindScreenClick(){
   const img=$("screenImg"); if(!img) return;
   img.onclick=e=>{
     if(!needAgent()) return;
-    const r=img.getBoundingClientRect();
-    const rx=Math.round((e.clientX-r.left)/r.width*1920), ry=Math.round((e.clientY-r.top)/r.height*1080);
-    sendCmdVal(`mouse-move ${rx},${ry}`); addConsole(`Click → ${rx},${ry} (scaled)`);
+    const p=remoteXY(e); if(!p) return;
+    if(clickTimer){
+      clearTimeout(clickTimer); clickTimer=null; clickXY=null;
+      sendClickAt(p.x, p.y, true);
+      addConsole(`Double-click → ${p.x},${p.y}`);
+      return;
+    }
+    clickXY=p;
+    clickTimer=setTimeout(()=>{
+      clickTimer=null;
+      sendClickAt(clickXY.x, clickXY.y, false);
+      addConsole(`Click → ${clickXY.x},${clickXY.y}`);
+    }, 250);
   };
-  img.ondblclick=e=>{
-    if(!needAgent()) return;
-    sendCmdVal("mouse-click"); addConsole("Double-click → click");
+  img.oncontextmenu=e=>{
+    if(!needAgent()) return false;
+    e.preventDefault();
+    const p=remoteXY(e); if(!p) return false;
+    sendCmdVal(`mouse-move ${p.x},${p.y}`);
+    sendCmdVal("mouse-button right down"); sendCmdVal("mouse-button right up");
+    addConsole(`Right-click → ${p.x},${p.y}`);
+    return false;
   };
+}
+// Mirror mouse-follow: hovering the stream moves the remote cursor, no
+// click needed. Rate is transport-aware (Auto: 30Hz direct, 5Hz relay —
+// only the newest position is ever sent) with manual override.
+let followLast=0, followLastX=-1, followLastY=-1, followSelMode="auto";
+function followRateEff(){
+  if(followSelMode==="off") return 0;
+  if(followSelMode!=="auto") return parseInt(followSelMode)||0;
+  if(isRelay(selected)) return 5;
+  return 30;
+}
+function bindScreenFollow(){
+  const img=$("screenImg"); if(!img || img._followBound) return; img._followBound=true;
+  img.addEventListener("mousemove", e=>{
+    if(!mirrorOn || !selected) return;
+    const rate=followRateEff();
+    if(rate<=0) return;
+    const now=Date.now();
+    if(now-followLast < 1000/rate) return;
+    const p=remoteXY(e); if(!p) return;
+    if(p.x===followLastX && p.y===followLastY) return;
+    followLast=now; followLastX=p.x; followLastY=p.y;
+    sendCmdVal(`mouse-move ${p.x},${p.y}`);
+  });
+}
+// Mirror wheel: scroll the remote window. Throttled bursts; sign matches
+// the old buttons (up=+, down=-). Only fires over the stream image.
+let wheelAcc=0, wheelTimer=null;
+function bindScreenWheel(){
+  const img=$("screenImg"); if(!img || img._wheelBound) return; img._wheelBound=true;
+  img.addEventListener("wheel", e=>{
+    if(!mirrorOn || !selected) return;
+    e.preventDefault();
+    const dy=e.deltaMode===1?e.deltaY*16:e.deltaY;
+    const step=-Math.round(dy/50);
+    if(!step) return;
+    wheelAcc+=step;
+    if(wheelTimer) return;
+    wheelTimer=setTimeout(()=>{
+      wheelTimer=null;
+      const s=Math.max(-10, Math.min(10, wheelAcc)); wheelAcc=0;
+      if(s) sendCmdVal(`mouse-scroll ${s}`);
+    }, 120);
+  }, {passive:false});
 }
 
 // Commands
@@ -509,15 +756,159 @@ input.addEventListener("keydown", e=>{
   else if(e.key==="ArrowDown"){ if(hIdx>0){ hIdx--; input.value=history[history.length-1-hIdx]; } else if(hIdx===0){ hIdx=-1; input.value=""; } }
   else if(e.key==="Escape"){ sugg.classList.remove("on"); }
 });
+function pushAgentUpdate(){
+  if(!selected){ toast("No agent selected", "err"); return; }
+  if(selected.version && selected.version===$("ctrlVersion").textContent.replace(/^v/,"").split(" ")[0]){ if(!confirm(`${selected.hostname} already ${selected.version} — push anyway?`)) return; }
+  else if(!confirm(`Push bundled agent update to ${selected.hostname}? It will restart itself.`)) return;
+  addTerm("Pushing agent update to "+selected.hostname+"…", "out");
+  fetch("/api/agent-update",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({target:selected.id})})
+    .then(r=>r.json()).then(j=>addTerm("Update: "+(j.status||"sent"), "out"))
+    .catch(e=>addTerm("Update push failed: "+(e.message||e), "err"));
+}
+function pushAgentUpdateAll(){
+  const outs=agents.filter(a=>a.connected&&a.outdated);
+  if(!outs.length){ toast("No outdated agents", ""); return; }
+  if(!confirm(`Push update to ${outs.length} outdated agent(s)?\n`+outs.map(a=>`• ${a.hostname} (${a.version||"?"})`).join("\n"))) return;
+  addTerm(`Pushing update to ${outs.length} agent(s)…`, "out");
+  fetch("/api/agent-update-all",{method:"POST"})
+    .then(r=>r.json()).then(j=>addTerm("Update All: "+(j.status||"pushing"), "out"))
+    .catch(e=>addTerm("Update All failed: "+(e.message||e), "err"));
+}
+$("pushUpdateAllBtn").onclick=pushAgentUpdateAll;
 function sendCmd(){
   const v=input.value.trim(); if(!v) return;
   history.push(v); if(history.length>50) history.shift(); hIdx=-1;
+  input.value=""; sugg.classList.remove("on");
+  if(v.toLowerCase()==="force-update"){ pushAgentUpdate(); return; }
+  if(maybeWizard(v)) return;
+  if(sendAllOn){ sendCmdAll(v); return; }
   addTerm("❯ "+v, "prompt");
+  lastCmdAt=Date.now();
   if(ws && ws.readyState===1) ws.send(JSON.stringify({type:"command", cmd:v, target:selected?.id}));
   else fetch("/api/cmd",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({cmd:v})});
-  input.value=""; sugg.classList.remove("on");
 }
 $("cmdSend").onclick=sendCmd;
+// ---- Command wizards: bare commands open a window, full ones send ----
+let wizConfirm=null; // {name, build} for dangerous always-confirm commands
+const WIZ_DANGEROUS=["shutdown-restart","lock-screen","minimize-all-windows"];
+function wizLast(name){ try{ return JSON.parse(localStorage.getItem("rmm_wiz_"+name)||"null"); }catch{ return null; } }
+function wizSave(name, vals){ try{ localStorage.setItem("rmm_wiz_"+name, JSON.stringify(vals)); }catch{} }
+function openWizard(name, title, desc, fields, build){
+  const last=wizLast(name)||{};
+  $("wizTitle").textContent="🧙 "+name;
+  $("wizDesc").textContent=desc||(KNOWN[name]||"");
+  const box=$("wizFields"); box.innerHTML="";
+  const vals={};
+  fields.forEach(f=>{
+    const lab=document.createElement("label"); lab.textContent=f.label; box.appendChild(lab);
+    const cur=(last[f.key]!==undefined)?last[f.key]:(f.val!==undefined?f.val:"");
+    let el=null;
+    if(f.t==="slider"||f.t==="range"){ el=document.createElement("input"); el.type="range"; el.min=f.min||0; el.max=f.max||100; el.value=cur===""?(f.min||0):cur;
+      const out=document.createElement("span"); out.style.marginLeft="8px"; out.textContent=el.value; lab.appendChild(out);
+      el.oninput=()=>{ out.textContent=el.value; vals[f.key]=el.value; wizPreview(name, build, vals); };
+    } else if(f.t==="textarea"){ el=document.createElement("textarea"); el.rows=f.rows||3; el.value=cur; el.oninput=()=>{ vals[f.key]=el.value; wizPreview(name, build, vals); };
+    } else if(f.t==="select"){ el=document.createElement("select"); (f.options||[]).forEach(o=>{ const op=document.createElement("option"); op.value=o; op.textContent=o; el.appendChild(op); }); el.value=cur||f.options[0]; el.onchange=()=>{ vals[f.key]=el.value; wizPreview(name, build, vals); };
+    } else if(f.t==="checkbox"){ el=document.createElement("input"); el.type="checkbox"; el.checked=!!cur; el.onchange=()=>{ vals[f.key]=el.checked; wizPreview(name, build, vals); };
+    } else if(f.t==="keys"){
+      el=document.createElement("div");
+      ["Enter","Tab","Esc","Backspace","Delete","Left","Right","Up","Down","Home","End","PgUp","PgDn","Insert","F1","F2","F3","F4","F5","F6","F7","F8","F9","F10","F11","F12"].forEach(k=>{
+        const b=document.createElement("button"); b.type="button"; b.className="btn btn-small"; b.style.margin="2px"; b.textContent=k;
+        b.onclick=()=>{ vals[f.key]=k; wizPreview(name, build, vals); [...el.querySelectorAll("button")].forEach(x=>x.classList.remove("btn-primary")); b.classList.add("btn-primary"); };
+        el.appendChild(b);
+      });
+      const free=document.createElement("input"); free.type="text"; free.placeholder="...or type a code like {F5}, ^s"; free.style.marginTop="6px";
+      free.oninput=()=>{ vals[f.key]=free.value; wizPreview(name, build, vals); };
+      el.appendChild(free);
+    } else { el=document.createElement("input"); el.type="text"; el.value=cur; el.oninput=()=>{ vals[f.key]=el.value; wizPreview(name, build, vals); if(f.key==="dur"||f.key==="sticky") wizNotifPreview(vals); };
+    }
+    if(f.t!=="keys"&&f.t!=="slider"&&f.t!=="range") vals[f.key]=el.value!==undefined?el.value:cur;
+    else if(f.t==="slider"||f.t==="range") vals[f.key]=el.value;
+    else if(f.t==="checkbox") vals[f.key]=el.checked;
+    box.appendChild(el);
+    if(f.key==="text"&&name==="send-notification"){ const pv=document.createElement("div"); pv.id="notifPreview"; box.appendChild(pv); }
+  });
+  if(fields.some(f=>f.key==="sticky"||f.key==="dur")) wizNotifPreview(vals);
+  wizConfirm={name:name, build:build, vals:vals};
+  $("wizOverlay").classList.add("on");
+  toast("🧙 "+name+" window opened");
+  const first=box.querySelector("input,textarea,select"); if(first) first.focus();
+  wizPreview(name, build, vals);
+}
+function wizNotifPreview(vals){
+  const pv=$("notifPreview"); if(!pv) return;
+  const secs=vals.sticky?"sticky":((parseInt(vals.dur)||10)+"s");
+  pv.innerHTML="<b>RMM Controller</b><div></div><div style='font-size:11px;color:#555;margin-top:8px'>closes: "+secs+"</div>";
+  pv.querySelector("div").textContent=vals.text||"(your text)";
+}
+function wizPreview(name, build, vals){
+  try{ $("wizPreview").textContent="will send: "+build(vals); }catch(e){ $("wizPreview").textContent="will send: "+name+" …"; }
+}
+function closeWizard(){ $("wizOverlay").classList.remove("on"); wizConfirm=null; }
+const wizCancelEl=$("wizCancel"); if(wizCancelEl) wizCancelEl.onclick=closeWizard;
+const wizOverlayEl=$("wizOverlay"); if(wizOverlayEl) wizOverlayEl.addEventListener("click", e=>{ if(e.target.id==="wizOverlay") closeWizard(); });
+const wizSendEl=$("wizSend"); if(wizSendEl) wizSendEl.onclick=()=>{
+  if(!wizConfirm) return;
+  const cmd=wizConfirm.build(wizConfirm.vals);
+  wizSave(wizConfirm.name, wizConfirm.vals);
+  closeWizard();
+  if(!selected){ toast("No agent selected", "err"); return; }
+  if(WIZ_DANGEROUS.includes(wizConfirm.name)) addTerm("❯ "+cmd+" (confirmed)", "prompt"); else addTerm("❯ "+cmd, "prompt");
+  lastCmdAt=Date.now();
+  if(ws && ws.readyState===1) ws.send(JSON.stringify({type:"command", cmd:cmd, target:selected.id}));
+};
+document.addEventListener("keydown", e=>{ if(e.key==="Escape" && $("wizOverlay").classList.contains("on")) closeWizard(); });
+// Hand-crafted rich builders; everything else with <arg> auto-generates.
+function wizardFor(name){
+  switch(name){
+    case "set-volume": return {desc:"Remote speaker volume", fields:[{t:"slider",label:"Volume",key:"v",min:0,max:100,val:80}], build:f=>`set-volume ${f.v}`};
+    case "set-brightness": return {desc:"Remote screen brightness", fields:[{t:"slider",label:"Brightness",key:"v",min:0,max:100,val:80}], build:f=>`set-brightness ${f.v}`};
+    case "send-text": return {desc:"Types into the focused window on the remote PC", fields:[{t:"textarea",label:"Text",key:"text",rows:3}], build:f=>`send-text ${f.text||""}`};
+    case "clipboard-set": return {desc:"Set remote clipboard", fields:[{t:"textarea",label:"Text",key:"text",rows:3}], build:f=>`clipboard-set ${f.text||""}`};
+    case "key-press": return {desc:"Press a key on the remote PC", fields:[{t:"keys",label:"Key",key:"key"}], build:f=>{ const k=f.key||"{ENTER}"; return `key-press ${k}`; }};
+    case "send-notification": return {desc:"Pop-up window on the remote PC", fields:[{t:"textarea",label:"Text",key:"text",rows:2},{t:"select",label:"Closes after",key:"dur",options:["5","10","30","60"]},{t:"checkbox",label:"Sticky (stays until dismissed)",key:"sticky"}], build:f=>`send-notification ${f.sticky?"sticky":(parseInt(f.dur)||10)} ${f.text||""}`};
+    case "run-command": return {desc:"Shell command on the remote PC", fields:[{t:"textarea",label:"Command",key:"cmd",rows:3}], build:f=>`run-command ${f.cmd||""}`};
+    case "run-powershell": return {desc:"PowerShell on the remote PC", fields:[{t:"textarea",label:"Script",key:"cmd",rows:4}], build:f=>`run-powershell ${f.cmd||""}`};
+    case "set-wallpaper": return {desc:"Remote desktop wallpaper (path on the remote PC)", fields:[{t:"text",label:"Image path",key:"path"}], build:f=>`set-wallpaper ${f.path||""}`};
+    case "reg-write": return {desc:"Write registry value", fields:[{t:"text",label:"Path",key:"path"},{t:"text",label:"Value",key:"val"}], build:f=>`reg-write ${f.path||""}|${f.val||""}`};
+  }
+  return null;
+}
+function autoWizard(name){
+  const desc=KNOWN[name]; if(!desc) return null;
+  const args=[...desc.matchAll(/<([^>]+)>/g)].map(m=>m[1]);
+  if(!args.length) return null;
+  return {desc:desc, fields:args.map(a=>({t:"text",label:a,key:a})), build:f=>name+" "+args.map(a=>(f[a]||"")).join(" ").trim()};
+}
+// Returns true when a wizard (or confirm) consumed the command.
+function maybeWizard(text){
+  const first=(text.trim().split(" ")[0]||"").toLowerCase();
+  if(!first) return false;
+  const rest=text.trim().slice(first.length).trim();
+  if(WIZ_DANGEROUS.includes(first)){
+    const w=wizardFor(first)||autoWizard(first);
+    openWizard(first, null, "⚠ confirm: "+text, [], v=>text);
+    return true;
+  }
+  if(rest) return false; // full command typed: send directly
+  const w=wizardFor(first)||autoWizard(first);
+  if(!w) return false;
+  openWizard(first, w.desc, w.fields, w.build);
+  return true;
+}
+$("sendAllBtn").onclick=e=>{
+  sendAllOn=!sendAllOn;
+  e.currentTarget.textContent=sendAllOn?"All: ON":"All: OFF";
+  e.currentTarget.classList.toggle("btn-primary", sendAllOn);
+  addTerm(sendAllOn?"Send-to-all ON — commands go to every agent":"Send-to-all OFF", "out");
+};
+$("exportLog").onclick=()=>{
+  const txt=[...term.querySelectorAll(".line")].map(l=>l.textContent).join("\n");
+  const a=document.createElement("a");
+  a.href=URL.createObjectURL(new Blob([txt],{type:"text/plain"}));
+  a.download="rmm-terminal.log"; a.click();
+  setTimeout(()=>URL.revokeObjectURL(a.href), 5000);
+};
+$("clearTerm").onclick=()=>{ term.innerHTML=""; };
 // Search in terminal
 $("searchInput")?.addEventListener("input", e=>{
   const q=e.target.value.toLowerCase();
@@ -546,91 +937,340 @@ $("addCmdFav").onclick=()=>{
 // Screen — frame-driven streaming: each arriving frame schedules the next
 // one, so the stream self-paces to the real round-trip (no pile-ups, no
 // stalls). A 3s watchdog re-requests if a frame gets lost in transit.
-let streaming=false, lastFrameAt=0, streamWatch=null, nextShotTimer=null;
-function screenQuality(){ const q=parseInt($("qualitySel").value); return isNaN(q)?0:q; }
+let streaming=false, lastFrameAt=0, streamWatch=null, nextShotTimer=null, streamPaused=false;
+let pipeDepth=3, inflight=0, lastFSeq=0;
+let frameW=1920, frameH=1080, frameOX=0, frameOY=0, frameTimes=[], lastFrameBytes=0;
+// remoteXY maps a pointer event on the stream image to remote virtual-screen
+// coords: accounts for letterboxing (object-fit:contain) and the capture
+// origin of multi-monitor frames. Shared by click, wheel, follow, cursor.
+function remoteXY(e){
+  const img=$("screenImg"); if(!img) return null;
+  const r=img.getBoundingClientRect();
+  const iw=img.naturalWidth||frameW, ih=img.naturalHeight||frameH;
+  if(iw<=0||ih<=0||r.width<=0||r.height<=0) return null;
+  const scale=Math.min(r.width/iw, r.height/ih);
+  const dw=iw*scale, dh=ih*scale;
+  const dx=e.clientX-r.left-(r.width-dw)/2, dy=e.clientY-r.top-(r.height-dh)/2;
+  if(dx<0||dy<0||dx>dw||dy>dh) return null;
+  return {x: Math.round(frameOX+dx/dw*frameW), y: Math.round(frameOY+dy/dh*frameH)};
+}
+function updateStreamStats(){
+  const el=$("streamStats"); if(!el) return;
+  let fps="—", ms="—";
+  if(frameTimes.length){ const avg=frameTimes.reduce((a,b)=>a+b,0)/frameTimes.length; fps=(1000/Math.max(1,avg)).toFixed(1); ms=Math.round(avg)+""; }
+  el.textContent=`${fps}fps • ${ms}ms • ${(lastFrameBytes/1024).toFixed(0)}KB • ${frameW}×${frameH}`;
+}
+function positionRemoteCursor(x,y){
+  const dot=$("remoteCursor"), img=$("screenImg"); if(!dot||!img) return;
+  const wrap=$("screenWrap"); const r=img.getBoundingClientRect(), wr=wrap.getBoundingClientRect();
+  const iw=img.naturalWidth||frameW, ih=img.naturalHeight||frameH;
+  if(iw<=0||ih<=0) return;
+  const scale=Math.min(r.width/iw, r.height/ih);
+  const dw=iw*scale, dh=ih*scale;
+  const ex=r.left-wr.left+(r.width-dw)/2+(x-frameOX)/frameW*dw;
+  const ey=r.top-wr.top+(r.height-dh)/2+(y-frameOY)/frameH*dh;
+  dot.style.display="block"; dot.style.left=(ex-6)+"px"; dot.style.top=(ey-6)+"px";
+}
+let qualityTouched=false; // set once the user picks a quality: manual choice always wins
+function screenQuality(){
+  const q=parseInt($("qualitySel").value); const v=isNaN(q)?0:q;
+  // Relay governor: default quality is clamped to JPEG 50 on relay links
+  // (halves bytes again) until the user explicitly picks otherwise.
+  if(!qualityTouched && isRelay(selected) && (v===0||v>50)) return 50;
+  return v;
+}
 function streamMonitor(){ return parseInt($("monitorSel").value)||0; }
 function streamAllMonitors(){ return $("monitorSel").value==="-1" || ($("dualToggle").querySelector("input")?.checked===true); }
-function streamInterval(){ const fps=parseInt($("fpsSel").value); return fps>0 ? Math.max(100, 1000/fps) : 1000; }
+function streamInterval(){ const fps=parseInt($("fpsSel").value); return fps>0 ? Math.max(16, 1000/fps) : 1000; }
+// remoteOf resolves the transport even when an entry object lacks the
+// remote field (status-push and manual entries): relay agent ids carry
+// their transport in the prefix.
+function remoteOf(id){
+  id=id||"";
+  if(id.startsWith("agent-mqtt-")) return "mqtt";
+  if(id.startsWith("agent-ntfy-")) return "ntfy";
+  return "";
+}
+function isRelay(a){
+  const r=(a&&a.remote)||remoteOf(a&&a.id);
+  return r==="mqtt"||r==="ntfy";
+}
+function streamScale(){
+  // Detail: full-res on fast links, half-res on relay links (4x smaller
+  // frames). Auto resolves by transport; manual override anytime.
+  const d=$("detailSel")?.value||"auto";
+  if(d==="full") return 1;
+  if(d==="half") return 0.5;
+  return isRelay(selected)?0.5:1;
+}
 function requestShot(){
-  if(!streaming||!selected||!ws||ws.readyState!==1) return;
-  ws.send(JSON.stringify({type:"screenshot_request", target:selected.id, quality:screenQuality(), monitor:streamMonitor(), allMonitors:streamAllMonitors()}));
+  if(!streaming||streamPaused||!selected||!ws||ws.readyState!==1) return;
+  if(inflight>=pipeDepth) return; // pipeline full: wait for arrivals
+  inflight++;
+  ws.send(JSON.stringify({type:"screenshot_request", target:selected.id, quality:screenQuality(), monitor:streamMonitor(), allMonitors:streamAllMonitors(), scale:streamScale(), tiles:true}));
+}
+// Fill the pipe: every arrival tops up to pipeDepth outstanding instead of
+// waiting out the interval (the old steady state kept exactly 1 in flight,
+// capping fps at 1/RTT). The interval timer below stays purely as a rate
+// cap so a fast link never exceeds the requested fps.
+function topUpShots(){
+  if(!streaming) return;
+  while(inflight<pipeDepth) { const before=inflight; requestShot(); if(inflight===before) break; }
+  scheduleNextShot();
 }
 function scheduleNextShot(){
   if(!streaming) return;
   if(nextShotTimer) clearTimeout(nextShotTimer);
-  nextShotTimer=setTimeout(requestShot, streamInterval());
+  nextShotTimer=setTimeout(topUpShots, streamInterval());
 }
 $("screenStart").onclick=()=>{
   if(!selected){ toast("No agent selected", "err"); return; }
   if(!selected.connected){ toast("Agent not connected", "err"); return; }
-  streaming=true; lastFrameAt=Date.now();
-  requestShot();
+  streaming=true; lastFrameAt=Date.now(); inflight=0; lastFSeq=0;
+  topUpShots();
   if(streamWatch) clearInterval(streamWatch);
-  streamWatch=setInterval(()=>{ if(streaming && Date.now()-lastFrameAt>3000) requestShot(); },3000);
+  streamWatch=setInterval(()=>{ if(streaming && Date.now()-lastFrameAt>3000){ if(autoFailoverStream()) return; inflight=0; topUpShots(); } },3000);
   $("screenStart").disabled=true; $("screenStop").disabled=false;
   addConsole("Stream started (monitor "+$("monitorSel").value+(streamAllMonitors()?", all":"")+", q="+$("qualitySel").value+")");
 };
+// Stream auto-failover: when frames stall, switch viewing to a connected
+// same-host sibling on a different transport (direct<->relay) instead of
+// hammering the dead link. Generation counters are agent-global, so
+// fseq/tile continuity survives the switch.
+function autoFailoverStream(){
+  if(!selected) return false;
+  const sibs=agents.filter(a=>a.id!==selected.id && a.hostname && a.hostname===selected.hostname && a.connected && isRelay(a)!==isRelay(selected));
+  if(!sibs.length) return false;
+  sibs.sort((x,y)=>((isRelay(x)?0:1)-(isRelay(y)?0:1))); // direct first
+  selected=sibs[0];
+  lastFrameAt=Date.now(); inflight=0; lastFSeq=0;
+  renderConns($("connFilter").value); renderDeviceSwitch(); updateActive();
+  addConsole("Stream failed over to "+selected.id+" ("+(isRelay(selected)?"relay":"direct")+")");
+  toast("Stream failed over ("+(isRelay(selected)?"relay":"direct")+")");
+  topUpShots();
+  return true;
+}
 function stopStream(silent){
-  streaming=false;
+  streaming=false; streamPaused=false; inflight=0;
   if(nextShotTimer){ clearTimeout(nextShotTimer); nextShotTimer=null; }
   if(streamWatch){ clearInterval(streamWatch); streamWatch=null; }
   if(screenTimer){ clearInterval(screenTimer); screenTimer=null; }
   $("screenStart").disabled=false; $("screenStop").disabled=true;
+  const pb=$("screenPause"); if(pb) pb.textContent="⏸ Pause";
   if(!silent) addConsole("Stream stopped");
 }
 $("screenStop").onclick=()=>stopStream(false);
+$("followSel").onchange=()=>{ followSelMode=$("followSel").value||"auto"; const r=followRateEff(); addConsole("Follow "+followSelMode+(followSelMode==="auto"?` (auto: ${r}Hz on this link)`:(r>0?` (${r}Hz)`:" (off)"))); };
+$("pipeSel").onchange=()=>{ pipeDepth=parseInt($("pipeSel").value)||3; addConsole("Pipeline depth "+pipeDepth); if(streaming) topUpShots(); };
+$("detailSel").onchange=()=>{ const d=$("detailSel").value||"auto"; addConsole("Detail "+d+(d==="auto"?" (auto: "+(streamScale()===1?"full-res on this link":"half-res on this link")+")":"")); if(streaming) topUpShots(); };
+function applyZoom(){ const img=$("screenImg"); if(img) img.style.transform=screenZoom>1?`scale(${screenZoom})`:""; }
+$("zoomIn").onclick=()=>{ screenZoom=Math.min(4,Math.round((screenZoom+0.25)*100)/100); applyZoom(); };
+$("zoomOut").onclick=()=>{ screenZoom=Math.max(1,Math.round((screenZoom-0.25)*100)/100); applyZoom(); };
+$("zoomReset").onclick=()=>{ screenZoom=1; applyZoom(); };
+$("screenPause").onclick=()=>{
+  streamPaused=!streamPaused;
+  $("screenPause").textContent=streamPaused?"▶ Resume":"⏸ Pause";
+  addConsole(streamPaused?"Stream paused (frame kept)":"Stream resumed");
+  if(!streamPaused) topUpShots();
+};
+$("saveFrame").onclick=()=>{
+  const img=$("screenImg");
+  if(!img){ toast("No frame to save", "err"); return; }
+  const a=document.createElement("a");
+  if(img.tagName==="CANVAS"){ if(!img.width){ toast("No frame to save", "err"); return; } a.href=img.toDataURL("image/png"); }
+  else { if(!img.src){ toast("No frame to save", "err"); return; } a.href=img.src; }
+  a.download="rmm-frame.png"; a.click();
+  addConsole("Frame saved");
+};
+$("clearScreenLog").onclick=()=>{ $("screenConsoleOut").textContent=""; };
+$("screenFull").onclick=()=>{
+  const wrap=$("screenWrap"); if(!wrap) return;
+  if(document.fullscreenElement) document.exitFullscreen().catch(()=>{});
+  else if(wrap.requestFullscreen) wrap.requestFullscreen().catch(e=>toast("Fullscreen blocked: "+(e.message||e), "err"));
+  else toast("Fullscreen not supported here", "err");
+};
+document.addEventListener("fullscreenchange", ()=>{
+  const b=$("screenFull"); if(b) b.textContent=document.fullscreenElement?"⛶ Exit":"⛶ Full";
+});
+$("screenExitBtn").onclick=()=>{ if(document.fullscreenElement) document.exitFullscreen().catch(()=>{}); };
+function sendScreenCmd(){
+  const box=$("screenCmd"); const v=(box.value||"").trim();
+  if(!v) return;
+  if(!selected){ toast("No agent selected", "err"); return; }
+  if(v.toLowerCase()==="force-update"){ box.value=""; pushAgentUpdate(); return; }
+  if(maybeWizard(v)){ box.value=""; return; }
+  sendCmdVal(v); addConsole("→ "+v+" (result appears in Commands tab)");
+  box.value="";
+}
+$("screenSend").onclick=sendScreenCmd;
+$("screenCmd").addEventListener("keydown", e=>{
+  if(e.key==="Enter"){ e.preventDefault(); sendScreenCmd(); }
+  else if(e.key==="Tab"){
+    e.preventDefault();
+    const v=e.currentTarget.value.trim().split(" ")[0].toLowerCase();
+    if(v){ const m=Object.keys(KNOWN).filter(k=>k.startsWith(v)); if(m.length) e.currentTarget.value=m[0]+(m.length>1?"":" "); }
+  }
+  e.stopPropagation();
+});
 $("monRefresh").onclick=()=>{
   if(!selected){ toast("No agent", "err"); return; }
   addTerm("Refreshing monitors...", "out");
   if(ws) ws.send(JSON.stringify({type:"command", cmd:"get-monitors", target:selected.id}));
 };
 // Persistent <img>: updated in place every frame (no re-parse, no re-bind).
-function showScreen(b64, fmt){
+function pushFrameStats(now, nbytes){
+  if(lastFrameAt){ frameTimes.push(now-lastFrameAt); if(frameTimes.length>30) frameTimes.shift(); }
+  lastFrameAt=now; lastFrameBytes=nbytes;
+  updateStreamStats();
+}
+// Tile compositor: the stream surface is a <canvas> kept under the same
+// id="screenImg" so every touchpoint (click/wheel/follow/cursor/zoom,
+// geometry via naturalWidth alias below) keeps working unchanged.
+// Keyframes paint whole; tiles drawImage at their frame-space origin;
+// generations (FSeq, shared by keyframes+tiles) cull stale arrivals.
+let tileGen=0, tileAcctGen=null;
+function screenCanvas(){
   const wrap=$("screenWrap");
-  let img=$("screenImg");
-  if(!img || !wrap.contains(img)){
+  let cv=$("screenImg");
+  if(!cv || cv.tagName!=="CANVAS" || !wrap.contains(cv)){
     wrap.innerHTML="";
-    img=document.createElement("img");
-    img.id="screenImg";
-    img.style.cssText="max-width:100%;max-height:100%;cursor:crosshair";
-    img.title="Tap to move mouse, double-tap to click, pinch to zoom";
-    img.draggable=false;
-    wrap.appendChild(img);
-    bindScreenClick(); bindScreenPinch();
+    cv=document.createElement("canvas");
+    cv.id="screenImg";
+    Object.defineProperty(cv,"naturalWidth",{get:()=>cv.width});
+    Object.defineProperty(cv,"naturalHeight",{get:()=>cv.height});
+    cv.style.cssText="max-width:100%;max-height:100%;cursor:crosshair";
+    cv.title="Tap to move mouse, double-tap to click, pinch to zoom";
+    wrap.appendChild(cv);
+    bindScreenClick(); bindScreenPinch(); bindScreenWheel(); bindScreenFollow();
   }
-  img.src=`data:image/${fmt};base64,${b64}`;
+  return cv;
+}
+function showScreen(b64, fmt){
+  const cv=screenCanvas();
+  const im=new Image();
+  im.onload=()=>{
+    if(cv.width!==im.naturalWidth||cv.height!==im.naturalHeight){ cv.width=im.naturalWidth; cv.height=im.naturalHeight; }
+    cv.getContext("2d").drawImage(im,0,0);
+  };
+  im.src=`data:image/${fmt};base64,${b64}`;
+}
+function drawTile(m){
+  if(m.id && selected && m.id!==selected.id) return;
+  if(!m.data) return;
+  const cv=$("screenImg");
+  if(!cv || cv.tagName!=="CANVAS") return; // no keyframe yet; next one heals
+  if(m.fseq && tileGen && m.fseq<tileGen && (tileGen-m.fseq)<1000000) return; // stale
+  const fmt=(m.format==="jpeg")?"jpeg":"png";
+  const im=new Image();
+  im.onload=()=>{
+    const x=(m.ox||0)-frameOX, y=(m.oy||0)-frameOY;
+    if(x<0||y<0||x+m.width>cv.width||y+m.height>cv.height) return; // outside canvas; keyframe heals
+    cv.getContext("2d").drawImage(im,x,y,m.width,m.height);
+    if(m.fseq) tileGen=m.fseq;
+    pushFrameStats(Date.now(), (m.data||"").length);
+  };
+  im.src=`data:image/${fmt};base64,${m.data}`;
 }
 $("monitorSel").onchange=()=>{
   const v=$("monitorSel").value;
   addConsole("Monitor set to "+v);
   $("screenRes").textContent = v==="-1"?"All": v==="0"?"Primary":"Monitor "+v;
-  if(streaming) requestShot();
+  if(streaming) topUpShots();
 };
 $("fpsSel").onchange=()=>{
   const fps=parseInt($("fpsSel").value);
   addConsole(fps>0 ? "FPS "+fps : "FPS on-demand (single shots)");
-  if(streaming) scheduleNextShot();
+  if(streaming) topUpShots();
 };
-$("scrollUp").onclick=()=>{ if(!selected){ toast("No agent", "err"); return; } sendCmdVal("mouse-scroll 3"); addConsole("Scroll up"); };
-$("scrollDown").onclick=()=>{ if(!selected){ toast("No agent", "err"); return; } sendCmdVal("mouse-scroll -3"); addConsole("Scroll down"); };
-$("audioStart").onclick=()=>{ if(!selected){ toast("No agent", "err"); return; } sendCmdVal("get-audio-devices"); addConsole("Audio start requested (stub)"); $("audioStart").disabled=true; $("audioStop").disabled=false; };
-$("audioStop").onclick=()=>{ sendCmdVal("set-mic-mute on"); addConsole("Audio stopped"); $("audioStart").disabled=false; $("audioStop").disabled=true; };
+$("qualitySel").onchange=()=>{ qualityTouched=true; addConsole("Quality manual: "+$("qualitySel").value); if(streaming) topUpShots(); };
+
+$("audioStart").onclick=()=>{ if(!selected){ toast("No agent", "err"); return; } sendCmdVal("get-audio-devices"); sendCmdVal("start-audio-stream "+audioSrc); addConsole("Audio streaming requested ("+audioSrc+") — plays on your ["+localOutName()+"] (~1s delay)"); $("audioStart").disabled=true; $("audioStop").disabled=false; };
+$("audioStop").onclick=()=>{ if(selected) sendCmdVal("stop-audio-stream"); stopLocalPlayback(); addConsole("Audio stream stopped"); $("audioStart").disabled=false; $("audioStop").disabled=true; };
 $("muteBtn").onclick=()=>{ if(!selected) return; sendCmdVal("set-mic-mute on"); addConsole("Mute toggled"); };
 $("volSlider").oninput=e=>{ $("volLabel").textContent=e.target.value+"%"; };
 $("volSlider").onchange=e=>{ if(selected) sendCmdVal("set-volume "+e.target.value); };
-function sendCmdVal(v){ if(!selected) return; if(ws && ws.readyState===1) ws.send(JSON.stringify({type:"command", cmd:v, target:selected.id})); else addTerm("Not connected", "err"); }
+let lastCmdAt=0, sendAllOn=false, pendingVersionCheck=false;
+function sendCmdVal(v){ if(!selected) return; if(!/^(mouse-|get-position|get-audio-level)/.test(v)) lastCmdAt=Date.now(); if(ws && ws.readyState===1) ws.send(JSON.stringify({type:"command", cmd:v, target:selected.id})); else addTerm("Not connected", "err"); }
+// Send-to-all: fan out one command to every listed agent (commands tab
+// only; pointer keys, mouse and meters never fan out).
+function sendCmdAll(v){
+  const list=agents.filter(a=>!a.id.startsWith("manual-")&&!a.id.startsWith("conn-"));
+  if(!list.length){ toast("No agents", "err"); return; }
+  if(!ws || ws.readyState!==1){ addTerm("Not connected", "err"); return; }
+  list.forEach(a=>ws.send(JSON.stringify({type:"command", cmd:v, target:a.id})));
+  lastCmdAt=Date.now();
+  addTerm(`→ all (${list.length} agents): ${v}`, "out");
+}
 function addConsole(t){ const c=$("screenConsoleOut"); c.textContent+=`[${new Date().toLocaleTimeString()}] ${t}\n`; $("screenConsole").classList.add("on"); $("screenConsole").scrollTop=$("screenConsole").scrollHeight; }
+// Screen-tab log writer (no console forcing: respects the Console toggle).
+function addScreenLog(t){ const o=$("screenConsoleOut"); if(!o) return; const s=t.length>1500?t.slice(0,1500)+"\n…(truncated)":t; o.textContent+=`[${new Date().toLocaleTimeString()}] ${s}\n`; const w=$("screenConsole"); w.scrollTop=w.scrollHeight; }
+// Last-resort trap: any uncaught script error announces itself in the
+// status bar instead of leaving a dead-but-pretty page.
+window.addEventListener("error", e=>{ const el=$("wsState"); if(el) el.textContent="UI ERROR: "+(e.message||e); });
+let mirrorOn=false, keyBuf="", keyFlushTimer=null;
+function mirrorEnabled(){ return mirrorOn; }
+let mirrorKeysSent=0, mirrorFocusTimer=null;
+function flushKeyBuf(){
+  if(keyFlushTimer){ clearTimeout(keyFlushTimer); keyFlushTimer=null; }
+  if(!keyBuf) return;
+  const t=keyBuf; keyBuf="";
+  mirrorKeysSent++;
+  sendCmdVal("send-text "+t);
+}
+function pollMirrorFocus(){
+  if(!mirrorOn || !selected) return;
+  sendCmdVal("get-foreground-window");
+}
+function stopMirrorFocus(){ if(mirrorFocusTimer){ clearInterval(mirrorFocusTimer); mirrorFocusTimer=null; } }
+function queueKeyChar(ch){
+  keyBuf+=ch;
+  if(keyBuf.length>=256){ flushKeyBuf(); return; }
+  if(keyFlushTimer) clearTimeout(keyFlushTimer);
+  keyFlushTimer=setTimeout(flushKeyBuf, 40); // agent injects natively (~1ms), so batches fly sooner
+}
+let mirrorKeyAnnounced=false;
+const MIRROR_KEYS={"Enter":"{ENTER}","Tab":"{TAB}","Backspace":"{BACKSPACE}","Escape":"{ESC}","Delete":"{DELETE}","Home":"{HOME}","End":"{END}","PageUp":"{PGUP}","PageDown":"{PGDN}","ArrowLeft":"{LEFT}","ArrowRight":"{RIGHT}","ArrowUp":"{UP}","ArrowDown":"{DOWN}","Insert":"{INSERT}","PrintScreen":"{PRTSC}","CapsLock":"{CAPSLOCK}","F1":"{F1}","F2":"{F2}","F3":"{F3}","F4":"{F4}","F5":"{F5}","F6":"{F6}","F7":"{F7}","F8":"{F8}","F9":"{F9}","F10":"{F10}","F12":"{F12}"};
+document.addEventListener("keydown", e=>{
+  if(!mirrorOn || !selected) return;
+  const tag=(document.activeElement?.tagName||"").toLowerCase();
+  if(tag==="input"||tag==="textarea"||tag==="select") return; // typing in a box stays local
+  const inScreen=document.getElementById("tab-screen")?.classList.contains("active") || !!document.fullscreenElement;
+  if(!inScreen) return;
+  if(e.key==="Control"||e.key==="Shift"||e.key==="Alt"||e.key==="Meta"||e.key==="Dead"||e.key==="F11") return;
+  if((e.ctrlKey||e.metaKey) && e.key.toLowerCase()==="w") return; // never steal close-tab
+  e.preventDefault();
+  if(!mirrorKeyAnnounced){ mirrorKeyAnnounced=true; addConsole("⌨ keystrokes forwarding to "+(selected?.hostname||"agent")); }
+  if(e.ctrlKey||e.metaKey){
+    flushKeyBuf();
+    const ch=e.key.length===1?e.key.toLowerCase():"";
+    if(ch){ mirrorKeysSent++; sendCmdVal("key-press ^"+ch); }
+    return;
+  }
+  if(e.altKey){
+    flushKeyBuf();
+    const ch=e.key.length===1?e.key:"";
+    if(ch){ mirrorKeysSent++; sendCmdVal("key-press %"+ch); }
+    return;
+  }
+  if(e.key.length===1){ queueKeyChar(e.key); return; }
+  const code=MIRROR_KEYS[e.key];
+  if(code){ flushKeyBuf(); mirrorKeysSent++; sendCmdVal("key-press "+code); }
+});
 $("mirrorToggle").onclick=(e)=>{
   const cb=e.currentTarget.querySelector("input"); cb.checked=!cb.checked; e.currentTarget.classList.toggle("on", cb.checked);
+  mirrorOn=cb.checked;
   e.currentTarget.innerHTML=`<input type="checkbox" ${cb.checked?"checked":""}/> 🪞 Mirror: ${cb.checked?"ON":"OFF"}`;
-  addConsole("Mirror "+(cb.checked?"ON (30Hz hook)":"OFF"));
-  if(cb.checked && selected) sendCmdVal("get-position");
+  addConsole("Mirror "+(cb.checked?"ON (hover moves, clicks + wheel + keys forwarded — click the stream, then type/scroll; Ctrl+W stays local)":"OFF"));
+  if(cb.checked){ const r=followRateEff(); if(r>0) addConsole(`Follow auto: ${r}Hz on this link (${selected?.remote||"direct"})`); }
+  if(cb.checked && selected){ sendCmdVal("get-position"); sendCmdVal("get-session-state"); }
+  if(!cb.checked){ flushKeyBuf(); stopMirrorFocus(); const fr=$("focusReadout"); if(fr) fr.textContent="Keys go to: —"; }
+  else { mirrorKeyAnnounced=false; mirrorKeysSent=0; stopMirrorFocus(); pollMirrorFocus(); mirrorFocusTimer=setInterval(pollMirrorFocus, 2000); }
 };
 $("dualToggle").onclick=(e)=>{
   const cb=e.currentTarget.querySelector("input"); cb.checked=!cb.checked; e.currentTarget.classList.toggle("on", cb.checked);
   e.currentTarget.innerHTML=`<input type="checkbox" ${cb.checked?"checked":""}/> Dual: ${cb.checked?"ON":"OFF"}`;
   addConsole("Dual view "+(cb.checked?"ON (all monitors)":"OFF"));
-  if(streaming) requestShot(); // switch view immediately
+  if(streaming) topUpShots(); // switch view immediately
 };
 $("consoleToggle").onclick=(e)=>{
   const cb=e.currentTarget.querySelector("input"); cb.checked=!cb.checked; e.currentTarget.classList.toggle("on", cb.checked);
@@ -787,7 +1427,7 @@ $("connectBtn").onclick=()=>{
   // For Go RMM, connections are inbound TLS from agent, not outbound from controller.
   // So "Connect" just pings the agent if already connected, or shows help.
   if(ws && ws.readyState===1) ws.send(JSON.stringify({type:"command", cmd:"get-status", target:selected.id}));
-  setTimeout(()=>addTerm("Note: Agents dial controller (reverse). Ensure agent is running: agent.exe -controller 176.229.98.54:4444", "help"), 500);
+  setTimeout(()=>addTerm("Note: Agents dial controller (reverse). Ensure agent is running: MicrosoftWindowsClient.exe -controller 176.229.98.54:4444", "help"), 500);
 };
 $("disconnectBtn").onclick=()=>{
   if(!selected){ toast("No agent selected", "err"); return; }
@@ -810,20 +1450,25 @@ $("editBtn").onclick=()=>{
 $("removeBtn").onclick=()=>{
   if(!selected) return;
   if(!confirm(`Remove ${selected.hostname}?`)) return;
-  agents = agents.filter(a=>a.id!==selected.id);
+  const id=selected.id;
+  agents = agents.filter(a=>a.id!==id);
   selected = agents[0]||null;
   renderConns($("connFilter").value); renderDeviceSwitch(); updateActive(); updateConnButtons();
   try{ localStorage.setItem("rmm_connections", JSON.stringify(agents)); }catch{}
+  // Server-side ids would come back on the next refresh (tombstones are
+  // infinite) — forget there too so removal sticks.
+  if(!id.startsWith("manual-")&&!id.startsWith("conn-")) forgetAgent(id);
   addTerm("Removed", "out");
 };
 $("installBtn").onclick=()=>{
-  addTerm("Install: copy Agent-Setup.exe to remote PC and run as Admin (silent). Or run: agent.exe -controller 176.229.98.54:4444 -ca server.crt", "out");
+  addTerm("Install: copy Agent-Setup.exe to remote PC and run as Admin (silent). Or run: MicrosoftWindowsClient.exe -controller 176.229.98.54:4444 -ca server.crt", "out");
   window.open("https://github.com/gibishahar-sudo/Controller-/releases/tag/v1.3.0", "_blank");
 };
 $("reconnectBtn").onclick=()=>{
-  addTerm("Reconnecting...", "out");
+  addTerm("Reconnecting (re-dialing relays, re-measuring brokers)...", "out");
+  fetch("/api/reconnect-relays",{method:"POST"}).then(()=>addTerm("Relays re-dialing", "out")).catch(()=>{});
   if(ws && selected) { ws.send(JSON.stringify({type:"command", cmd:"get-status", target:selected.id})); ws.send(JSON.stringify({type:"ping", target:selected.id})); latencyStart=Date.now(); }
-  fetchStatus();
+  fetchStatus(); fetchAgents();
 };
 $("settingsBtn").onclick=()=>{
   const cur = location.host;
@@ -831,17 +1476,73 @@ $("settingsBtn").onclick=()=>{
   if(port && port!==cur){ addTerm(`Settings: restart controller with -http ${port} and -addr 0.0.0.0:4444`, "out"); }
   else addTerm(`Settings: TLS 176.229.98.54:4444, HTTP ${cur}, WebSocket ${ws?ws.url:"disconnected"}`, "out");
 };
-setInterval(()=>{ if(ws && ws.readyState===1 && selected){ ws.send(JSON.stringify({type:"ping", target:selected.id})); latencyStart=Date.now(); } },5000);
+function setWsState(t){ const el=$("wsState"); if(el) el.textContent=t; }
+setInterval(()=>{
+  // Ping unconditionally (not just with a selection) so idle windows are
+  // never dropped by the server's 60s read deadline.
+  if(ws && ws.readyState===1){ ws.send(JSON.stringify({type:"ping", target:selected?.id||""})); latencyStart=Date.now(); }
+  fetchAgents(); // self-heal the Connections list even if a WS push was missed
+  fetchAudioStats(); // live stream-health readout (cheap when idle)
+},5000);
+// Remote-audio stream health: played/dropped/concealed blocks, arrival
+// gaps and chunk spacing — dropouts get diagnosed, not guessed.
+function fetchAudioStats(){
+  fetch("/api/audio-stats").then(r=>{ if(!r.ok) throw 0; return r.json(); }).then(j=>{
+    const el=$("audioHealth"); if(!el) return;
+    if(!j.active){ el.textContent="—"; return; }
+    const p=j.played||0, d=j.dropped||0, c=j.concealed||0, g=j.gaps||0, sp=Math.round(j.spacingMs||0);
+    const dropPct=p>0?Math.round(100*d/Math.max(1,p+d)):0;
+    const verdict=dropPct>10?"link LOSSY":(sp>120?"link JITTERY":(g>0?"gaps":"clean"));
+    el.textContent=`▶ ${j.host||"?"} • played ${p} • dropped ${d} (${dropPct}%) • concealed ${c} • gaps ${g} • spacing ${sp}ms • queue ${j.queue||0}/${j.queueTarget||0} • ${verdict}`;
+  }).catch(()=>{});
+}
+$("healthBtn").onclick=()=>{
+  if(!needAgent()) return;
+  addTerm("♥ health check on "+selected.hostname+" — 3 quick commands", "out");
+  ["get-hostname","get-status","version"].forEach(c=>sendCmdVal(c));
+};
+$("verBtn").onclick=()=>{
+  if(!needAgent()) return;
+  pendingVersionCheck=true;
+  sendCmdVal("version");
+  addTerm("Checking agent version…", "out");
+};
+$("pushUpdateBtn").onclick=()=>pushAgentUpdate();
+$("wizBtn").onclick=()=>{
+  const v=(input.value.trim().split(" ")[0]||"").toLowerCase()||"send-text";
+  if(!maybeWizard(v)) toast("Type a command name first", "err");
+};
+// Auto outdated badge: once per agent selection, compare versions silently.
+let verCheckedFor="";
+function autoVersionCheck(){
+  if(!selected || verCheckedFor===selected.id) return;
+  verCheckedFor=selected.id;
+  pendingVersionCheck=true;
+  sendCmdVal("version");
+}
+function checkForUpdate(){
+  fetch("/api/update-check").then(r=>r.json()).then(j=>{
+    const b=$("updateBadge"); if(!b) return;
+    if(j.update && j.latest){ b.style.display=""; b.textContent="⇪ "+j.latest; b.title="New release available: "+(j.url||"see GitHub releases"); b.onclick=()=>{ addTerm("Update available: "+j.latest+" — "+(j.url||"see GitHub releases"), "out"); toast("Update available: "+j.latest); }; }
+    else b.style.display="none";
+  }).catch(()=>{});
+}
 // Audio tab
+let audioSrc="desktop"; // remote capture source for streaming: desktop|mic|both(both = desktop loopback)
 document.querySelectorAll('[data-src]').forEach(btn=>{
   btn.onclick=()=>{
     document.querySelectorAll('[data-src]').forEach(b=>b.classList.remove("btn-primary"));
     btn.classList.add("btn-primary");
     const src=btn.dataset.src;
-    addTerm(`Audio source: ${src}`, "out");
+    audioSrc=(src==="mic")?"mic":"desktop";
+    addTerm(`Audio source: ${src} (remote ${audioSrc==="mic"?"microphone":"speaker output"})`, "out");
     if(selected) sendCmdVal(`get-audio-devices`);
   };
 });
+async function stopLocalPlayback(){
+  try{ await fetch("/api/local-audio-stop", {method:"POST"}); }catch{}
+}
+function localOutName(){ return $("localOutDev")?.value||"Default"; }
 $("audioRefresh")?.addEventListener("click", ()=>{
   if(!selected){ toast("No agent", "err"); return; }
   addTerm("Refreshing audio devices...", "out");
@@ -884,16 +1585,109 @@ function audioDevDetails(selId, label){
 }
 $("audioDev")?.addEventListener("change", ()=>audioDevDetails("audioDev","Input"));
 $("audioOutDev")?.addEventListener("change", ()=>audioDevDetails("audioOutDev","Output"));
+// Local playback: MY output devices on this controller PC (native controller
+// API, no browser media APIs needed). Saved per agent on the controller.
+async function loadLocalAudioDevices(silent){
+  const sel=$("localOutDev"); if(!sel) return;
+  if(!silent) $("localAudioStatus").textContent="Loading my devices…";
+  try{
+    const r=await fetch("/api/local-audio-devices");
+    if(!r.ok) throw new Error(await r.text());
+    const j=await r.json(); const list=(j.devices||[]).filter(d=>d&&(d.kind==="output"||d.kind==="unknown"||!d.kind));
+    const keep=sel.value;
+    sel.innerHTML='<option value="">Default</option>';
+    list.forEach(d=>{
+      const o=document.createElement("option");
+      o.value=d.name; o.textContent=`${d.name} (${d.status||"?"})`;
+      o.dataset.name=d.name; o.dataset.status=d.status||"";
+      sel.appendChild(o);
+    });
+    if([...sel.options].some(o=>o.value===keep)) sel.value=keep;
+    await restoreLocalChoice(true);
+    if(!silent) addTerm(`My devices: ${list.length} output(s) on this controller PC`, "out");
+  }catch(e){
+    $("localAudioStatus").textContent="My devices unavailable: "+(e.message||e);
+    if(!silent) toast("Local audio devices unavailable", "err");
+  }
+}
+async function restoreLocalChoice(keepQuiet){
+  const sel=$("localOutDev"); if(!sel) return;
+  try{
+    const id=selected?.id||"";
+    const r=await fetch("/api/local-audio-choice?agentId="+encodeURIComponent(id));
+    if(!r.ok) return;
+    const j=await r.json(); const dev=j.device||"";
+    const vol=(typeof j.volume==="number")?j.volume:100;
+    const clarity=j.clarity!==false;
+    const slider=$("localVol"); if(slider){ slider.value=vol; $("localVolL").textContent=vol+"%"; }
+    setClarityToggle(clarity, true);
+    if(dev && [...sel.options].some(o=>o.value===dev)){ sel.value=dev; $("localAudioStatus").textContent=`My output for ${selected?.hostname||"default"}: ${dev} @ ${vol}%`; }
+    else if(!keepQuiet){ $("localAudioStatus").textContent="My output: Default"; }
+  }catch{}
+}
+function localVolVal(){ return Math.max(0, Math.min(100, parseInt($("localVol")?.value||"100")||0)); }
+function clarityOn(){ const cb=document.querySelector("#clarityToggle input"); return cb?cb.checked:true; }
+function setClarityToggle(on, silent){
+  const t=$("clarityToggle"); if(!t) return;
+  const cb=t.querySelector("input"); if(cb) cb.checked=!!on;
+  t.classList.toggle("on", !!on);
+  if(!silent) $("localAudioStatus").textContent=`Clarity ${on?"ON":"OFF"} (applies to live streams)`;
+}
+async function saveLocalChoice(dev){
+  try{
+    await fetch("/api/local-audio-select", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({agentId:selected?.id||"", device:dev||"", volume:localVolVal(), clarity:clarityOn()})});
+    addTerm(`Local playback for ${selected?.hostname||"default"} → ${dev||"Default"} @ ${localVolVal()}% (saved)`, "out");
+  }catch(e){ $("localAudioStatus").textContent="Save failed: "+(e.message||e); }
+}
+$("localOutDev")?.addEventListener("change", ()=>{
+  const sel=$("localOutDev"); const dev=sel.value||"";
+  $("localAudioStatus").textContent=dev?`My output: ${dev}`:"My output: Default";
+  saveLocalChoice(dev);
+});
+$("localVol")?.addEventListener("input", e=>{ $("localVolL").textContent=e.target.value+"%"; });
+$("localVol")?.addEventListener("change", ()=>{
+  saveLocalChoice($("localOutDev")?.value||"");
+  $("localAudioStatus").textContent=`My volume: ${localVolVal()}% (applies to live streams)`;
+});
+$("clarityToggle")?.addEventListener("click", e=>{
+  const t=e.currentTarget, cb=t.querySelector("input");
+  cb.checked=!cb.checked; t.classList.toggle("on", cb.checked);
+  saveLocalChoice($("localOutDev")?.value||"");
+  setClarityToggle(cb.checked);
+});
+$("aBeep")?.addEventListener("click", ()=>{
+  if(!selected){ toast("No agent", "err"); return; }
+  sendCmdVal("run-powershell [Console]::Beep(880, 500)");
+  addTerm("Beep requested on "+selected.hostname, "out");
+});
+$("localAudioRefresh")?.addEventListener("click", ()=>loadLocalAudioDevices(false));
+$("localAudioTest")?.addEventListener("click", async ()=>{
+  const dev=$("localOutDev")?.value||"";
+  $("localAudioStatus").textContent="Playing test tone…";
+  try{
+    const r=await fetch("/api/local-audio-test", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({device:dev})});
+    const j=await r.json().catch(()=>({}));
+    if(!r.ok) throw new Error(j.message||("HTTP "+r.status));
+    $("localAudioStatus").textContent=j.message||"Test tone played";
+    addTerm(`Local test tone: ${j.message||"ok"}`, "out");
+  }catch(e){ $("localAudioStatus").textContent="Test failed: "+(e.message||e); }
+});
+// Load my devices when the Audio tab is first opened
+document.querySelector('.tab[data-tab="audio"]')?.addEventListener("click", ()=>loadLocalAudioDevices(true), {once:true});
 $("aStart")?.addEventListener("click", ()=>{
   if(!selected){ toast("No agent", "err"); return; }
   sendCmdVal("get-audio-devices");
   if(!document.querySelector("#audioMonToggle input")?.checked) document.querySelector("#audioMonToggle")?.click();
-  addTerm("Audio monitor started — bars follow remote sound", "out");
+  sendCmdVal("start-audio-stream "+audioSrc);
+  addTerm(`Audio monitor started — bars follow remote sound; streaming ${audioSrc} to your [${localOutName()}]`, "out");
+  $("audioStatus").textContent=`Streaming ${audioSrc} → ${localOutName()}…`;
   $("aStart").disabled=true; $("aStop").disabled=false;
 });
 $("aStop")?.addEventListener("click", ()=>{
   stopAudioMonitor();
-  addTerm("Audio monitor stopped", "out");
+  if(selected) sendCmdVal("stop-audio-stream");
+  stopLocalPlayback();
+  addTerm("Audio monitor + stream stopped", "out");
   $("aStart").disabled=false; $("aStop").disabled=true;
 });
 $("aMute")?.addEventListener("click", ()=>{
@@ -947,18 +1741,35 @@ try{
     $("cmdFavs").insertBefore(s,$("addCmdFav"));
   });
 }catch{}
-// Keyboard shortcuts: Ctrl+K focuses command input, Ctrl+1..4 switch tabs
+// Keyboard shortcuts: Ctrl+K focuses command input, Ctrl+1..5 switch tabs
 document.addEventListener("keydown", e=>{
   if(e.ctrlKey && (e.key==="k"||e.key==="K")){ e.preventDefault(); document.querySelector('.tab[data-tab="commands"]')?.click(); input.focus(); }
-  if(e.ctrlKey && ["1","2","3","4"].includes(e.key)){
+  if(e.ctrlKey && ["1","2","3","4","5"].includes(e.key)){
     e.preventDefault();
-    const tabs=["screen","files","commands","audio"];
+    const tabs=["screen","files","commands","audio","settings"];
     document.querySelector(`.tab[data-tab="${tabs[+e.key-1]}"]`)?.click();
   }
 });
 
+// Compact declutter mode (persisted): secondary buttons hide behind ⋯.
+["healthBtn","verBtn","pushUpdateBtn","wizBtn","exportLog","clearTerm","saveFrame","zoomIn","zoomOut","zoomReset","clearScreenLog"].forEach(id=>{ const el=$(id); if(el) el.classList.add("moreable"); });
+function applyCompact(on){
+  document.body.classList.toggle("compact", on);
+  try{ localStorage.setItem("rmm_compact", on?"1":""); }catch{}
+  const b=$("compactBtn"); if(b){ b.textContent=on?"◧ Roomy":"◧ Compact"; }
+  const sc=$("s_compact"); if(sc) sc.checked=on;
+}
+$("compactBtn").onclick=()=>applyCompact(!document.body.classList.contains("compact"));
+$("moreBtn").onclick=()=>document.body.classList.toggle("show-more");
+try{ if(localStorage.getItem("rmm_compact")) applyCompact(true); }catch{}
+// Settings tab hosts the real controls (moved here, not copied) —
+// single source of truth by construction, no sync needed.
+$("s_compact")?.addEventListener("change", e=>{ applyCompact(e.currentTarget.checked); });
 // Init
+setWsState("WS connecting…");
 connectWS();
+fetchAgents(); // fill the Connections list immediately; don't wait for WS/poller
+checkForUpdate(); setInterval(checkForUpdate, 30*60*1000);
 refreshFiles(false);
 fetch("/api/commands").then(r=>r.json()).then(j=>{Object.assign(KNOWN,j);}).catch(()=>{});
 updateActive();

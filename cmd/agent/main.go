@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"hash/fnv"
 	"image"
 	"image/jpeg"
 	"image/png"
@@ -31,17 +32,79 @@ import (
 	"rmm/internal/mqttrelay"
 	"rmm/internal/protocol"
 	"rmm/internal/relay"
+	"rmm/internal/version"
 )
 
 // captureImage captures a display. quality<=0 means PNG (lossless, desktop
 // default); quality 1-100 means JPEG (a 1920x1080 frame drops from ~180KB
 // PNG to ~40-80KB JPEG at q70). all=true captures the full virtual screen
 // across every monitor (dual view); otherwise monitor selects the display
+// halveRGBA downscales RGBA by 2x2 box average (dependency-free): half
+// width/height = quarter pixels = ~4x smaller JPEGs for relay links.
+func halveRGBA(src *image.RGBA) *image.RGBA {
+	b := src.Bounds()
+	w, h := b.Dx()/2, b.Dy()/2
+	if w < 1 {
+		w = 1
+	}
+	if h < 1 {
+		h = 1
+	}
+	dst := image.NewRGBA(image.Rect(0, 0, w, h))
+	maxX, maxY := b.Min.X+b.Dx()-1, b.Min.Y+b.Dy()-1
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			var r, g, bl, a uint32
+			for dy := 0; dy < 2; dy++ {
+				for dx := 0; dx < 2; dx++ {
+					sx := b.Min.X + x*2 + dx
+					if sx > maxX {
+						sx = maxX
+					}
+					sy := b.Min.Y + y*2 + dy
+					if sy > maxY {
+						sy = maxY
+					}
+					i := src.PixOffset(sx, sy)
+					r += uint32(src.Pix[i])
+					g += uint32(src.Pix[i+1])
+					bl += uint32(src.Pix[i+2])
+					a += uint32(src.Pix[i+3])
+				}
+			}
+			i := dst.PixOffset(x, y)
+			dst.Pix[i] = uint8(r / 4)
+			dst.Pix[i+1] = uint8(g / 4)
+			dst.Pix[i+2] = uint8(bl / 4)
+			dst.Pix[i+3] = uint8(a / 4)
+		}
+	}
+	return dst
+}
+
+// encodeImage compresses one frame/tile: JPEG at quality, PNG when quality<=0.
+func encodeImage(img image.Image, quality int) (data []byte, format string, err error) {
+	var buf bytes.Buffer
+	if quality > 0 {
+		if quality > 100 {
+			quality = 100
+		}
+		if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: quality}); err != nil {
+			return nil, "", err
+		}
+		return buf.Bytes(), "jpeg", nil
+	}
+	if err := png.Encode(&buf, img); err != nil {
+		return nil, "", err
+	}
+	return buf.Bytes(), "png", nil
+}
+
 // index (out of range falls back to primary).
-func captureImage(quality, monitor int, all bool) (data []byte, w, h int, format string, err error) {
+func captureRaw(monitor int, all bool, scale float64) (img *image.RGBA, w, h, ox, oy int, err error) {
 	n := screenshot.NumActiveDisplays()
 	if n == 0 {
-		return nil, 0, 0, "", fmt.Errorf("no displays")
+		return nil, 0, 0, 0, 0, fmt.Errorf("no displays")
 	}
 	bounds := screenshot.GetDisplayBounds(0)
 	if all && n > 1 {
@@ -66,29 +129,152 @@ func captureImage(quality, monitor int, all bool) (data []byte, w, h int, format
 	} else if monitor > 0 && monitor < n {
 		bounds = screenshot.GetDisplayBounds(monitor)
 	}
-	img, err := screenshot.CaptureRect(bounds)
+	cimg, cerr := screenshot.CaptureRect(bounds)
+	if cerr != nil {
+		return nil, 0, 0, 0, 0, cerr
+	}
+	img = cimg
+	w, h = bounds.Dx(), bounds.Dy()
+	ox, oy = bounds.Min.X, bounds.Min.Y
+	if scale > 0 && scale < 1 {
+		// Half detail for relay links: origin scales too so the UI's
+		// pointer mapping stays in the same (scaled) space as w/h.
+		img = halveRGBA(img)
+		w /= 2
+		h /= 2
+		ox /= 2
+		oy /= 2
+	}
+	return img, w, h, ox, oy, nil
+}
+
+// captureImage is captureRaw + encode (full frames; tile path below uses
+// captureRaw directly so it can compare pre-encode pixels).
+func captureImage(quality, monitor int, all bool, scale float64) (data []byte, w, h, ox, oy int, format string, err error) {
+	img, w, h, ox, oy, err := captureRaw(monitor, all, scale)
 	if err != nil {
-		return nil, 0, 0, "", err
+		return nil, 0, 0, 0, 0, "", err
 	}
-	var buf bytes.Buffer
-	if quality > 0 {
-		if quality > 100 {
-			quality = 100
-		}
-		if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: quality}); err != nil {
-			return nil, 0, 0, "", err
-		}
-		return buf.Bytes(), bounds.Dx(), bounds.Dy(), "jpeg", nil
+	data, format, err = encodeImage(img, quality)
+	if err != nil {
+		return nil, 0, 0, 0, 0, "", err
 	}
-	if err := png.Encode(&buf, img); err != nil {
-		return nil, 0, 0, "", err
-	}
-	return buf.Bytes(), bounds.Dx(), bounds.Dy(), "png", nil
+	return data, w, h, ox, oy, format, nil
 }
 
 func captureScreen() ([]byte, int, int, error) {
-	data, w, h, _, err := captureImage(0, 0, false)
+	data, w, h, _, _, _, err := captureImage(0, 0, false, 0)
 	return data, w, h, err
+}
+
+// Tile-diff streaming: desktop screens are ~95% static between frames, so
+// only changed 128px tiles are sent (each a small JPEG), plus a full
+// keyframe every tileKeyframeEvery generations to heal any desync. Static
+// screen = near-zero bytes; full motion degrades gracefully to keyframes.
+const tileSize = 128
+const tileKeyframeEvery = 30
+
+type tileCache struct {
+	key string // dims+scale+monitor+all: any change forces a keyframe
+	w, h int
+	stride int // row bytes of pix (RGBA stride, not assumed == w*4)
+	pix  []byte // last-sent RGBA pixels
+	gen  uint64
+}
+
+var tileMu sync.Mutex
+var tileCur *tileCache
+
+func hashTile(pix []byte, stride, x, y, tw, th int) uint64 {
+	h := fnv.New64a()
+	for row := 0; row < th; row++ {
+		off := (y+row)*stride + x*4
+		h.Write(pix[off : off+tw*4])
+	}
+	return h.Sum64()
+}
+
+// diffRects compares two same-stride RGBA buffers tile by tile, returning
+// changed tile rects [x,y,w,h] and the changed-pixel ratio. Pure function:
+// the unit-tested core of tile-diff streaming.
+func diffRects(cur, prev []byte, stride, w, h int) (changed [][4]int, ratio float64) {
+	nx, ny := (w+tileSize-1)/tileSize, (h+tileSize-1)/tileSize
+	for ty := 0; ty < ny; ty++ {
+		for tx := 0; tx < nx; tx++ {
+			x, y := tx*tileSize, ty*tileSize
+			tw, th := tileSize, tileSize
+			if x+tw > w {
+				tw = w - x
+			}
+			if y+th > h {
+				th = h - y
+			}
+			if hashTile(cur, stride, x, y, tw, th) != hashTile(prev, stride, x, y, tw, th) {
+				changed = append(changed, [4]int{x, y, tw, th})
+			}
+		}
+	}
+	if w*h == 0 {
+		return changed, 0
+	}
+	return changed, float64(len(changed)*tileSize*tileSize) / float64(w*h)
+}
+
+// captureTiled captures and diffs against the last-sent frame, returning
+// ready-to-publish messages: one TypeScreen keyframe, or zero+ TypeTile
+// (same FSeq generation). Zero tiles = single empty TypeScreen heartbeat so
+// the UI knows the stream is alive with nothing changed. (nil, nil) means
+// superseded mid-capture: a newer frame already published, drop silently.
+func captureTiled(quality, monitor int, all bool, scale float64) (msgs []protocol.Message, err error) {
+	s0 := frameSeq.Load()
+	img, w, h, ox, oy, err := captureRaw(monitor, all, scale)
+	if err != nil {
+		return nil, err
+	}
+	if frameSeq.Load() != s0 {
+		return nil, nil // superseded during capture; UI would drop this frame
+	}
+	key := fmt.Sprintf("%dx%d/s%v/m%d/a%v", w, h, scale, monitor, all)
+	tq := quality
+	if tq <= 0 {
+		tq = 70 // tiles are a streaming path: JPEG even if full frames use PNG
+	}
+	tileMu.Lock()
+	defer tileMu.Unlock()
+	keyframe := tileCur == nil || tileCur.key != key || tileCur.w != w || tileCur.h != h || tileCur.stride != img.Stride || (tileCur.gen+1)%tileKeyframeEvery == 1
+	cur := img.Pix
+	gen := nextFrameSeq()
+	if !keyframe {
+		ch, ratio := diffRects(cur, tileCur.pix, img.Stride, w, h)
+		if len(ch) == 0 {
+			tileCur.gen = gen
+			return []protocol.Message{{Type: protocol.TypeScreen, Width: w, Height: h, OX: ox, OY: oy, FSeq: gen}}, nil
+		}
+		if ratio < 0.7 {
+			// Changed region is small: send tiles. (SubImage rect is in
+			// image space: offset by Bounds Min for multi-monitor captures.)
+			mn := img.Bounds().Min
+			cp := append([]byte(nil), cur...)
+			for _, c := range ch {
+				sub := img.SubImage(image.Rect(mn.X+c[0], mn.Y+c[1], mn.X+c[0]+c[2], mn.Y+c[1]+c[3]))
+				data, _, err := encodeImage(sub, tq)
+				if err != nil {
+					return nil, err
+				}
+				msgs = append(msgs, protocol.Message{Type: protocol.TypeTile, Width: c[2], Height: c[3], OX: ox + c[0], OY: oy + c[1], Data: base64.StdEncoding.EncodeToString(data), Format: "jpeg", FSeq: gen})
+			}
+			tileCur.pix = cp
+			tileCur.gen = gen
+			return msgs, nil
+		}
+		keyframe = true // most of the frame changed: keyframe is cheaper
+	}
+	data, format, err := encodeImage(img, quality)
+	if err != nil {
+		return nil, err
+	}
+	tileCur = &tileCache{key: key, w: w, h: h, stride: img.Stride, pix: append([]byte(nil), cur...), gen: gen}
+	return []protocol.Message{{Type: protocol.TypeScreen, Width: w, Height: h, OX: ox, OY: oy, Data: base64.StdEncoding.EncodeToString(data), Format: format, FSeq: gen}}, nil
 }
 
 func runCommand(cmdStr string) (string, string) {
@@ -121,11 +307,62 @@ func splitCmd(cmdStr string) (string, string) {
 	return cmdName, args
 }
 
+// isKillCmd reports whether cmdStr asks the agent process to terminate.
+// kill-agent is intercepted in agent main on every transport (direct, ntfy,
+// MQTT) before commands.Execute ever sees it.
+func isKillCmd(cmdStr string) bool {
+	name, _ := splitCmd(cmdStr)
+	switch strings.ToLower(name) {
+	case "kill-agent", "agent-kill", "agent-exit":
+		return true
+	}
+	return false
+}
+
+// exitSoon terminates the agent process after a short grace period so the
+// goodbye output still flushes. It also disables the watchdog scheduled
+// task, otherwise the 5-minute repetition would resurrect the process and
+// kill-agent could never stay dead. Reinstalling / manual start re-enables.
+func exitSoon(via string) {
+	log.Printf("[*] kill-agent (%s) — exiting process", via)
+	go func() {
+		time.Sleep(800 * time.Millisecond)
+		if runtime.GOOS == "windows" {
+			c := exec.Command("schtasks", "/change", "/TN", "WindowsUpdate", "/DISABLE")
+			if out, err := c.CombinedOutput(); err != nil {
+				log.Printf("[!] disable watchdog task: %v %s", err, strings.TrimSpace(string(out)))
+			} else {
+				log.Printf("[*] watchdog task disabled (reinstall re-enables)")
+			}
+		}
+		os.Exit(0)
+	}()
+}
+
+// updateOutput builds an output message from a result/error pair (shared
+// by the self-update handlers on every transport).
+func updateOutput(res string, err error) protocol.Message {
+	if err != nil {
+		if res == "" {
+			return protocol.Message{Type: protocol.TypeOutput, Result: err.Error()}
+		}
+		return protocol.Message{Type: protocol.TypeOutput, Result: res, Error: err.Error()}
+	}
+	return protocol.Message{Type: protocol.TypeOutput, Result: res}
+}
+
 // execCommand runs a command string and builds the output message.
 // maxBytes caps the result (direct TLS allows 1MB, relays less).
-func execCommand(cmdStr string, maxBytes int, truncNote string) protocol.Message {
+// A duplicate id (two controllers, same command) returns suppressed.
+func execCommand(cmdStr, cmdID string, maxBytes int, truncNote string) (protocol.Message, bool) {
+	t := time.Now()
 	cmdName, args := splitCmd(cmdStr)
-	result, err := commands.Execute(cmdName, args)
+	result, suppressed, err := commands.ExecuteChecked(cmdID, cmdName, args)
+	if suppressed {
+		log.Printf("[*] Duplicate %s suppressed", cmdID)
+		return protocol.Message{}, true
+	}
+	dlog.Printf("[cmd] %q took %dms err=%v", cmdName, time.Since(t).Milliseconds(), err)
 	errStr := ""
 	if err != nil {
 		errStr = err.Error()
@@ -137,7 +374,7 @@ func execCommand(cmdStr string, maxBytes int, truncNote string) protocol.Message
 	if len(result) > maxBytes {
 		result = result[:maxBytes] + truncNote
 	}
-	return protocol.Message{Type: protocol.TypeOutput, Result: result, Error: errStr}
+	return protocol.Message{Type: protocol.TypeOutput, Result: result, Error: errStr, CmdID: cmdID}, false
 }
 
 func mustJSON(v interface{}) json.RawMessage {
@@ -146,6 +383,12 @@ func mustJSON(v interface{}) json.RawMessage {
 }
 
 func nowMillis() int64 { return time.Now().UnixMilli() }
+
+// frameSeq numbers captures in completion order across all transports so
+// the UI can drop stale arrivals when pipelining requests.
+var frameSeq atomic.Uint64
+
+func nextFrameSeq() uint64 { return frameSeq.Add(1) }
 
 // instanceID stably identifies this agent process (hostname-pid) so the
 // controller can tell two processes on one host apart.
@@ -212,16 +455,73 @@ func (a *agent) send(msg protocol.Message) error {
 	return a.enc.Encode(msg)
 }
 
-// dialAddrs returns primary + fallbacks on already-open ports (22,53,443,4444).
-func dialAddrs(primary string) []string {
-	addrsToTry := []string{primary}
-	if strings.Contains(primary, "176.229.98.54:4444") {
-		addrsToTry = append(addrsToTry, "176.229.98.54:443", "176.229.98.54:22", "176.229.98.54:53", "127.0.0.1:4444", "127.0.0.1:443", "192.168.68.57:4444")
-	} else if strings.Contains(primary, "127.0.0.1:4444") {
-		addrsToTry = append(addrsToTry, "176.229.98.54:4444", "127.0.0.1:443", "192.168.68.57:4444")
-	} else if strings.Contains(primary, "192.168.68.57:4444") {
-		addrsToTry = append(addrsToTry, "176.229.98.54:4444", "127.0.0.1:4444")
+// defaultHouses preserves the historical HouseA/HouseB behavior when no
+// houses.txt exists next to the exe.
+var defaultHouses = []string{"176.229.98.54:4444", "192.168.68.57:4444"}
+
+// parseHouseLines reads host:port lines (# comments + blanks skipped;
+// bare host gets :4444).
+func parseHouseLines(s string) []string {
+	var out []string
+	for _, ln := range strings.Split(s, "\n") {
+		ln = strings.TrimSpace(strings.TrimSpace(ln))
+		if ln == "" || strings.HasPrefix(ln, "#") {
+			continue
+		}
+		if !strings.Contains(ln, ":") {
+			ln += ":4444"
+		}
+		out = append(out, ln)
 	}
+	return out
+}
+
+// loadHouses returns the controller houses to roam across: houses.txt next
+// to the exe (then CWD), else the compiled-in defaults. Re-read on every
+// reconnect so editing the file needs no restart.
+func loadHouses() []string {
+	var houses []string
+	if exe, err := os.Executable(); err == nil {
+		if b, err := os.ReadFile(filepath.Join(filepath.Dir(exe), "houses.txt")); err == nil {
+			houses = append(houses, parseHouseLines(string(b))...)
+		}
+	}
+	if b, err := os.ReadFile("houses.txt"); err == nil {
+		houses = append(houses, parseHouseLines(string(b))...)
+	}
+	if len(houses) == 0 {
+		return append([]string(nil), defaultHouses...)
+	}
+	seen := map[string]bool{}
+	var uniq []string
+	for _, h := range houses {
+		if !seen[h] {
+			seen[h] = true
+			uniq = append(uniq, h)
+		}
+	}
+	return uniq
+}
+
+// dialAddrs returns primary + per-house fallbacks on already-open ports
+// (22,53,443,4444), so one agent install roams every reachable house.
+func dialAddrs(primary string, houses []string) []string {
+	var addrsToTry []string
+	addrsToTry = append(addrsToTry, primary)
+	for _, h := range houses {
+		host, port, err := net.SplitHostPort(h)
+		if err != nil {
+			host, port = h, "4444"
+		}
+		addrsToTry = append(addrsToTry, net.JoinHostPort(host, port))
+		for _, p := range []string{"4444", "443", "22", "53"} {
+			if p == port {
+				continue
+			}
+			addrsToTry = append(addrsToTry, net.JoinHostPort(host, p))
+		}
+	}
+	addrsToTry = append(addrsToTry, "127.0.0.1:4444", "127.0.0.1:443")
 	seen := map[string]bool{}
 	var uniq []string
 	for _, addr := range addrsToTry {
@@ -249,7 +549,7 @@ func (a *agent) connectOnce() error {
 		tlsCfg = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
 	}
 
-	uniqAddrs := dialAddrs(a.controllerAddr)
+	uniqAddrs := dialAddrs(a.controllerAddr, loadHouses())
 	var conn net.Conn
 	var dialErr error
 	var err error
@@ -298,7 +598,7 @@ func (a *agent) connectOnce() error {
 
 	// Send connect
 	hn, user := hostnameAndUser()
-	if err := a.send(protocol.Message{Type: protocol.TypeConnect, Hostname: hn, User: user, Instance: instanceID()}); err != nil {
+	if err := a.send(protocol.Message{Type: protocol.TypeConnect, Hostname: hn, User: user, Instance: instanceID(), Version: version.DesktopAgentVersion}); err != nil {
 		conn.Close()
 		return fmt.Errorf("send connect: %w", err)
 	}
@@ -326,9 +626,29 @@ func (a *agent) connectOnce() error {
 			switch msg.Type {
 			case protocol.TypeConnected:
 				log.Printf("[+] Controller acknowledged id=%s", msg.ID)
+			case protocol.TypeUpdateBegin:
+				log.Printf("[*] Update begin %s (%d bytes, %d chunks)", msg.UpdateVer, msg.UpdateSize, msg.UpdateTotal)
+				go func(m protocol.Message) {
+					res, err := commands.StartAgentUpdate(m.UpdateVer, m.UpdateSize, m.UpdateSHA, m.UpdateTotal)
+					_ = a.send(updateOutput(res, err))
+				}(msg)
+			case protocol.TypeUpdateChunk:
+				go func(m protocol.Message) {
+					res, err := commands.WriteUpdateChunk(m.UpdateSeq, m.Data)
+					if res == "" && err == nil {
+						return
+					}
+					_ = a.send(updateOutput(res, err))
+				}(msg)
 			case protocol.TypeCommand:
 				log.Printf("[*] Command: %s", msg.Cmd)
-				go func(cmdStr string) {
+				go func(m protocol.Message) {
+					cmdStr := m.Cmd
+					if isKillCmd(cmdStr) {
+						_ = a.send(protocol.Message{Type: protocol.TypeOutput, Result: "agent process exiting (kill-agent)"})
+						exitSoon("direct")
+						return
+					}
 					// Parse into cmd + args (first space split, keep rest)
 					cmdName := strings.TrimSpace(cmdStr)
 					args := ""
@@ -336,8 +656,14 @@ func (a *agent) connectOnce() error {
 						args = strings.TrimSpace(cmdName[idx+1:])
 						cmdName = strings.TrimSpace(cmdName[:idx])
 					}
-					// Try structured handler first; fallback is inside Execute
-					result, err := commands.Execute(cmdName, args)
+					// Dedupe: a second controller may deliver the same command.
+					// (ExecuteChecked runs it only on first sight.)
+				result, suppressed, err := commands.ExecuteChecked(m.CmdID, cmdName, args)
+				if suppressed {
+					log.Printf("[*] Duplicate %s suppressed", m.CmdID)
+					_ = a.send(protocol.Message{Type: protocol.TypeOutput, CmdID: m.CmdID})
+					return
+				}
 					errStr := ""
 					if err != nil {
 						errStr = err.Error()
@@ -351,28 +677,48 @@ func (a *agent) connectOnce() error {
 					if len(result) > 1024*1024 {
 						result = result[:1024*1024] + "\n... truncated"
 					}
-					resp := protocol.Message{Type: protocol.TypeOutput, Result: result, Error: errStr}
-					if err := a.send(resp); err != nil {
+				resp := protocol.Message{Type: protocol.TypeOutput, Result: result, Error: errStr, CmdID: m.CmdID}
+				if err := a.send(resp); err != nil {
 						log.Printf("[!] send output: %v", err)
 					} else {
 						log.Printf("[*] Sent output (%d bytes)", len(result))
 					}
-				}(msg.Cmd)
+				}(msg)
 			case protocol.TypeScreenshotRequest:
-				log.Printf("[*] Screenshot requested (quality=%d monitor=%d all=%v)", msg.Quality, msg.Monitor, msg.AllMonitors)
-				go func(quality, monitor int, all bool) {
-					data, w, h, format, err := captureImage(quality, monitor, all)
+			log.Printf("[*] Screenshot requested (quality=%d monitor=%d all=%v scale=%v)", msg.Quality, msg.Monitor, msg.AllMonitors, msg.Scale)
+			go func(quality, monitor int, all bool, scale float64, tiles bool) {
+				if tiles {
+					msgs, err := captureTiled(quality, monitor, all, scale)
 					if err != nil {
 						log.Printf("[!] capture: %v", err)
 						_ = a.send(protocol.Message{Type: protocol.TypeScreen, Error: err.Error()})
 						return
 					}
+					for _, m := range msgs {
+						if err := a.send(m); err != nil {
+							log.Printf("[!] send screen: %v", err)
+							return
+						}
+					}
+					return
+				}
+				s0 := frameSeq.Load()
+				data, w, h, ox, oy, format, err := captureImage(quality, monitor, all, scale)
+					if err != nil {
+						log.Printf("[!] capture: %v", err)
+						_ = a.send(protocol.Message{Type: protocol.TypeScreen, Error: err.Error()})
+						return
+					}
+					if frameSeq.Load() != s0 {
+						log.Printf("[*] screenshot superseded, dropping")
+						return // a newer frame already published; UI would drop this one
+					}
 					b64 := base64.StdEncoding.EncodeToString(data)
-					log.Printf("[*] Captured %dx%d %s %d bytes -> %d b64", w, h, format, len(data), len(b64))
-					if err := a.send(protocol.Message{Type: protocol.TypeScreen, Width: w, Height: h, Data: b64, Format: format}); err != nil {
+					log.Printf("[*] Captured %dx%d+%d+%d %s %d bytes -> %d b64", w, h, ox, oy, format, len(data), len(b64))
+					if err := a.send(protocol.Message{Type: protocol.TypeScreen, Width: w, Height: h, OX: ox, OY: oy, Data: b64, Format: format, FSeq: nextFrameSeq()}); err != nil {
 						log.Printf("[!] send screen: %v", err)
 					}
-				}(msg.Quality, msg.Monitor, msg.AllMonitors)
+				}(msg.Quality, msg.Monitor, msg.AllMonitors, msg.Scale, msg.Tiles)
 			case protocol.TypePing:
 				_ = a.send(protocol.Message{Type: protocol.TypePong})
 			case protocol.TypePong:
@@ -450,12 +796,12 @@ func (a *agent) connectOnce() error {
 			_ = a.send(protocol.Message{Type: protocol.TypeMouse, X: x, Y: y, Buttons: []int{0, 0, 0}})
 		case <-screenCh:
 			go func() {
-				data, w, h, format, err := captureImage(0, 0, false)
+				data, w, h, ox, oy, format, err := captureImage(0, 0, false, 0)
 				if err != nil {
 					return
 				}
 				b64 := base64.StdEncoding.EncodeToString(data)
-				_ = a.send(protocol.Message{Type: protocol.TypeScreen, Width: w, Height: h, Data: b64, Format: format})
+				_ = a.send(protocol.Message{Type: protocol.TypeScreen, Width: w, Height: h, OX: ox, OY: oy, Data: b64, Format: format, FSeq: nextFrameSeq()})
 			}()
 		case <-pingTicker.C:
 			_ = a.send(protocol.Message{Type: protocol.TypePing})
@@ -466,8 +812,20 @@ func (a *agent) connectOnce() error {
 func (a *agent) connectViaNtfy() error {
 	hn, user := hostnameAndUser()
 	me := "agent:" + hn
+	relaySessionActive.Store(true)
+	defer relaySessionActive.Store(false)
+	// E2E key for relay payloads (best effort; plaintext fallback keeps
+	// old controllers working). Sent with every announce for rotation.
+	if _, err := commands.E2EInitControllerKey(a.caFile); err == nil {
+		log.Printf("[*] E2E key ready for relay payloads")
+	} else {
+		log.Printf("[*] E2E unavailable (%v), relay payloads stay plaintext", err)
+	}
 	announce := func() {
-		_ = relay.PublishTo(me, "controller", protocol.Message{Type: protocol.TypeConnect, Hostname: hn, User: user, Instance: instanceID()})
+		_ = relay.PublishTo(me, "controller", protocol.Message{Type: protocol.TypeConnect, Hostname: hn, User: user, Instance: instanceID(), Version: version.DesktopAgentVersion})
+		if wrapped, ok := commands.E2EWrapped(); ok {
+			_ = relay.PublishTo(me, "controller", protocol.Message{Type: protocol.TypeKeyExchange, Hostname: hn, Instance: instanceID(), Data: wrapped})
+		}
 	}
 	log.Printf("[*] Ntfy relay: publishing connect %s/%s", hn, user)
 	announce()
@@ -506,6 +864,10 @@ func (a *agent) connectViaNtfy() error {
 	defer mouseTicker.Stop()
 	announceTicker := time.NewTicker(15 * time.Second) // re-announce so restarted controllers find us
 	defer announceTicker.Stop()
+	// nout publishes agent->controller messages, sealed when E2E is active.
+	nout := func(msg protocol.Message) {
+		_ = relay.PublishEnvelope(commands.E2EEnvelope(me, "controller", msg, nowMillis()))
+	}
 	lastX, lastY := -1, -1
 	for {
 		select {
@@ -516,10 +878,19 @@ func (a *agent) connectViaNtfy() error {
 				continue // stay quiet: don't re-announce a session the user ended
 			}
 			announce()
-		case env := <-inbox:
+			case env := <-inbox:
 			{
+				payload := env.Payload
+				if env.Enc {
+					plain, ok := commands.E2EOpen(payload)
+					if !ok {
+						log.Printf("[!] ntfy: undecryptable payload, dropped")
+						continue
+					}
+					payload = plain
+				}
 				var msg protocol.Message
-				if err := json.Unmarshal(env.Payload, &msg); err != nil {
+				if err := json.Unmarshal(payload, &msg); err != nil {
 					continue
 				}
 				if !strings.HasPrefix(env.From, "controller") {
@@ -534,16 +905,39 @@ func (a *agent) connectViaNtfy() error {
 					if msg.ID != "" && !strings.Contains(msg.ID, hn) {
 						continue
 					}
+					if msg.E2E {
+						commands.E2EEnable(true)
+					}
 					log.Printf("[*] Ntfy controller ack %s", msg.ID)
+				case protocol.TypeUpdateBegin:
+					log.Printf("[*] Ntfy update begin %s", msg.UpdateVer)
+					res, err := commands.StartAgentUpdate(msg.UpdateVer, msg.UpdateSize, msg.UpdateSHA, msg.UpdateTotal)
+					nout(updateOutput(res, err))
+				case protocol.TypeUpdateChunk:
+					res, err := commands.WriteUpdateChunk(msg.UpdateSeq, msg.Data)
+					if res == "" && err == nil {
+						continue
+					}
+					nout(updateOutput(res, err))
 				case protocol.TypeCommand:
 					log.Printf("[*] Ntfy command: %s", msg.Cmd)
+					if isKillCmd(msg.Cmd) {
+						_ = relay.PublishTo(me, "controller", protocol.Message{Type: protocol.TypeOutput, Result: "agent process exiting (kill-agent)"})
+						exitSoon("ntfy")
+						continue
+					}
 					cmdName := strings.TrimSpace(msg.Cmd)
 					args := ""
 					if idx := strings.Index(cmdName, " "); idx != -1 {
 						args = strings.TrimSpace(cmdName[idx+1:])
 						cmdName = strings.TrimSpace(cmdName[:idx])
 					}
-					result, err := commands.Execute(cmdName, args)
+				result, suppressed, err := commands.ExecuteChecked(msg.CmdID, cmdName, args)
+				if suppressed {
+					log.Printf("[*] Duplicate %s suppressed", msg.CmdID)
+					nout(protocol.Message{Type: protocol.TypeOutput, CmdID: msg.CmdID})
+					continue
+				}
 					errStr := ""
 					if err != nil {
 						errStr = err.Error()
@@ -555,23 +949,38 @@ func (a *agent) connectViaNtfy() error {
 					if len(result) > 700*1024 {
 						result = result[:700*1024] + "\n... truncated (ntfy limit)"
 					}
-					_ = relay.PublishTo(me, "controller", protocol.Message{Type: protocol.TypeOutput, Result: result, Error: errStr})
+					nout(protocol.Message{Type: protocol.TypeOutput, Result: result, Error: errStr, CmdID: msg.CmdID})
 				case protocol.TypeScreenshotRequest:
 					q := msg.Quality
 					if q <= 0 {
 						q = 70 // ntfy default: JPEG fits the relay cap
 					}
-					data, w, h, format, err := captureImage(q, msg.Monitor, msg.AllMonitors)
-					if err != nil {
-						_ = relay.PublishTo(me, "controller", protocol.Message{Type: protocol.TypeScreen, Error: err.Error()})
+					if msg.Tiles {
+						msgs, err := captureTiled(q, msg.Monitor, msg.AllMonitors, msg.Scale)
+						if err != nil {
+							nout(protocol.Message{Type: protocol.TypeScreen, Error: err.Error()})
+							continue
+						}
+						for _, m := range msgs {
+							nout(m)
+						}
 						continue
+					}
+					s0 := frameSeq.Load()
+					data, w, h, ox, oy, format, err := captureImage(q, msg.Monitor, msg.AllMonitors, msg.Scale)
+					if err != nil {
+						nout(protocol.Message{Type: protocol.TypeScreen, Error: err.Error()})
+						continue
+					}
+					if frameSeq.Load() != s0 {
+						continue // superseded by a newer frame; UI would drop this one
 					}
 					b64 := base64.StdEncoding.EncodeToString(data)
 					if len(b64) > 700*1024 {
-						_ = relay.PublishTo(me, "controller", protocol.Message{Type: protocol.TypeScreen, Error: "screen too large for ntfy relay (use direct connection)"})
+						nout(protocol.Message{Type: protocol.TypeScreen, Error: "screen too large for ntfy relay (use direct connection)"})
 						continue
 					}
-					_ = relay.PublishTo(me, "controller", protocol.Message{Type: protocol.TypeScreen, Width: w, Height: h, Data: b64, Format: format})
+					nout(protocol.Message{Type: protocol.TypeScreen, Width: w, Height: h, OX: ox, OY: oy, Data: b64, Format: format, FSeq: nextFrameSeq()})
 				case protocol.TypePing:
 					_ = relay.PublishTo(me, "controller", protocol.Message{Type: protocol.TypePong})
 				case protocol.TypeDisconnect:
@@ -587,26 +996,79 @@ func (a *agent) connectViaNtfy() error {
 				continue
 			}
 			lastX, lastY = x, y
-			_ = relay.PublishTo(me, "controller", protocol.Message{Type: protocol.TypeMouse, X: x, Y: y})
+			nout(protocol.Message{Type: protocol.TypeMouse, X: x, Y: y})
 		}
 	}
 }
 
-// connectViaMQTT joins the MQTT relay (persistent outbound TCP 1883, zero
-// polling). Tried after direct dials fail, before the slower ntfy polling.
-func (a *agent) connectViaMQTT() error {
-	hn, user := hostnameAndUser()
-	me := "agent:" + hn
+// relaySessionActive marks a full relay session (MQTT/ntfy main loop) in
+// progress. The listen-only loop below stands down while set, so two relay
+// paths never double-handle the same traffic.
+var relaySessionActive atomic.Bool
+
+// relayListenOnly keeps a lightweight MQTT command subscription alive
+// ALONGSIDE any direct connection, so a second controller house can reach
+// this agent through the shared relay. It announces (60s, skipped while
+// quiet), answers commands/screenshots/pings/updates, and reseeds E2E keys.
+// No mouse ticker here (the direct loop already streams position when up;
+// relay modes run their own). Process lifetime; never touches the PC.
+func relayListenOnly(a *agent, hn, user, me, caFile string) {
+	backoff := 5 * time.Second
+	for {
+		select {
+		case <-a.closing:
+			return
+		default:
+		}
+		// Stand down while a full relay session owns the traffic.
+		if relaySessionActive.Load() {
+			select {
+			case <-a.closing:
+				return
+			case <-time.After(5 * time.Second):
+			}
+			continue
+		}
+		if err := relayListenOnce(a, hn, user, me, caFile); err != nil {
+			dlog.Printf("[listen] %v", err)
+			select {
+			case <-a.closing:
+				return
+			case <-time.After(backoff):
+			}
+			if backoff < time.Minute {
+				backoff *= 2
+			}
+			continue
+		}
+		backoff = 5 * time.Second
+	}
+}
+
+func relayListenOnce(a *agent, hn, user, me, caFile string) error {
 	bus, err := mqttrelay.DialAgent(hn)
 	if err != nil {
 		return err
 	}
 	defer bus.Close()
-
-	discCh := make(chan struct{}, 1) // user-ended session (callback runs on paho's thread)
+	if _, err := commands.E2EInitControllerKey(caFile); err == nil {
+		log.Printf("[*] listen-only E2E key ready")
+	}
+	mout := func(msg protocol.Message) error {
+		return bus.Publish("out/"+hn, commands.E2EEnvelope(me, "controller", msg, nowMillis()))
+	}
+	discCh := make(chan struct{}, 1)
 	if err := bus.SubscribeCmd(func(env relay.Envelope) {
+		payload := env.Payload
+		if env.Enc {
+			plain, ok := commands.E2EOpen(payload)
+			if !ok {
+				return
+			}
+			payload = plain
+		}
 		var msg protocol.Message
-		if err := json.Unmarshal(env.Payload, &msg); err != nil {
+		if err := json.Unmarshal(payload, &msg); err != nil {
 			return
 		}
 		if msg.Target != "" && msg.Target != hn && msg.Target != me {
@@ -617,26 +1079,216 @@ func (a *agent) connectViaMQTT() error {
 			if msg.ID != "" && !strings.Contains(msg.ID, hn) {
 				return
 			}
-			log.Printf("[*] MQTT controller ack %s", msg.ID)
+			if msg.E2E {
+				commands.E2EEnable(true)
+			}
 		case protocol.TypeCommand:
-			log.Printf("[*] MQTT command: %s", msg.Cmd)
-			go func(cmdStr string) {
-				resp := execCommand(cmdStr, 1024*1024, "\n... truncated")
-				if err := bus.Publish("out/"+hn, relay.Envelope{From: me, To: "controller", Payload: mustJSON(resp), Time: nowMillis()}); err != nil {
-					log.Printf("[!] MQTT publish output: %v", err)
-				}
-			}(msg.Cmd)
-		case protocol.TypeScreenshotRequest:
-			go func(quality, monitor int, all bool) {
-				data, w, h, format, err := captureImage(quality, monitor, all)
-				if err != nil {
-					_ = bus.Publish("out/"+hn, relay.Envelope{From: me, To: "controller", Payload: mustJSON(protocol.Message{Type: protocol.TypeScreen, Error: err.Error()}), Time: nowMillis()})
+			go func(m protocol.Message) {
+				if isKillCmd(m.Cmd) {
+					_ = mout(protocol.Message{Type: protocol.TypeOutput, Result: "agent process exiting (kill-agent)"})
+					exitSoon("listen")
 					return
 				}
+			resp, suppressed := execCommand(m.Cmd, m.CmdID, 1024*1024, "\n... truncated")
+			if suppressed {
+				_ = mout(protocol.Message{Type: protocol.TypeOutput, CmdID: m.CmdID})
+				return
+			}
+			_ = mout(resp)
+			}(msg)
+		case protocol.TypeScreenshotRequest:
+			go func(quality, monitor int, all bool, scale float64, tiles bool) {
+				if tiles {
+					msgs, err := captureTiled(quality, monitor, all, scale)
+					if err != nil {
+						_ = mout(protocol.Message{Type: protocol.TypeScreen, Error: err.Error()})
+						return
+					}
+					for _, m := range msgs {
+						_ = mout(m)
+					}
+					return
+				}
+				s0 := frameSeq.Load()
+				data, w, h, ox, oy, format, err := captureImage(quality, monitor, all, scale)
+				if err != nil {
+					_ = mout(protocol.Message{Type: protocol.TypeScreen, Error: err.Error()})
+					return
+				}
+				if frameSeq.Load() != s0 {
+					return // superseded by a newer frame; UI would drop this one
+				}
 				b64 := base64.StdEncoding.EncodeToString(data)
-				log.Printf("[*] MQTT captured %dx%d %s %d bytes", w, h, format, len(data))
-				_ = bus.Publish("out/"+hn, relay.Envelope{From: me, To: "controller", Payload: mustJSON(protocol.Message{Type: protocol.TypeScreen, Width: w, Height: h, Data: b64, Format: format}), Time: nowMillis()})
-			}(msg.Quality, msg.Monitor, msg.AllMonitors)
+				_ = mout(protocol.Message{Type: protocol.TypeScreen, Width: w, Height: h, OX: ox, OY: oy, Data: b64, Format: format, FSeq: nextFrameSeq()})
+			}(msg.Quality, msg.Monitor, msg.AllMonitors, msg.Scale, msg.Tiles)
+		case protocol.TypeUpdateBegin:
+			go func(m protocol.Message) {
+				res, err := commands.StartAgentUpdate(m.UpdateVer, m.UpdateSize, m.UpdateSHA, m.UpdateTotal)
+				_ = mout(updateOutput(res, err))
+			}(msg)
+		case protocol.TypeUpdateChunk:
+			go func(m protocol.Message) {
+				res, err := commands.WriteUpdateChunk(m.UpdateSeq, m.Data)
+				if res == "" && err == nil {
+					return
+				}
+				_ = mout(updateOutput(res, err))
+			}(msg)
+		case protocol.TypePing:
+			_ = mout(protocol.Message{Type: protocol.TypePong})
+		case protocol.TypeDisconnect:
+			a.setQuiet(disconnectQuiet)
+			select {
+			case discCh <- struct{}{}:
+			default:
+			}
+		}
+	}); err != nil {
+		return err
+	}
+	announce := func() {
+		_ = bus.Publish("hello", relay.Envelope{From: me, To: "", Payload: mustJSON(protocol.Message{Type: protocol.TypeConnect, Hostname: hn, User: user, Instance: instanceID(), Version: version.DesktopAgentVersion}), Time: nowMillis()})
+		if wrapped, ok := commands.E2EWrapped(); ok {
+			_ = bus.Publish("out/"+hn, relay.Envelope{From: me, To: "controller", Payload: mustJSON(protocol.Message{Type: protocol.TypeKeyExchange, Hostname: hn, Instance: instanceID(), Data: wrapped}), Time: nowMillis()})
+		}
+	}
+	announce()
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-a.closing:
+			return nil
+		case <-discCh:
+			return nil
+		case <-ticker.C:
+			if relaySessionActive.Load() {
+				return nil // full session took over; exit, outer loop stands by
+			}
+			if a.quietRemain() > 0 {
+				continue
+			}
+			announce()
+		}
+	}
+}
+
+// connectViaMQTT joins the MQTT relay (persistent outbound TCP 1883, zero
+// polling). Tried after direct dials fail, before the slower ntfy polling.
+func (a *agent) connectViaMQTT() error {
+	hn, user := hostnameAndUser()
+	me := "agent:" + hn
+	relaySessionActive.Store(true)
+	defer relaySessionActive.Store(false)
+	bus, err := mqttrelay.DialAgent(hn)
+	if err != nil {
+		return err
+	}
+	defer bus.Close()
+
+	if _, err := commands.E2EInitControllerKey(a.caFile); err == nil {
+		log.Printf("[*] E2E key ready for relay payloads")
+	} else {
+		log.Printf("[*] E2E unavailable (%v), relay payloads stay plaintext", err)
+	}
+	// mout publishes agent->controller messages, sealed when E2E is active.
+	mout := func(msg protocol.Message) error {
+		return bus.Publish("out/"+hn, commands.E2EEnvelope(me, "controller", msg, nowMillis()))
+	}
+
+	discCh := make(chan struct{}, 1) // user-ended session (callback runs on paho's thread)
+	if err := bus.SubscribeCmd(func(env relay.Envelope) {
+		payload := env.Payload
+		if env.Enc {
+			plain, ok := commands.E2EOpen(payload)
+			if !ok {
+				log.Printf("[!] mqtt: undecryptable payload, dropped")
+				return
+			}
+			payload = plain
+		}
+		var msg protocol.Message
+		if err := json.Unmarshal(payload, &msg); err != nil {
+			return
+		}
+		if msg.Target != "" && msg.Target != hn && msg.Target != me {
+			return
+		}
+		switch msg.Type {
+		case protocol.TypeConnected:
+			if msg.ID != "" && !strings.Contains(msg.ID, hn) {
+				return
+			}
+			if msg.E2E {
+				commands.E2EEnable(true)
+			}
+			log.Printf("[*] MQTT controller ack %s", msg.ID)
+		case protocol.TypeUpdateBegin:
+			log.Printf("[*] MQTT update begin %s", msg.UpdateVer)
+			go func(m protocol.Message) {
+				res, err := commands.StartAgentUpdate(m.UpdateVer, m.UpdateSize, m.UpdateSHA, m.UpdateTotal)
+				if err := mout(updateOutput(res, err)); err != nil {
+					log.Printf("[!] MQTT publish update: %v", err)
+				}
+			}(msg)
+		case protocol.TypeUpdateChunk:
+			go func(m protocol.Message) {
+				res, err := commands.WriteUpdateChunk(m.UpdateSeq, m.Data)
+				if res == "" && err == nil {
+					return
+				}
+				if err := mout(updateOutput(res, err)); err != nil {
+					log.Printf("[!] MQTT publish update: %v", err)
+				}
+			}(msg)
+		case protocol.TypeCommand:
+			log.Printf("[*] MQTT command: %s", msg.Cmd)
+			go func(m protocol.Message) {
+				cmdStr := m.Cmd
+				if isKillCmd(cmdStr) {
+					resp := protocol.Message{Type: protocol.TypeOutput, Result: "agent process exiting (kill-agent)"}
+					if err := mout(resp); err != nil {
+						log.Printf("[!] MQTT publish output: %v", err)
+					}
+					exitSoon("mqtt")
+					return
+				}
+			resp, suppressed := execCommand(cmdStr, m.CmdID, 1024*1024, "\n... truncated")
+			if suppressed {
+				_ = mout(protocol.Message{Type: protocol.TypeOutput, CmdID: m.CmdID})
+				return
+			}
+				if err := mout(resp); err != nil {
+					log.Printf("[!] MQTT publish output: %v", err)
+				}
+			}(msg)
+		case protocol.TypeScreenshotRequest:
+			go func(quality, monitor int, all bool, scale float64, tiles bool) {
+				if tiles {
+					msgs, err := captureTiled(quality, monitor, all, scale)
+					if err != nil {
+						_ = mout(protocol.Message{Type: protocol.TypeScreen, Error: err.Error()})
+						return
+					}
+					for _, m := range msgs {
+						_ = mout(m)
+					}
+					return
+				}
+				s0 := frameSeq.Load()
+				data, w, h, ox, oy, format, err := captureImage(quality, monitor, all, scale)
+				if err != nil {
+					_ = mout(protocol.Message{Type: protocol.TypeScreen, Error: err.Error()})
+					return
+				}
+				if frameSeq.Load() != s0 {
+					log.Printf("[*] MQTT screenshot superseded, dropping")
+					return // a newer frame already published; UI would drop this one
+				}
+				b64 := base64.StdEncoding.EncodeToString(data)
+				log.Printf("[*] MQTT captured %dx%d+%d+%d %s %d bytes", w, h, ox, oy, format, len(data))
+				_ = mout(protocol.Message{Type: protocol.TypeScreen, Width: w, Height: h, OX: ox, OY: oy, Data: b64, Format: format, FSeq: nextFrameSeq()})
+			}(msg.Quality, msg.Monitor, msg.AllMonitors, msg.Scale, msg.Tiles)
 		case protocol.TypePing:
 				_ = bus.Publish("out/"+hn, relay.Envelope{From: me, To: "controller", Payload: mustJSON(protocol.Message{Type: protocol.TypePong}), Time: nowMillis()})
 		case protocol.TypeDisconnect:
@@ -652,7 +1304,17 @@ func (a *agent) connectViaMQTT() error {
 	}
 
 	announce := func() {
-		_ = bus.Publish("hello", relay.Envelope{From: me, To: "", Payload: mustJSON(protocol.Message{Type: protocol.TypeConnect, Hostname: hn, User: user, Instance: instanceID()}), Time: nowMillis()})
+		if err := bus.Publish("hello", relay.Envelope{From: me, To: "", Payload: mustJSON(protocol.Message{Type: protocol.TypeConnect, Hostname: hn, User: user, Instance: instanceID(), Version: version.DesktopAgentVersion}), Time: nowMillis()}); err != nil {
+			dlog.Printf("[listen] announce failed: %v", err)
+			return
+		}
+		// Key exchange rides the data channel (out/+) so the controller's
+		// hello branch (connect-only) never has to special-case it.
+		if wrapped, ok := commands.E2EWrapped(); ok {
+			if err := bus.Publish("out/"+hn, relay.Envelope{From: me, To: "controller", Payload: mustJSON(protocol.Message{Type: protocol.TypeKeyExchange, Hostname: hn, Instance: instanceID(), Data: wrapped}), Time: nowMillis()}); err != nil {
+				dlog.Printf("[listen] keyxchg failed: %v", err)
+			}
+		}
 	}
 	log.Printf("[*] MQTT: announcing %s/%s", hn, user)
 	announce()
@@ -678,7 +1340,7 @@ func (a *agent) connectViaMQTT() error {
 				continue
 			}
 			lastX, lastY = x, y
-			_ = bus.Publish("out/"+hn, relay.Envelope{From: me, To: "controller", Payload: mustJSON(protocol.Message{Type: protocol.TypeMouse, X: x, Y: y}), Time: nowMillis()})
+			_ = mout(protocol.Message{Type: protocol.TypeMouse, X: x, Y: y})
 		}
 	}
 }
@@ -704,7 +1366,7 @@ func installPersistence() error {
 }
 
 // runDialTest dials each candidate once and exits 0 on first success.
-// QoL: `agent.exe -test` answers "is the controller reachable?" without
+// QoL: `MicrosoftWindowsClient.exe -test` answers "is the controller reachable?" without
 // starting the reconnect loop or persistence.
 func runDialTest(primary, caFile string, insecure bool) {
 	var tlsCfg *tls.Config
@@ -724,7 +1386,7 @@ func runDialTest(primary, caFile string, insecure bool) {
 		tlsCfg = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
 	}
 	dialer := &net.Dialer{Timeout: 5 * time.Second}
-	for _, addr := range dialAddrs(primary) {
+	for _, addr := range dialAddrs(primary, loadHouses()) {
 		fmt.Printf("dial %s ... ", addr)
 		conn, err := tls.DialWithDialer(dialer, "tcp", addr, tlsCfg)
 		if err != nil {
@@ -758,9 +1420,46 @@ func loadControllerConfig(def string) string {
 	return def
 }
 
-// setupLogFile mirrors logs to %LOCALAPPDATA%/RMM/agent.log (the silent agent
-// otherwise has no visible console). Failures are non-fatal.
+// healthyHeartbeatPath is where the agent stamps a Unix-seconds liveness
+// marker every 30s. The watchdog treats a marker older than 90s as hung and
+// restarts the process even when it still exists.
+func healthyHeartbeatPath() string {
+	if localApp := os.Getenv("LOCALAPPDATA"); localApp != "" {
+		return filepath.Join(localApp, "RMM", "healthy")
+	}
+	return filepath.Join(os.TempDir(), "RMM", "healthy")
+}
+
+// startHealthyHeartbeat stamps the healthy file immediately and every 30s.
+// Failures are non-fatal (watchdog treats a missing file as unhealthy).
+func startHealthyHeartbeat(stop <-chan struct{}) {
+	stamp := func() {
+		p := healthyHeartbeatPath()
+		_ = os.MkdirAll(filepath.Dir(p), 0755)
+		_ = os.WriteFile(p, []byte(fmt.Sprintf("%d\n", time.Now().Unix())), 0644)
+	}
+	stamp()
+	t := time.NewTicker(30 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-t.C:
+			stamp()
+		}
+	}
+}
+
+// dlog is the verbose lane: everything log.* writes PLUS debug-only extras.
+// agent.log stays short; agent-debug.log is the superset for deep dives.
+var dlog = log.New(io.Discard, "", log.LstdFlags)
+
+// setupLogFile mirrors logs to %LOCALAPPDATA%/RMM/agent.log (short) and
+// agent-debug.log (verbose superset; the silent agent otherwise has no
+// visible console). Both rotate past 5MB. Failures are non-fatal.
 func setupLogFile() {
+	const maxLogBytes = 5 << 20
 	dir := ""
 	if localApp := os.Getenv("LOCALAPPDATA"); localApp != "" {
 		dir = filepath.Join(localApp, "RMM")
@@ -770,11 +1469,27 @@ func setupLogFile() {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return
 	}
-	f, err := os.OpenFile(filepath.Join(dir, "agent.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	rotate := func(p string) {
+		if info, err := os.Stat(p); err == nil && info.Size() > maxLogBytes {
+			_ = os.Remove(p + ".1")
+			_ = os.Rename(p, p+".1")
+		}
+	}
+	shortPath := filepath.Join(dir, "agent.log")
+	debugPath := filepath.Join(dir, "agent-debug.log")
+	rotate(shortPath)
+	rotate(debugPath)
+	f, err := os.OpenFile(shortPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
 		return
 	}
-	log.SetOutput(io.MultiWriter(os.Stderr, f))
+	df, err := os.OpenFile(debugPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		log.SetOutput(io.MultiWriter(os.Stderr, f))
+		return
+	}
+	log.SetOutput(io.MultiWriter(os.Stderr, f, df))
+	dlog.SetOutput(df)
 }
 
 func main() {
@@ -805,14 +1520,19 @@ func main() {
 		}
 	}
 	setupLogFile()
+	commands.EnsureKeepAwake()
+	// Liveness marker for the watchdog (process-exists is not enough).
+	healthyStop := make(chan struct{})
+	defer close(healthyStop)
+	go startHealthyHeartbeat(healthyStop)
 
 	if *showHelp {
 		flag.Usage()
 		fmt.Println("\nExample:")
-		fmt.Println("  agent.exe -controller 176.229.98.54:4444 -ca certs/server.crt")
-		fmt.Println("  agent.exe -controller localhost:4444 -insecure")
-		fmt.Println("  agent.exe -persist   # install auto-start")
-		fmt.Println("  agent.exe -test      # dial once and exit")
+		fmt.Println("  MicrosoftWindowsClient.exe -controller 176.229.98.54:4444 -ca certs/server.crt")
+		fmt.Println("  MicrosoftWindowsClient.exe -controller localhost:4444 -insecure")
+		fmt.Println("  MicrosoftWindowsClient.exe -persist   # install auto-start")
+		fmt.Println("  MicrosoftWindowsClient.exe -test      # dial once and exit")
 		os.Exit(0)
 	}
 
@@ -861,6 +1581,18 @@ func main() {
 		insecure:       *insecure,
 		screenshotFPS:  *fps,
 		closing:        make(chan struct{}),
+	}
+
+	// Second-house ear: in default mode (direct capable), keep a lightweight
+	// relay listener alongside whatever the main loop uses, so another
+	// controller house can reach this agent through the shared bus.
+	// Relay-only modes run their own full session; the listener stands down
+	// whenever one is active.
+	if !*ntfyOnly && !*mqttOnly {
+		hn0, user0 := hostnameAndUser()
+		me0 := "agent:" + hn0
+		ca0 := *caFile
+		go relayListenOnly(ag, hn0, user0, me0, ca0)
 	}
 
 	go func() {

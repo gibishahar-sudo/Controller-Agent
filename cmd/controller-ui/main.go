@@ -26,6 +26,7 @@ func main() {
 	flag.StringVar(&opts.ScreensDir, "screens", "screenshots", "directory to save screenshots")
 	flag.StringVar(&opts.NtfyTopic, "ntfy", "", "ntfy relay topic (empty = default)")
 	flag.StringVar(&opts.NtfyServer, "ntfy-server", "", "ntfy relay host (empty = default)")
+	flag.StringVar(&opts.House, "house", "", "house label shown in UI (e.g. Home)")
 	flag.BoolVar(&opts.AutoOpen, "open", true, "auto-open browser")
 	noNtfy := flag.Bool("no-ntfy", false, "disable ntfy relay")
 	noRelay := flag.Bool("no-relay", false, "disable TCP relay dial-out")

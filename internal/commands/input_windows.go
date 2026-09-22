@@ -54,6 +54,38 @@ func mouseDoubleClick() (string, error) {
 	return mouseClick("")
 }
 
+func parseXY(arg string) (int, int, error) {
+	parts := strings.Split(arg, ",")
+	if len(parts) != 2 {
+		return 0, 0, fmt.Errorf("usage: <x>,<y>")
+	}
+	var x, y int
+	fmt.Sscanf(strings.TrimSpace(parts[0]), "%d", &x)
+	fmt.Sscanf(strings.TrimSpace(parts[1]), "%d", &y)
+	return x, y, nil
+}
+
+// mouseClickAt moves then clicks atomically: one command round trip
+// instead of two (mouse-move + mouse-click) on high-latency relays.
+func mouseClickAt(arg string) (string, error) {
+	x, y, err := parseXY(arg)
+	if err != nil {
+		return "", fmt.Errorf("mouse-click-at %v", err)
+	}
+	procSetPos.Call(uintptr(x), uintptr(y))
+	return mouseClick("")
+}
+
+// mouseDoubleClickAt moves then double-clicks atomically.
+func mouseDoubleClickAt(arg string) (string, error) {
+	x, y, err := parseXY(arg)
+	if err != nil {
+		return "", fmt.Errorf("mouse-doubleclick-at %v", err)
+	}
+	procSetPos.Call(uintptr(x), uintptr(y))
+	return mouseDoubleClick()
+}
+
 func mouseButton(arg string) (string, error) {
 	parts := strings.Fields(strings.ToLower(arg))
 	if len(parts) < 2 {

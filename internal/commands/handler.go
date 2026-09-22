@@ -19,6 +19,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/shirou/gopsutil/v3/cpu"
@@ -80,6 +81,37 @@ func cmdQuote(s string) string { return `"` + s + `"` }
 // The canonical map lives in internal/cmdlist (dependency-free, so the
 // controller and mobile builds can import it without Windows packages).
 var KnownCommands = cmdlist.Known
+
+var (
+	seenCmdsMu sync.Mutex
+	seenCmds   = map[string]int64{} // cmd id -> unixnano (two-controller dedupe)
+)
+
+// ExecuteChecked runs a command unless its id already ran in the last
+// minute (two controllers delivering the same command). Empty id always
+// runs (old controllers). Suppressed calls return suppressed=true so the
+// caller sends nothing instead of a confusing duplicate.
+func ExecuteChecked(cmdID, cmd, args string) (result string, suppressed bool, err error) {
+	if cmdID != "" {
+		now := time.Now().UnixNano()
+		seenCmdsMu.Lock()
+		if ts, ok := seenCmds[cmdID]; ok && now-ts < int64(time.Minute) {
+			seenCmdsMu.Unlock()
+			return "", true, nil
+		}
+		seenCmds[cmdID] = now
+		if len(seenCmds) > 500 {
+			for id, ts := range seenCmds {
+				if now-ts > 2*int64(time.Minute) {
+					delete(seenCmds, id)
+				}
+			}
+		}
+		seenCmdsMu.Unlock()
+	}
+	result, err = Execute(cmd, args)
+	return result, false, err
+}
 
 // Execute runs a command and returns result string
 func Execute(cmd, args string) (string, error) {
@@ -390,6 +422,10 @@ func Execute(cmd, args string) (string, error) {
 		return mouseClick(args)
 	case "mouse-doubleclick":
 		return mouseDoubleClick()
+	case "mouse-click-at":
+		return mouseClickAt(args)
+	case "mouse-doubleclick-at":
+		return mouseDoubleClickAt(args)
 	case "mouse-button":
 		return mouseButton(args)
 	case "mouse-scroll":
@@ -421,6 +457,31 @@ func Execute(cmd, args string) (string, error) {
 		return setMicMute(args)
 	case "set-default-audio-device":
 		return setDefaultAudioDevice(args)
+	case "start-audio-stream":
+		return StartAudioStream(args)
+	case "stop-audio-stream":
+		return StopAudioStream()
+	case "force-update":
+		// Runs controller-side (push-update button / interception). If it
+		// ever reaches the agent directly, say so instead of falling
+		// through to cmd.exe noise.
+		return "", fmt.Errorf("force-update runs controller-side: use Controller v1.4.19+ push-update button or type force-update there")
+	case "send-notification":
+		return sendNotification(args)
+	case "speak":
+		return speak(args)
+	case "speak-stop":
+		return speakStop()
+	case "keep-awake":
+		return keepAwake(args)
+	case "get-session-state":
+		return getSessionState()
+	case "get-foreground-window":
+		return getForegroundWindow()
+	case "get-agent-log":
+		return getAgentLog(args)
+	case "get-agent-debug-log":
+		return getAgentDebugLog(args)
 	case "send-text":
 		return sendText(args)
 	case "clipboard-get":
@@ -1144,6 +1205,11 @@ func sendText(t string) (string, error) {
 		return "", fmt.Errorf("usage: send-text <text>")
 	}
 	if runtime.GOOS == "windows" {
+		// Native first: one SendInput call (~1ms). PowerShell spawn below
+		// (~300-1000ms) is the fallback, not the default.
+		if err := sendTextNative(t); err == nil {
+			return "", nil
+		}
 		// Escape SendKeys special chars (+ ^ % ~ ( ) [ ] { }) with braces.
 		var b strings.Builder
 		for _, r := range t {
@@ -1167,6 +1233,9 @@ func keyPress(key string) (string, error) {
 		return "", fmt.Errorf("usage: key-press <key>  (e.g. {ENTER}, {TAB}, {F5}, ^s)")
 	}
 	if runtime.GOOS == "windows" {
+		if err := keyPressNative(key); err == nil {
+			return "", nil
+		}
 		script := fmt.Sprintf(`Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait("%s")`, strings.ReplaceAll(key, `"`, `""`))
 		return execPS(script)
 	}

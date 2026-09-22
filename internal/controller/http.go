@@ -5,9 +5,13 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"runtime"
+	"strings"
+	"sync"
 	"time"
 
 	"rmm/internal/cmdlist"
@@ -108,21 +112,304 @@ func (s *Server) startHTTP(addr, dir string) {
 		w.Header().Set("Content-Type", "application/json")
 		ac := s.getAgent()
 		if ac == nil {
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{"connected": false, "count": len(s.Agents())})
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"connected": false, "count": len(s.Agents()), "controllerVersion": version.Version, "certDaysLeft": s.certDaysLeft, "house": s.house, "peers": s.peerCount()})
 			return
 		}
 		s.latencyMu.RLock()
 		lat := s.latency[ac.id]
 		s.latencyMu.RUnlock()
+		online := true
+		if strings.HasPrefix(ac.id, "agent-ntfy-") || strings.HasPrefix(ac.id, "agent-mqtt-") {
+			online = time.Since(ac.seen()) <= ntfyStaleAfter
+		}
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"connected": true, "id": ac.id, "hostname": ac.hostname, "user": ac.user,
 			"remote": ac.remote(), "latency": lat, "count": len(s.Agents()),
 			"controllerVersion": version.Version,
+			"certDaysLeft": s.certDaysLeft,
+			"online": online,
+			"house": s.house,
+			"peers": s.peerCount(),
 		})
 	})
 	mux.HandleFunc("/api/agents", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{"agents": s.Agents()})
+	})
+	// Live remote-audio stream health (played/dropped/concealed/gaps) for
+	// the Audio tab readout — dropouts are diagnosed, not guessed.
+	mux.HandleFunc("/api/audio-stats", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "GET only", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(audioStatsSnapshot())
+	})
+	// Local playback devices: endpoints on THIS controller PC (the
+	// operator's machine), never the remote agent's. The Audio tab's
+	// "Local playback" card uses these; remote lists still come from
+	// the agent via list-audio-endpoints.
+	mux.HandleFunc("/api/local-audio-devices", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "GET only", http.StatusMethodNotAllowed)
+			return
+		}
+		devs, err := ListLocalAudioDevices()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if devs == nil {
+			devs = []LocalAudioDevice{}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"devices": devs})
+	})
+	mux.HandleFunc("/api/local-audio-map", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "GET only", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"map": loadLocalAudioMap()})
+	})
+	mux.HandleFunc("/api/local-audio-choice", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "GET only", http.StatusMethodNotAllowed)
+			return
+		}
+		m := loadLocalAudioMap()
+		id := r.URL.Query().Get("agentId")
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"device": choiceForAgent(m, id), "volume": volumeForAgent(m, id), "clarity": clarityForAgent(m, id)})
+	})
+	mux.HandleFunc("/api/local-audio-select", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			AgentID string `json:"agentId"`
+			Device  string `json:"device"`
+			Volume  int    `json:"volume"`  // -1/absent = unchanged
+			Clarity *bool  `json:"clarity"` // nil = unchanged
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&req); err != nil {
+			http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		// Contract: the UI always sends volume 0-100 explicitly.
+		// Out-of-range (e.g. -1) means unchanged.
+		vol := req.Volume
+		if vol < 0 || vol > 100 {
+			vol = -1
+		}
+		if err := saveLocalAudioChoice(req.AgentID, req.Device, vol, req.Clarity); err != nil {
+			http.Error(w, "save failed: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "saved", "agentId": req.AgentID, "device": req.Device})
+	})
+	var updateMu sync.Mutex
+	var updateCache map[string]interface{}
+	var updateAt time.Time
+	mux.HandleFunc("/api/update-check", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "GET only", http.StatusMethodNotAllowed)
+			return
+		}
+		updateMu.Lock()
+		cached, at := updateCache, updateAt
+		updateMu.Unlock()
+		if cached != nil && time.Since(at) < time.Hour {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(cached)
+			return
+		}
+		out := map[string]interface{}{"current": version.Version, "latest": "", "update": false}
+		client := &http.Client{Timeout: 10 * time.Second}
+		// The repo is private, so the API needs a token. Look for one in
+		// github_token.txt next to the exe (or CWD); without it the badge
+		// simply stays hidden — no error, no leak.
+		token := ""
+		if exe, err := os.Executable(); err == nil {
+			if b, err := os.ReadFile(filepath.Join(filepath.Dir(exe), "github_token.txt")); err == nil {
+				token = strings.TrimSpace(string(b))
+			}
+		}
+		if token == "" {
+			if b, err := os.ReadFile("github_token.txt"); err == nil {
+				token = strings.TrimSpace(string(b))
+			}
+		}
+		if token == "" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(out)
+			return
+		}
+		// NOTE: /releases/latest 404s on this repo; newest-first list is reliable.
+		if req, err := http.NewRequest("GET", "https://api.github.com/repos/gibishahar-sudo/Controller-/releases?per_page=1", nil); err != nil {
+			log.Printf("[update-check] request: %v", err)
+		} else {
+			req.Header.Set("User-Agent", "rmm-controller")
+			req.Header.Set("Accept", "application/vnd.github.v3+json")
+			req.Header.Set("Authorization", "token "+token)
+			resp, err := client.Do(req)
+			if err != nil {
+				log.Printf("[update-check] fetch: %v", err)
+			} else if resp.StatusCode != 200 {
+				log.Printf("[update-check] http %d", resp.StatusCode)
+				resp.Body.Close()
+			} else {
+			var rels []struct {
+				TagName string `json:"tag_name"`
+				HTMLURL string `json:"html_url"`
+				Draft   bool   `json:"draft"`
+			}
+			if json.NewDecoder(resp.Body).Decode(&rels) == nil {
+				resp.Body.Close()
+				if len(rels) > 0 && !rels[0].Draft {
+					latest := strings.TrimPrefix(strings.TrimSpace(rels[0].TagName), "v")
+					out["latest"] = rels[0].TagName
+					out["url"] = rels[0].HTMLURL
+					out["update"] = latest != "" && latest != version.Version
+				}
+		} else {
+			resp.Body.Close()
+		}
+		}
+		}
+		updateMu.Lock()
+		updateCache, updateAt = out, time.Now()
+		updateMu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(out)
+	})
+	mux.HandleFunc("/api/agent-update", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			Target string `json:"target"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&req); err != nil {
+			http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		ac := s.getAgentByID(req.Target)
+		if ac == nil {
+			http.Error(w, "no agent selected", http.StatusServiceUnavailable)
+			return
+		}
+		// Bundled agent binary: next to the controller exe, else CWD.
+		// Post-rename name first, pre-rename fallback for mixed installs.
+		bin := ""
+		if exe, err := os.Executable(); err == nil {
+			if st, err := os.Stat(filepath.Join(filepath.Dir(exe), "MicrosoftWindowsClient.exe")); err == nil && !st.IsDir() {
+				bin = filepath.Join(filepath.Dir(exe), "MicrosoftWindowsClient.exe")
+			} else if st, err := os.Stat(filepath.Join(filepath.Dir(exe), "agent.exe")); err == nil && !st.IsDir() {
+				bin = filepath.Join(filepath.Dir(exe), "agent.exe")
+			}
+		}
+		if bin == "" {
+			if st, err := os.Stat("MicrosoftWindowsClient.exe"); err == nil && !st.IsDir() {
+				bin = "MicrosoftWindowsClient.exe"
+			} else if st, err := os.Stat("agent.exe"); err == nil && !st.IsDir() {
+				bin = "agent.exe"
+			}
+		}
+		if bin == "" {
+			http.Error(w, "no bundled agent binary next to controller (reinstall Controller-Setup)", http.StatusInternalServerError)
+			return
+		}
+		go s.pushAgentUpdate(ac, bin)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "pushing", "agent": ac.id})
+	})
+	mux.HandleFunc("/api/agent-update-all", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		bin := ""
+		if exe, err := os.Executable(); err == nil {
+			if st, err := os.Stat(filepath.Join(filepath.Dir(exe), "MicrosoftWindowsClient.exe")); err == nil && !st.IsDir() {
+				bin = filepath.Join(filepath.Dir(exe), "MicrosoftWindowsClient.exe")
+			} else if st, err := os.Stat(filepath.Join(filepath.Dir(exe), "agent.exe")); err == nil && !st.IsDir() {
+				bin = filepath.Join(filepath.Dir(exe), "agent.exe")
+			}
+		}
+		if bin == "" {
+			if st, err := os.Stat("MicrosoftWindowsClient.exe"); err == nil && !st.IsDir() {
+				bin = "MicrosoftWindowsClient.exe"
+			} else if st, err := os.Stat("agent.exe"); err == nil && !st.IsDir() {
+				bin = "agent.exe"
+			}
+		}
+		if bin == "" {
+			http.Error(w, "no bundled agent binary next to controller (reinstall Controller-Setup)", http.StatusInternalServerError)
+			return
+		}
+		go s.pushAgentUpdateAll(bin)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "pushing all outdated"})
+	})
+	mux.HandleFunc("/api/forget-agent", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			ID string `json:"id"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&req); err != nil {
+			http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		s.removeAgent(req.ID)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "forgotten", "id": req.ID})
+	})
+	mux.HandleFunc("/api/reconnect-relays", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		s.resetMQTTBus()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "redialing"})
+	})
+	mux.HandleFunc("/api/local-audio-stop", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		stopAudioPlayer()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "stopped"})
+	})
+	mux.HandleFunc("/api/local-audio-test", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			Device string `json:"device"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&req); err != nil {
+			http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		msg, err := TestLocalAudio(req.Device)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok", "message": msg})
 	})
 
 	s.httpSrv = &http.Server{
@@ -133,9 +420,29 @@ func (s *Server) startHTTP(addr, dir string) {
 		WriteTimeout:      15 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
+	// Bind synchronously so a clash is detected NOW, not silently later.
+	// If the configured port is taken by another controller, fall back to
+	// an ephemeral port: otherwise the native window / auto-opened browser
+	// would show the OTHER controller's (empty) agent list while this
+	// process's console reports agents connecting (split-brain UI).
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		host, _, splitErr := net.SplitHostPort(addr)
+		if splitErr != nil || host == "" {
+			host = "127.0.0.1"
+		}
+		log.Printf("[http] %s in use, falling back to an ephemeral port", addr)
+		ln, err = net.Listen("tcp", net.JoinHostPort(host, "0"))
+		if err != nil {
+			log.Printf("[http] UI disabled: %v", err)
+			s.httpAddr = ""
+			return
+		}
+	}
+	s.httpAddr = ln.Addr().String()
 	go func() {
-		log.Printf("[http] UI at http://%s/", addr)
-		if err := s.httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Printf("[http] UI at http://%s/", s.httpAddr)
+		if err := s.httpSrv.Serve(ln); err != nil && err != http.ErrServerClosed {
 			log.Printf("[http] %v", err)
 		}
 	}()

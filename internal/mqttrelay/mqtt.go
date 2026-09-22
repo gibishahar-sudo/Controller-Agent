@@ -8,6 +8,8 @@
 //   - Base/out/<host>       agent data: output/screen/mouse/pong
 //   - Base/cmd/<host>       controller commands to one agent
 //   - Base/cmd/all          controller broadcasts (currently unused)
+//   - Base/presence         controller heartbeats (controllers subscribe;
+//                             agents never see it; peer count = HA visibility)
 // Payloads are relay.Envelope JSON (same shape as the ntfy path, so all
 // routing/To-filtering code is shared). QoS 0 + clean session everywhere:
 // drops beat duplicates/replays for screens and mouse; commands are
@@ -16,11 +18,13 @@ package mqttrelay
 
 import (
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	paho "github.com/eclipse/paho.mqtt.golang"
@@ -28,12 +32,24 @@ import (
 )
 
 var (
-	// Brokers in priority order; Dial tries each with a 5s timeout.
+	// TLS-only brokers (no username/password): every relay byte is
+	// encrypted in transit. Verification stays ON (InsecureSkipVerify is
+	// never set) so this is real encryption, not just obfuscation.
+	// Sticky priority order (first reachable wins) so all processes meet
+	// on the same broker. A latency race was tried and caused chronic
+	// split-brain; failures cool down 5 minutes, then rejoin the order.
 	Brokers = []string{
-		"tcp://broker.emqx.io:1883",
-		"tcp://test.mosquitto.org:1883",
-		"tcp://broker.hivemq.com:1883",
+		"ssl://broker.emqx.io:8883",
+		"ssl://broker.hivemq.com:8883",
+		// WebSocket-TLS fallback on 443-ish ports: when a firewall kills
+		// raw 8883, MQTT-over-WSS usually still passes. Tried last (more
+		// overhead than raw TLS) and skipped automatically when unreachable.
+		"wss://broker.emqx.io:8084/mqtt",
 	}
+	// NOTE: test.mosquitto.org:8883 was dropped: its chain does not verify
+	// against the Windows root store (unknown authority), and unverified
+	// TLS is worse than no entry. Two verified brokers + WSS fallback +
+	// direct + ntfy keep redundancy intact.
 	// Base is the topic root. Keep in sync on both sides.
 	Base = "rmm/1762299854"
 )
@@ -56,6 +72,9 @@ func dial(broker, clientID string, onConnect paho.OnConnectHandler) (paho.Client
 	opts.SetConnectTimeout(5 * time.Second)
 	opts.SetKeepAlive(30 * time.Second)
 	opts.SetPingTimeout(10 * time.Second)
+	if strings.HasPrefix(broker, "ssl://") || strings.HasPrefix(broker, "tls://") || strings.HasPrefix(broker, "wss://") {
+		opts.SetTLSConfig(&tls.Config{MinVersion: tls.VersionTLS12})
+	}
 	opts.SetOnConnectHandler(onConnect)
 	opts.SetConnectionLostHandler(func(_ paho.Client, err error) {
 		log.Printf("[mqtt] connection lost (%s): %v", broker, err)
@@ -99,24 +118,103 @@ type AgentBus struct {
 	host   string
 }
 
-// DialAgent connects to the first reachable broker.
-func DialAgent(hostname string) (*AgentBus, error) {
+var (
+	brokerMu       sync.Mutex
+	cachedBroker   string
+	brokerCooldown = map[string]int64{} // broker -> unixnano until which it is skipped
+)
+
+func noteBrokerFailure(b string) {
+	brokerMu.Lock()
+	defer brokerMu.Unlock()
+	if b == cachedBroker {
+		cachedBroker = ""
+	}
+	brokerCooldown[b] = time.Now().Add(5 * time.Minute).UnixNano()
+}
+
+// raceDial picks a healthy broker with sticky priority order (first
+// reachable wins) so every process converges on the SAME broker —
+// rendezvous requires it, since publishers and subscribers only meet when
+// they share one. A parallel race by latency was tried and caused chronic
+// split-brain (agent on emqx, controller on hivemq, silence both ways).
+// Failed brokers cool down 5 minutes, then rejoin the order.
+func raceDial(idPrefix string) (paho.Client, string, error) {
+	return raceDialExcept(idPrefix, "", true)
+}
+
+// raceDialExcept is raceDial that skips one broker (the controller's second
+// bus listens on a DIFFERENT broker so agents are heard no matter which
+// broker they picked — split-brain is impossible when you listen on both).
+// With useCache=false the shared sticky cache is left untouched.
+func raceDialExcept(idPrefix, skip string, useCache bool) (paho.Client, string, error) {
+	brokerMu.Lock()
+	cached, cooled := cachedBroker, brokerCooldown[cachedBroker] > time.Now().UnixNano()
+	brokerMu.Unlock()
+	if useCache && cached != "" && !cooled && cached != skip {
+		id := fmt.Sprintf("%s-%s", idPrefix, randHex(3))
+		if c, err := dial(cached, id, nil); err == nil {
+			return c, cached, nil
+		}
+		noteBrokerFailure(cached)
+	}
+	now := time.Now().UnixNano()
+	brokerMu.Lock()
+	var cands []string
+	for _, b := range Brokers {
+		if b != skip && brokerCooldown[b] <= now {
+			cands = append(cands, b)
+		}
+	}
+	brokerMu.Unlock()
+	if len(cands) == 0 {
+		return nil, "", fmt.Errorf("all brokers cooling down")
+	}
 	var lastErr error
-	for _, broker := range Brokers {
-		id := fmt.Sprintf("rmm-agent-%s-%s", sanitize(hostname), randHex(3))
-		c, err := dial(broker, id, nil)
+	for _, b := range cands {
+		id := fmt.Sprintf("%s-%s", idPrefix, randHex(3))
+		t := time.Now()
+		c, err := dial(b, id, nil)
 		if err != nil {
-			log.Printf("[mqtt] %s unreachable: %v", broker, shortErr(err))
+			log.Printf("[mqtt] %s unreachable: %v", b, shortErr(err))
+			noteBrokerFailure(b)
 			lastErr = err
 			continue
 		}
-		log.Printf("[mqtt] agent connected via %s", broker)
-		return &AgentBus{client: c, broker: broker, host: hostname}, nil
+		if useCache {
+			brokerMu.Lock()
+			cachedBroker = b
+			brokerMu.Unlock()
+		}
+		log.Printf("[mqtt] broker %s (%s)", b, time.Since(t).Round(time.Millisecond))
+		return c, b, nil
 	}
 	if lastErr == nil {
-		lastErr = fmt.Errorf("no brokers configured")
+		lastErr = fmt.Errorf("no brokers reachable")
 	}
-	return nil, lastErr
+	return nil, "", lastErr
+}
+
+// DialControllerExcept connects through the first healthy broker that is
+// NOT skip (the controller's secondary listener). Shares failure/cooldown
+// tracking but never disturbs the sticky primary cache.
+func DialControllerExcept(skip string) (*CtrlBus, error) {
+	c, broker, err := raceDialExcept("rmm-ctrl2", skip, false)
+	if err != nil {
+		return nil, err
+	}
+	log.Printf("[mqtt] controller secondary via %s", broker)
+	return &CtrlBus{client: c, broker: broker}, nil
+}
+
+// DialAgent connects through the fastest healthy broker.
+func DialAgent(hostname string) (*AgentBus, error) {
+	c, broker, err := raceDial("rmm-agent-" + sanitize(hostname))
+	if err != nil {
+		return nil, err
+	}
+	log.Printf("[mqtt] agent connected via %s", broker)
+	return &AgentBus{client: c, broker: broker, host: hostname}, nil
 }
 
 // SubscribeCmd subscribes to our directed topic plus broadcasts.
@@ -150,38 +248,34 @@ func (b *AgentBus) Publish(suffix string, env relay.Envelope) error {
 
 func (b *AgentBus) Close() { b.client.Disconnect(500) }
 
+// Broker reports which broker this bus is connected through (diagnostics).
+func (b *AgentBus) Broker() string { return b.broker }
+
 // CtrlBus is the controller side of the MQTT transport.
 type CtrlBus struct {
 	client paho.Client
 	broker string
 }
 
-// DialController connects to the first reachable broker.
+// DialController connects through the fastest healthy broker.
 func DialController() (*CtrlBus, error) {
-	var lastErr error
-	for _, broker := range Brokers {
-		id := "rmm-ctrl-" + randHex(3)
-		c, err := dial(broker, id, nil)
-		if err != nil {
-			log.Printf("[mqtt] %s unreachable: %v", broker, shortErr(err))
-			lastErr = err
-			continue
-		}
-		log.Printf("[mqtt] controller connected via %s", broker)
-		return &CtrlBus{client: c, broker: broker}, nil
+	c, broker, err := raceDial("rmm-ctrl")
+	if err != nil {
+		return nil, err
 	}
-	if lastErr == nil {
-		lastErr = fmt.Errorf("no brokers configured")
-	}
-	return nil, lastErr
+	log.Printf("[mqtt] controller connected via %s", broker)
+	return &CtrlBus{client: c, broker: broker}, nil
 }
 
-// Subscribe registers hello + all agent outputs. Topic is passed so the
-// controller can route (hello vs out/<host>).
+// Subscribe registers hello + all agent outputs + live audio chunks +
+// controller presence. Topic is passed so the controller can route
+// (hello vs out/<host> vs audio/<host> vs presence).
 func (b *CtrlBus) Subscribe(handle func(topic string, env relay.Envelope)) error {
 	topics := map[string]byte{
-		Base + "/hello": 0,
-		Base + "/out/+": 0,
+		Base + "/hello":   0,
+		Base + "/out/+":   0,
+		Base + "/audio/+": 0,
+		Base + "/presence": 0,
 	}
 	token := b.client.SubscribeMultiple(topics, func(_ paho.Client, m paho.Message) {
 		var env relay.Envelope
@@ -201,7 +295,16 @@ func (b *CtrlBus) PublishCmd(host string, env relay.Envelope) error {
 	return publish(b.client, Base+"/cmd/"+host, env)
 }
 
+// PublishPresence broadcasts a controller heartbeat (peer visibility for
+// multi-controller HA). Only controllers subscribe; agents never see it.
+func (b *CtrlBus) PublishPresence(env relay.Envelope) error {
+	return publish(b.client, Base+"/presence", env)
+}
+
 func (b *CtrlBus) Close() { b.client.Disconnect(500) }
+
+// Broker reports which broker this bus is connected through (diagnostics).
+func (b *CtrlBus) Broker() string { return b.broker }
 
 func sanitize(s string) string {
 	var b strings.Builder

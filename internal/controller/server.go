@@ -20,8 +20,13 @@ package controller
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -41,6 +46,7 @@ import (
 	"rmm/internal/mqttrelay"
 	"rmm/internal/protocol"
 	"rmm/internal/relay"
+	"rmm/internal/version"
 )
 
 const (
@@ -58,6 +64,7 @@ type Options struct {
 	CertFile     string
 	KeyFile      string
 	HTTPAddr     string // "" disables UI
+	House        string // operator label for multi-house setups (e.g. Home)
 	ScreensDir   string
 	AutoOpen     bool
 	NtfyTopic    string // "" = default
@@ -73,6 +80,7 @@ type AgentConn struct {
 	hostname string
 	user     string
 	id       string
+	version  string // DesktopAgentVersion from TypeConnect/hello ("" = old agent, unknown)
 	mu       sync.Mutex
 
 	lastSeenMu sync.Mutex
@@ -123,24 +131,32 @@ func (a *AgentConn) transport() string {
 	return "direct"
 }
 
-// mqttHost returns the MQTT topic host for directed commands.
+// mqttHost returns the MQTT topic host for directed commands. This MUST be
+// the plain hostname: agents subscribe to cmd/<hostname> (their instance id
+// is only used for the controller-side agent id, never for topics).
+// Publishing to the instance id was a v1.4.6 regression that silently
+// dropped every command to relay agents (they showed "connected" via hello
+// but never received anything).
 func (a *AgentConn) mqttHost() string {
-	if strings.HasPrefix(a.id, "agent-mqtt-") {
-		return strings.TrimPrefix(a.id, "agent-mqtt-")
-	}
 	if a.hostname != "" {
 		return a.hostname
+	}
+	if strings.HasPrefix(a.id, "agent-mqtt-") {
+		return strings.TrimPrefix(a.id, "agent-mqtt-")
 	}
 	return a.id
 }
 
-// ntfyName returns the agent hostname used for directed ntfy delivery.
+// ntfyName returns the name used for directed ntfy delivery. This MUST be
+// the plain hostname: agents poll with To-filter == hostname, so a To of
+// the instance id is filtered out and the command never arrives (same
+// v1.4.6 regression as mqttHost).
 func (a *AgentConn) ntfyName() string {
-	if strings.HasPrefix(a.id, "agent-ntfy-") {
-		return strings.TrimPrefix(a.id, "agent-ntfy-")
-	}
 	if a.hostname != "" {
 		return a.hostname
+	}
+	if strings.HasPrefix(a.id, "agent-ntfy-") {
+		return strings.TrimPrefix(a.id, "agent-ntfy-")
 	}
 	return a.id
 }
@@ -158,10 +174,17 @@ type Server struct {
 	closeOnce   sync.Once
 	wg          sync.WaitGroup
 	screenshotN atomic.Int64
+	lastScreenRotate atomic.Int64
 
 	agents        map[string]*AgentConn
 	agentsMu      sync.RWMutex
 	currentAgent  *AgentConn
+	peers         map[string]peerInfo // live peer controllers by ctrl id
+	peersMu       sync.Mutex
+	pending       map[string]*pendingCmd // relay commands awaiting output
+	pendingMu     sync.Mutex
+	certDaysLeft  int
+	house         string
 	latency       map[string]int64
 	latencyMu     sync.RWMutex
 	wsClients     map[*wsClient]bool
@@ -169,9 +192,20 @@ type Server struct {
 	screenshotDir string
 	httpAddr      string
 
-	mqttMu      sync.Mutex
-	mqttBus     *mqttrelay.CtrlBus
-	mqttLastMsg atomic.Int64 // unixnano of last inbound MQTT message
+	mqttMu       sync.Mutex
+	mqttBus      *mqttrelay.CtrlBus // primary listener/publisher
+	mqttBus2     *mqttrelay.CtrlBus // secondary listener on a different broker (split-brain guard)
+	mqttLastMsg  atomic.Int64       // unixnano of last inbound MQTT message (either bus)
+	mqttLastMsg1 atomic.Int64       // primary bus traffic (per-bus blackhole watchdog)
+	mqttLastMsg2 atomic.Int64       // secondary bus traffic
+
+	// End-to-end payload encryption (relay transports): per-agent AES data
+	// keys, wrapped once by the agent with this controller's RSA public
+	// key. Keyed by agent hostname. Absent key = plaintext peer (old
+	// agent), which stays accepted for backward compatibility.
+	rsaPriv *rsa.PrivateKey
+	e2eMu   sync.Mutex
+	e2eKeys map[string][32]byte
 }
 
 type wsClient struct {
@@ -211,6 +245,7 @@ func StartBackground(opts Options) (*Server, error) {
 		wsClients: make(map[*wsClient]bool),
 		closeCh:   make(chan struct{}),
 		httpAddr:  opts.HTTPAddr,
+		house:     opts.House,
 	}
 	certFile := resolveCert(opts.CertFile, "server.crt")
 	keyFile := resolveCert(opts.KeyFile, "server.key")
@@ -230,6 +265,26 @@ func StartBackground(opts Options) (*Server, error) {
 		}
 	}
 	s.tlsCfg = &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
+	s.e2eKeys = make(map[string][32]byte)
+	if priv, ok := cert.PrivateKey.(*rsa.PrivateKey); ok {
+		s.rsaPriv = priv
+	} else {
+		log.Printf("[e2e] no RSA private key: inbound key exchanges will be refused, relay stays plaintext")
+	}
+	// Cert-expiry guard: an expired server cert silently kills every direct
+	// agent connection, so warn loudly while there is still time to rotate.
+	if len(cert.Certificate) > 0 {
+		if leaf, err := x509.ParseCertificate(cert.Certificate[0]); err == nil {
+			s.certDaysLeft = int(time.Until(leaf.NotAfter).Hours() / 24)
+			if s.certDaysLeft < 0 {
+				log.Printf("[!] TLS certificate EXPIRED %d days ago — direct connections will fail; regenerate with gencerts", -s.certDaysLeft)
+			} else if s.certDaysLeft < 30 {
+				log.Printf("[!] TLS certificate expires in %d days — regenerate with gencerts soon", s.certDaysLeft)
+			} else {
+				log.Printf("[*] TLS certificate valid for %d more days", s.certDaysLeft)
+			}
+		}
+	}
 
 	addrs := []string{opts.Addr, ":443", ":22", ":53", ":80", ":4445"}
 	addrs = append(addrs, opts.ExtraAddrs...)
@@ -290,10 +345,18 @@ func StartBackground(opts Options) (*Server, error) {
 	s.screenshotDir = resolveScreensDir(opts.ScreensDir)
 	if opts.HTTPAddr != "" {
 		s.startHTTP(opts.HTTPAddr, s.screenshotDir)
+		if ui := s.HTTPAddr(); ui != "" {
+			log.Printf("[http] serving this controller's UI at http://%s/", ui)
+			if h, _, err := net.SplitHostPort(ui); err != nil || (h != "" && h != "127.0.0.1" && h != "::1" && h != "localhost") {
+				log.Printf("[!] HTTP UI is bound to %s (NOT loopback) and has NO password — anyone who can reach it controls every agent. Use 127.0.0.1 unless you need LAN access.", ui)
+			}
+		}
 		if opts.AutoOpen {
 			go func() {
 				time.Sleep(500 * time.Millisecond)
-				openBrowser("http://" + opts.HTTPAddr + "/")
+				if ui := s.HTTPAddr(); ui != "" {
+					openBrowser("http://" + ui + "/")
+				}
 			}()
 		}
 	}
@@ -323,7 +386,309 @@ func StartBackground(opts Options) (*Server, error) {
 		defer s.wg.Done()
 		s.sweepLoop()
 	}()
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.cmdRetryLoop()
+	}()
 	return s, nil
+}
+
+// pendingCmd tracks a relay command awaiting its output so a lost packet
+// can be retried once instead of silently vanishing. Agent-side CmdID
+// dedupe makes redelivery safe (already-executed commands are suppressed,
+// never re-run).
+type pendingCmd struct {
+	msg      protocol.Message
+	targetID string
+	sentAt   int64 // unixnano
+	retries  int
+}
+
+func (s *Server) trackCmd(msg protocol.Message, targetID string) {
+	if msg.Type != protocol.TypeCommand || msg.CmdID == "" {
+		return
+	}
+	now := time.Now().UnixNano()
+	s.pendingMu.Lock()
+	if s.pending == nil {
+		s.pending = map[string]*pendingCmd{}
+	}
+	if old, ok := s.pending[msg.CmdID]; ok {
+		// Re-send (retry/failover): fresh attempt clock, kept retry count
+		// so retries stay bounded instead of resetting forever.
+		old.msg = msg
+		old.targetID = targetID
+		old.sentAt = now
+	} else {
+		s.pending[msg.CmdID] = &pendingCmd{msg: msg, targetID: targetID, sentAt: now}
+	}
+	s.pendingMu.Unlock()
+}
+
+// ackCmd clears a pending command when any output carrying its CmdID lands.
+func (s *Server) ackCmd(cmdID string) {
+	if cmdID == "" {
+		return
+	}
+	s.pendingMu.Lock()
+	delete(s.pending, cmdID)
+	s.pendingMu.Unlock()
+}
+
+// cmdRetryLoop resends relay commands that produced no output within 10s
+// (one retry, then forgotten after 2 minutes). At-most-once delivery was
+// the relay's quiet data-loss hole; dedupe keeps this at-most-once
+// execution with at-least-once delivery attempt.
+func (s *Server) cmdRetryLoop() {
+	t := time.NewTicker(5 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-s.closeCh:
+			return
+		case <-t.C:
+		}
+		now := time.Now().UnixNano()
+		s.pendingMu.Lock()
+		for id, p := range s.pending {
+			age := now - p.sentAt
+			if age > 120e9 {
+				delete(s.pending, id)
+				continue
+			}
+			if age > 10e9 && p.retries < 1 {
+				p.retries++
+				s.pendingMu.Unlock()
+				if ac := s.getAgentByID(p.targetID); ac != nil {
+					log.Printf("[retry] %s no output in 10s, resending via %s", id, ac.id)
+					_ = s.sendToAgent(ac, p.msg)
+				} else {
+					s.pendingMu.Lock()
+					delete(s.pending, id)
+					s.pendingMu.Unlock()
+				}
+				s.pendingMu.Lock()
+			}
+		}
+		s.pendingMu.Unlock()
+	}
+}
+
+// HTTPAddr returns the actual bound HTTP UI address (host:port), which may
+// differ from Options.HTTPAddr when the configured port was taken and an
+// ephemeral port was used instead. "" means the UI is disabled/failed.
+// Written once by startHTTP before StartBackground returns.
+func (s *Server) HTTPAddr() string {
+	return s.httpAddr
+}
+
+// e2eSet stores an agent data key from a keyxchg message.
+func (s *Server) e2eSet(host string, key [32]byte) {
+	if host == "" {
+		return
+	}
+	s.e2eMu.Lock()
+	s.e2eKeys[host] = key
+	s.e2eMu.Unlock()
+}
+
+// e2eGet fetches an agent data key. Absent = plaintext peer (old agent).
+func (s *Server) e2eGet(host string) ([32]byte, bool) {
+	s.e2eMu.Lock()
+	defer s.e2eMu.Unlock()
+	k, ok := s.e2eKeys[host]
+	return k, ok
+}
+
+// e2eHas reports whether relay traffic with host is end-to-end encrypted.
+func (s *Server) e2eHas(host string) bool {
+	_, ok := s.e2eGet(host)
+	return ok
+}
+
+// e2eKeyxchg unwraps an agent data key (RSA-OAEP with our private key).
+// Never logs key material, only the fact.
+func (s *Server) e2eKeyxchg(host, wrappedB64 string) {
+	if s.rsaPriv == nil || host == "" || wrappedB64 == "" {
+		return
+	}
+	raw, err := base64.StdEncoding.DecodeString(wrappedB64)
+	if err != nil {
+		log.Printf("[e2e] %s: bad keyxchg encoding", host)
+		return
+	}
+	secret, err := rsa.DecryptOAEP(sha256.New(), rand.Reader, s.rsaPriv, raw, nil)
+	if err != nil {
+		log.Printf("[e2e] %s: keyxchg unwrap failed", host)
+		return
+	}
+	if len(secret) != 32 {
+		log.Printf("[e2e] %s: bad keyxchg length", host)
+		return
+	}
+	var k [32]byte
+	copy(k[:], secret)
+	s.e2eSet(host, k)
+	log.Printf("[e2e] encrypted relay channel established with %s", host)
+}
+
+// e2eDecryptEnv opens an Enc envelope payload using the sender's key.
+// Returns the plaintext payload, or ok=false to drop the message.
+func (s *Server) e2eDecryptEnv(host string, env relay.Envelope) (json.RawMessage, bool) {
+	if !env.Enc {
+		return env.Payload, true
+	}
+	key, ok := s.e2eGet(host)
+	if !ok {
+		log.Printf("[e2e] %s: sealed message without key, dropped", host)
+		return nil, false
+	}
+	plain, err := relay.OpenPayload(key, env.Payload)
+	if err != nil {
+		log.Printf("[e2e] %s: open failed, dropped", host)
+		return nil, false
+	}
+	return json.RawMessage(plain), true
+}
+
+// e2eSealMsg seals an outbound protocol message for a keyed agent.
+// Falls back to plaintext (old agents).
+func (s *Server) e2eSealMsg(host string, msg protocol.Message) (json.RawMessage, bool) {
+	key, ok := s.e2eGet(host)
+	if !ok {
+		b, _ := json.Marshal(msg)
+		return b, false
+	}
+	b, err := json.Marshal(msg)
+	if err != nil {
+		bb, _ := json.Marshal(msg)
+		return bb, false
+	}
+	sealed, err := relay.SealPayload(key, b)
+	if err != nil {
+		bb, _ := json.Marshal(msg)
+		return bb, false
+	}
+	return sealed, true
+}
+
+// pushAgentUpdate streams the bundled agent binary to one agent in
+// per-transport chunks. The agent verifies SHA256, swaps its exe, and
+// restarts (singleton dedupes overlap). Progress lands in the terminal
+// via the agent's own outputs. Returns true if all chunks were sent.
+func (s *Server) pushAgentUpdate(ac *AgentConn, bin string) bool {
+	data, err := os.ReadFile(bin)
+	if err != nil {
+		log.Printf("[update] read %s: %v", bin, err)
+		s.broadcastWS(map[string]interface{}{"type": "output", "id": ac.id, "data": "push-update failed: cannot read bundled agent binary", "success": false})
+		return false
+	}
+	if ac.version != "" && ac.version == version.DesktopAgentVersion {
+		log.Printf("[update] %s already up to date (%s), skipping", ac.id, ac.version)
+		s.broadcastWS(map[string]interface{}{"type": "output", "id": ac.id, "data": fmt.Sprintf("skip %s: already %s", ac.hostname, ac.version), "success": true})
+		return true
+	}
+	sum := sha256.Sum256(data)
+	sha := hex.EncodeToString(sum[:])
+	chunkRaw := 512 * 1024
+	pacing := time.Duration(0)
+	slowWarn := ""
+	switch ac.transport() {
+	case "mqtt":
+		chunkRaw = 64 * 1024
+		pacing = 100 * time.Millisecond
+	case "ntfy":
+		chunkRaw = 4 * 1024
+		pacing = 500 * time.Millisecond
+		slowWarn = " (ntfy is slow: ~25min for a full binary — direct/MQTT preferred)"
+	}
+	total := (len(data) + chunkRaw - 1) / chunkRaw
+	log.Printf("[update] pushing agent binary (%d bytes, %d chunks) to %s%s", len(data), total, ac.id, slowWarn)
+	s.broadcastWS(map[string]interface{}{"type": "output", "id": ac.id, "data": fmt.Sprintf("pushing update (%d bytes, %d chunks)%s", len(data), total, slowWarn), "success": true})
+	begin := protocol.Message{Type: protocol.TypeUpdateBegin, UpdateVer: version.DesktopAgentVersion, UpdateSize: int64(len(data)), UpdateSHA: sha, UpdateTotal: total}
+	if err := s.sendToAgent(ac, begin); err != nil {
+		log.Printf("[update] begin failed: %v", err)
+		return false
+	}
+	for i := 0; i < total; i++ {
+		end := (i + 1) * chunkRaw
+		if end > len(data) {
+			end = len(data)
+		}
+		chunk := protocol.Message{
+			Type:      protocol.TypeUpdateChunk,
+			UpdateSeq: i,
+			Data:      base64.StdEncoding.EncodeToString(data[i*chunkRaw : end]),
+		}
+		if err := s.sendToAgent(ac, chunk); err != nil {
+			log.Printf("[update] chunk %d failed: %v", i, err)
+			return false
+		}
+		if (i+1)%20 == 0 || i+1 == total {
+			log.Printf("[update] %s: %d/%d chunks", ac.id, i+1, total)
+		}
+		if pacing > 0 {
+			time.Sleep(pacing)
+		}
+	}
+	log.Printf("[update] %s: all chunks sent, waiting for agent verify+restart", ac.id)
+	return true
+}
+
+// pushAgentUpdateAll streams the bundled binary to every outdated connected
+// agent, sequentially with a small gap (so relay buses aren't flooded).
+// Returns how many were actually pushed (skips up-to-date + offline).
+func (s *Server) pushAgentUpdateAll(bin string) (pushed, skipped, offline int) {
+	// Snapshot outdated, online agents (copy ids so we don't hold the lock
+	// while doing slow chunked sends).
+	s.agentsMu.RLock()
+	var targets []string
+	for id, a := range s.agents {
+		online := true
+		if strings.HasPrefix(id, "agent-ntfy-") || strings.HasPrefix(id, "agent-mqtt-") {
+			online = time.Since(a.seen()) <= ntfyStaleAfter
+		}
+		if !online {
+			offline++
+			continue
+		}
+		if a.version != "" && a.version == version.DesktopAgentVersion {
+			skipped++
+			continue
+		}
+		targets = append(targets, id)
+	}
+	s.agentsMu.RUnlock()
+	if len(targets) == 0 {
+		s.broadcastWS(map[string]interface{}{"type": "output", "data": fmt.Sprintf("update-all: nothing outdated (%d up to date, %d offline)", skipped, offline), "success": true})
+		return 0, skipped, offline
+	}
+	s.broadcastWS(map[string]interface{}{"type": "output", "data": fmt.Sprintf("update-all: pushing %d agent(s) (%d up to date, %d offline skipped)", len(targets), skipped, offline), "success": true})
+	for _, id := range targets {
+		ac := s.getAgentByID(id)
+		if ac == nil {
+			continue
+		}
+		s.pushAgentUpdate(ac, bin)
+		time.Sleep(800 * time.Millisecond)
+	}
+	return len(targets), skipped, offline
+}
+
+// resetMQTTBus drops both relay buses so mqttLoop re-dials (and
+// re-measures brokers). Manual unstick lever behind /api/reconnect-relays.
+func (s *Server) resetMQTTBus() {
+	s.mqttMu.Lock()
+	b, b2 := s.mqttBus, s.mqttBus2
+	s.mqttBus, s.mqttBus2 = nil, nil
+	s.mqttMu.Unlock()
+	if b != nil {
+		b.Close()
+	}
+	if b2 != nil {
+		b2.Close()
+	}
 }
 
 // Close stops listeners, HTTP server and background loops.
@@ -356,9 +721,22 @@ func (s *Server) Agents() []map[string]interface{} {
 		s.latencyMu.RLock()
 		lat := s.latency[a.id]
 		s.latencyMu.RUnlock()
+		// Relay agents unseen for a while are reported offline (with
+		// last-seen) rather than dropped, so the UI can gray them instead
+		// of silently losing them. Direct agents vanish on TCP close.
+		online := true
+		var seenAgo int64
+		if strings.HasPrefix(a.id, "agent-ntfy-") || strings.HasPrefix(a.id, "agent-mqtt-") {
+			ago := time.Since(a.seen())
+			seenAgo = int64(ago.Seconds())
+			online = ago <= ntfyStaleAfter
+		}
+		outdated := a.version != "" && a.version != version.Version
 		out = append(out, map[string]interface{}{
 			"id": a.id, "hostname": a.hostname, "user": a.user,
-			"connected": true, "latency": lat, "remote": a.remote(),
+			"version": a.version, "outdated": outdated,
+			"connected": online, "seenAgoSec": seenAgo,
+			"latency": lat, "remote": a.remote(), "e2e": s.e2eHas(a.hostname),
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i]["id"].(string) < out[j]["id"].(string) })
@@ -389,6 +767,105 @@ func (s *Server) getAgentByID(id string) *AgentConn {
 		return s.currentAgent
 	}
 	return s.agents[id]
+}
+
+// getMQTTAgent resolves a relay agent by the plain hostname its messages
+// arrive under. Prefers the exact id (old agents without instance ids),
+// then falls back to matching AgentConn.hostname so instanced
+// (v1.4.6+) agents are found.
+func (s *Server) getMQTTAgent(host string) *AgentConn {
+	if host == "" {
+		return nil
+	}
+	s.agentsMu.RLock()
+	defer s.agentsMu.RUnlock()
+	if ac, ok := s.agents["agent-mqtt-"+host]; ok {
+		return ac
+	}
+	for _, ac := range s.agents {
+		if strings.HasPrefix(ac.id, "agent-mqtt-") && ac.hostname == host {
+			return ac
+		}
+	}
+	return nil
+}
+
+// findAgentByHostname returns any connected agent (any transport) with the
+// given hostname, for stream-to-device mapping.
+func (s *Server) findAgentByHostname(host string) *AgentConn {
+	if host == "" {
+		return nil
+	}
+	s.agentsMu.RLock()
+	defer s.agentsMu.RUnlock()
+	for _, ac := range s.agents {
+		if ac.hostname == host {
+			return ac
+		}
+	}
+	return nil
+}
+
+// handleAudioChunk plays one live PCM chunk from a streaming agent on the
+// operator's selected local device (see audio_playback.go). Chunks arrive
+// as {"seq":N,"data":"base64 s16 mono 22050Hz"}.
+func (s *Server) handleAudioChunk(topic string, env relay.Envelope) {
+	s.mqttLastMsg.Store(time.Now().UnixNano())
+	host := strings.TrimPrefix(env.From, "agent:")
+	if host == "" || host == env.From {
+		if i := strings.LastIndex(topic, "/"); i != -1 {
+			host = topic[i+1:]
+		}
+	}
+	if host == "" {
+		return
+	}
+	payload := env.Payload
+	if env.Enc {
+		plain, ok := s.e2eDecryptEnv(host, env)
+		if !ok {
+			return
+		}
+		payload = plain
+	}
+	var chunk struct {
+		Seq  int    `json:"seq"`
+		V    int    `json:"v"`
+		K    bool   `json:"k"`
+		Data string `json:"data"`
+	}
+	if err := json.Unmarshal(payload, &chunk); err != nil {
+		return
+	}
+	// Lockstep guard: keyframes and sequence gaps both reset the
+	// predictor, bounding any divergence window. Gaps are counted.
+	if noteAudioSeq(host, chunk.Seq, chunk.K) {
+		resetAudioDecoder(host)
+	}
+	wire, err := base64.StdEncoding.DecodeString(chunk.Data)
+	if err != nil || len(wire) == 0 {
+		return
+	}
+	raw := decodeAudioChunk(host, chunk.V, wire)
+	if len(raw) == 0 {
+		return
+	}
+	dev := ""
+	gain := 1.0
+	clarity := true
+	if ac := s.findAgentByHostname(host); ac != nil {
+		m := loadLocalAudioMap()
+		dev = choiceForAgent(m, ac.id)
+		gain = float64(volumeForAgent(m, ac.id)) / 100
+		clarity = clarityForAgent(m, ac.id)
+	} else {
+		m := loadLocalAudioMap()
+		dev = choiceForAgent(m, "")
+		gain = float64(volumeForAgent(m, "")) / 100
+		clarity = clarityForAgent(m, "")
+	}
+	ensureAudioPlayer(host, dev, gain, clarity)
+	writeAudioChunk(raw)
 }
 
 // disconnectAgent ends the session with one agent WITHOUT touching the
@@ -471,19 +948,81 @@ func (s *Server) broadcastAudiolistIfJSON(result, id string) bool {
 
 // sendToAgent routes via MQTT/ntfy (directed) for virtual agents, TLS otherwise.
 func (s *Server) sendToAgent(ac *AgentConn, msg protocol.Message) error {
+	// Unique command id so agents drop duplicates when two controllers
+	// deliver the same command (one fleet, several houses).
+	if msg.Type == protocol.TypeCommand && msg.CmdID == "" {
+		msg.CmdID = fmt.Sprintf("c%d-%d", s.idCounter.Add(1), time.Now().UnixNano())
+	}
 	if strings.HasPrefix(ac.id, "agent-ntfy-") {
-		return relay.PublishTo("controller", ac.ntfyName(), msg)
+		name := ac.ntfyName()
+		s.trackCmd(msg, ac.id) // relay loss is real: retry if no output
+		if payload, enc := s.e2eSealMsg(name, msg); enc {
+			return relay.PublishEnvelope(relay.Envelope{From: "controller", To: name, Payload: payload, Enc: true, Time: time.Now().UnixMilli()})
+		}
+		return relay.PublishTo("controller", name, msg)
 	}
 	if strings.HasPrefix(ac.id, "agent-mqtt-") {
 		s.mqttMu.Lock()
-		bus := s.mqttBus
+		bus, bus2 := s.mqttBus, s.mqttBus2
 		s.mqttMu.Unlock()
-		if bus == nil {
+		if bus == nil && bus2 == nil {
 			return fmt.Errorf("mqtt bus not connected")
 		}
-		return bus.PublishCmd(ac.mqttHost(), relay.Envelope{From: "controller", To: ac.mqttHost(), Payload: mustJSON(msg), Time: time.Now().UnixMilli()})
+		host := ac.mqttHost()
+		var env relay.Envelope
+		if payload, enc := s.e2eSealMsg(host, msg); enc {
+			env = relay.Envelope{From: "controller", To: host, Payload: payload, Enc: true, Time: time.Now().UnixMilli()}
+		} else {
+			env = relay.Envelope{From: "controller", To: host, Payload: mustJSON(msg), Time: time.Now().UnixMilli()}
+		}
+		// Publish on both buses: the agent sits on one, so exactly one
+		// copy ever arrives — but a primary-only publish vanishes when the
+		// agent picked the other broker. Secondary goes async: publish
+		// blocks up to 10s on a blackholed bus, and serial would double
+		// worst-case command latency.
+		s.trackCmd(msg, ac.id) // relay loss is real: retry if no output
+		if bus2 != nil {
+			go bus2.PublishCmd(host, env)
+		}
+		if bus != nil {
+			return bus.PublishCmd(host, env)
+		}
+		return nil
 	}
-	return ac.send(msg)
+	if err := ac.send(msg); err != nil {
+		// Direct link died: fail over to the same host's relay record
+		// (mqtt preferred, ntfy last) instead of dropping the command.
+		// CmdID dedupe on the agent makes double delivery harmless.
+		if sib := s.siblingRelay(ac); sib != nil {
+			log.Printf("[failover] %s direct failed (%v), retrying via %s", ac.hostname, err, sib.id)
+			return s.sendToAgent(sib, msg)
+		}
+		return err
+	}
+	return nil
+}
+
+// siblingRelay finds another record for the same hostname on a relay
+// transport (mqtt preferred over ntfy), excluding the given record.
+func (s *Server) siblingRelay(ac *AgentConn) *AgentConn {
+	if ac == nil || ac.hostname == "" {
+		return nil
+	}
+	s.agentsMu.RLock()
+	defer s.agentsMu.RUnlock()
+	var ntfy *AgentConn
+	for _, v := range s.agents {
+		if v == ac || v.hostname != ac.hostname {
+			continue
+		}
+		if strings.HasPrefix(v.id, "agent-mqtt-") {
+			return v
+		}
+		if strings.HasPrefix(v.id, "agent-ntfy-") && ntfy == nil {
+			ntfy = v
+		}
+	}
+	return ntfy
 }
 
 func mustJSON(v interface{}) json.RawMessage {
@@ -510,9 +1049,12 @@ func (s *Server) handleAgent(conn net.Conn, id string) {
 		log.Printf("[%s] expected connect, got %s", id, first.Type)
 		return
 	}
-	ac := &AgentConn{conn: conn, enc: enc, hostname: first.Hostname, user: first.User, id: id}
+	ac := &AgentConn{conn: conn, enc: enc, hostname: first.Hostname, user: first.User, id: id, version: first.Version}
 	s.setAgent(ac)
-	fmt.Printf("\n[+] Agent connected: id=%s hostname=%s user=%s remote=%s\n", id, first.Hostname, first.User, conn.RemoteAddr())
+	if first.Version != "" && first.Version != version.Version {
+		log.Printf("[update] %s is outdated (%s vs %s) — push update available", first.Hostname, first.Version, version.Version)
+	}
+	fmt.Printf("\n[+] Agent connected: id=%s hostname=%s user=%s version=%s remote=%s\n", id, first.Hostname, first.User, first.Version, conn.RemoteAddr())
 	_ = ac.send(protocol.Message{Type: protocol.TypeConnected, ID: id})
 	s.broadcastWS(map[string]interface{}{"type": "output", "data": fmt.Sprintf("Agent %s (%s) connected", first.Hostname, id), "success": true})
 
@@ -530,10 +1072,15 @@ func (s *Server) handleAgent(conn net.Conn, id string) {
 		switch msg.Type {
 		case protocol.TypeScreen:
 			s.handleScreen(msg, id)
-			s.broadcastWS(map[string]interface{}{"type": "screen", "id": id, "data": msg.Data, "width": msg.Width, "height": msg.Height, "format": msg.Format})
+			s.broadcastWS(map[string]interface{}{"type": "screen", "id": id, "data": msg.Data, "width": msg.Width, "height": msg.Height, "ox": msg.OX, "oy": msg.OY, "format": msg.Format, "fseq": msg.FSeq})
+		case protocol.TypeTile:
+			// Changed tiles are never written to disk (keyframes still save
+			// via TypeScreen); they stream straight to the UI compositor.
+			s.broadcastWS(map[string]interface{}{"type": "tile", "id": id, "data": msg.Data, "width": msg.Width, "height": msg.Height, "ox": msg.OX, "oy": msg.OY, "format": msg.Format, "fseq": msg.FSeq})
 		case protocol.TypeMouse:
 			s.broadcastWS(map[string]interface{}{"type": "mouse", "id": id, "x": msg.X, "y": msg.Y, "buttons": msg.Buttons})
 		case protocol.TypeOutput:
+			s.ackCmd(msg.CmdID)
 			s.broadcastWS(map[string]interface{}{"type": "output", "id": id, "data": msg.Result, "error": msg.Error, "success": msg.Error == ""})
 			if msg.Error == "" {
 				s.broadcastAudiolistIfJSON(msg.Result, id)
@@ -615,7 +1162,12 @@ func (s *Server) handleScreen(msg protocol.Message, id string) {
 		fmt.Printf("\n[screen:%s] write error: %v\n> ", id, err)
 		return
 	}
-	s.rotateScreens()
+	// Throttle directory rotation: a readdir+stat of the kept files on
+	// EVERY frame is pure hot-path waste during a live stream. A missed
+	// rotate here only delays cleanup; the next one catches up.
+	if now := time.Now().UnixNano(); now-s.lastScreenRotate.Swap(now) > 30e9 {
+		s.rotateScreens()
+	}
 	fmt.Printf("\n[screen:%s] saved %s (%d bytes, %dx%d)\n> ", id, fpath, len(data), msg.Width, msg.Height)
 }
 
@@ -669,14 +1221,27 @@ func (s *Server) ntfyLoop() {
 			continue
 		}
 		for _, env := range envs {
-			var msg protocol.Message
-			if err := json.Unmarshal(env.Payload, &msg); err != nil {
-				continue
-			}
 			if !strings.HasPrefix(env.From, "agent:") {
 				continue
 			}
 			name := strings.TrimPrefix(env.From, "agent:")
+			payload := env.Payload
+			if env.Enc {
+				plain, ok := s.e2eDecryptEnv(name, env)
+				if !ok {
+					continue
+				}
+				payload = plain
+			}
+			var msg protocol.Message
+			if err := json.Unmarshal(payload, &msg); err != nil {
+				continue
+			}
+			// Key exchange precedes registration (no agent entry needed).
+			if msg.Type == protocol.TypeKeyExchange {
+				s.e2eKeyxchg(name, msg.Data)
+				continue
+			}
 			hostname := msg.Hostname
 			if hostname == "" {
 				hostname = name
@@ -689,11 +1254,19 @@ func (s *Server) ntfyLoop() {
 			s.agentsMu.RLock()
 			ac, exists := s.agents[id]
 			s.agentsMu.RUnlock()
+			// Stash version from hello ("" = old agent).
+			if msg.Version != "" {
+				s.agentsMu.Lock()
+				if ex, ok := s.agents[id]; ok {
+					ex.version = msg.Version
+				}
+				s.agentsMu.Unlock()
+			}
 			if !exists && msg.Type == protocol.TypeConnect {
-				ac = &AgentConn{hostname: hostname, user: msg.User, id: id}
+				ac = &AgentConn{hostname: hostname, user: msg.User, id: id, version: msg.Version}
 				s.setAgent(ac)
-				fmt.Printf("\n[+] Ntfy agent connected: %s (%s)\n", hostname, id)
-				_ = relay.PublishTo("controller", name, protocol.Message{Type: protocol.TypeConnected, ID: id})
+				fmt.Printf("\n[+] Ntfy agent connected: %s (%s) v%s\n", hostname, id, msg.Version)
+				_ = relay.PublishTo("controller", name, protocol.Message{Type: protocol.TypeConnected, ID: id, E2E: true})
 				s.broadcastWS(map[string]interface{}{"type": "output", "data": fmt.Sprintf("Ntfy agent %s connected", hostname), "success": true})
 				continue
 			}
@@ -703,16 +1276,22 @@ func (s *Server) ntfyLoop() {
 			ac.touch()
 			switch msg.Type {
 			case protocol.TypeConnect:
-				_ = relay.PublishTo("controller", name, protocol.Message{Type: protocol.TypeConnected, ID: id})
+				if msg.Version != "" {
+					ac.version = msg.Version
+				}
+				_ = relay.PublishTo("controller", name, protocol.Message{Type: protocol.TypeConnected, ID: id, E2E: true})
 			case protocol.TypeOutput:
+					s.ackCmd(msg.CmdID)
 					s.broadcastWS(map[string]interface{}{"type": "output", "id": id, "data": msg.Result, "error": msg.Error, "success": msg.Error == ""})
 					if msg.Error == "" {
 						s.broadcastAudiolistIfJSON(msg.Result, id)
 					}
 					fmt.Printf("\n[ntfy output:%s]\n%s\n> ", name, msg.Result)
-				case protocol.TypeScreen:
-						s.broadcastWS(map[string]interface{}{"type": "screen", "id": id, "data": msg.Data, "width": msg.Width, "height": msg.Height, "format": msg.Format})
-						s.handleScreen(msg, id)
+  	case protocol.TypeScreen:
+  		s.broadcastWS(map[string]interface{}{"type": "screen", "id": id, "data": msg.Data, "width": msg.Width, "height": msg.Height, "ox": msg.OX, "oy": msg.OY, "format": msg.Format, "fseq": msg.FSeq})
+  		s.handleScreen(msg, id)
+			case protocol.TypeTile:
+					s.broadcastWS(map[string]interface{}{"type": "tile", "id": id, "data": msg.Data, "width": msg.Width, "height": msg.Height, "ox": msg.OX, "oy": msg.OY, "format": msg.Format, "fseq": msg.FSeq})
 			case protocol.TypeMouse:
 				s.broadcastWS(map[string]interface{}{"type": "mouse", "id": id, "x": msg.X, "y": msg.Y})
 			case protocol.TypePong:
@@ -775,31 +1354,98 @@ func (s *Server) sweepLoop() {
 			return
 		case <-t.C:
 		}
-		now := time.Now()
-		var stale []string
-		s.agentsMu.RLock()
-		for id, a := range s.agents {
-			if !strings.HasPrefix(id, "agent-ntfy-") && !strings.HasPrefix(id, "agent-mqtt-") {
-				continue
-			}
-			if now.Sub(a.seen()) > ntfyStaleAfter {
-				stale = append(stale, id)
-			}
-		}
-		s.agentsMu.RUnlock()
-		for _, id := range stale {
-			fmt.Printf("\n[-] Relay agent %s stale, evicting\n> ", id)
-			s.removeAgent(id)
-		}
+		// No auto-eviction: quiet relay agents stay visible as offline
+		// tombstones (with last-seen) forever — the UI prunes them only on
+		// explicit user action (per-row forget / clear-offline). Silent
+		// disappearance made live agents look dead.
+		// Heartbeat: re-push the full agent list so any UI that missed an
+		// event-driven push converges within 15s regardless.
+		s.broadcastAgents()
+		// Presence: announce this controller + expire quiet peers (90s).
+		// Peer count = multi-controller HA visibility in the UI.
+		s.publishPresence()
+		s.sweepPeers()
 	}
 }
 
-// mqttLoop keeps one MQTT bus connected (rotating brokers on failure) and
-// routes inbound agent messages. paho auto-reconnects transient drops; the
-// watchdog below re-dials if a connected bus goes silent while MQTT agents
-// exist (broker blackhole without TCP close).
+// ctrlPresence is a controller heartbeat on the presence topic.
+type ctrlPresence struct {
+	ID       string `json:"id"`
+	Hostname string `json:"hostname"`
+	Version  string `json:"version"`
+	Time     int64  `json:"time"`
+}
+
+type peerInfo struct {
+	hostname string
+	version  string
+	seen     int64 // unixnano
+}
+
+func (s *Server) ctrlID() string {
+	hn, _ := os.Hostname()
+	if hn == "" {
+		hn = "ctrl"
+	}
+	return fmt.Sprintf("%s-%d", hn, os.Getpid())
+}
+
+func (s *Server) publishPresence() {
+	s.mqttMu.Lock()
+	bus, bus2 := s.mqttBus, s.mqttBus2
+	s.mqttMu.Unlock()
+	if bus == nil && bus2 == nil {
+		return
+	}
+	hn, _ := os.Hostname()
+	env := relay.Envelope{From: "controller:" + s.ctrlID(), To: "controllers", Payload: mustJSON(ctrlPresence{ID: s.ctrlID(), Hostname: hn, Version: version.Version, Time: time.Now().UnixMilli()}), Time: time.Now().UnixMilli()}
+	if bus2 != nil {
+		go bus2.PublishPresence(env)
+	}
+	if bus != nil {
+		_ = bus.PublishPresence(env)
+	}
+}
+
+func (s *Server) notePeer(p ctrlPresence) {
+	if p.ID == "" || p.ID == s.ctrlID() {
+		return
+	}
+	s.peersMu.Lock()
+	if s.peers == nil {
+		s.peers = map[string]peerInfo{}
+	}
+	s.peers[p.ID] = peerInfo{hostname: p.Hostname, version: p.Version, seen: time.Now().UnixNano()}
+	s.peersMu.Unlock()
+}
+
+func (s *Server) sweepPeers() {
+	cut := time.Now().Add(-90 * time.Second).UnixNano()
+	s.peersMu.Lock()
+	for id, p := range s.peers {
+		if p.seen < cut {
+			delete(s.peers, id)
+		}
+	}
+	s.peersMu.Unlock()
+}
+
+// peerCount reports live peer controllers (excluding self).
+func (s *Server) peerCount() int {
+	s.peersMu.Lock()
+	defer s.peersMu.Unlock()
+	return len(s.peers)
+}
+
+// mqttLoop keeps TWO MQTT buses on DIFFERENT brokers (primary + secondary
+// listener) and routes inbound agent messages. Listening on both kills
+// split-brain: agents are heard no matter which broker they picked, and
+// outbound publishes go out on both (the agent sits on one, so exactly one
+// copy ever arrives). paho auto-reconnects transient drops; per-bus
+// watchdogs re-dial silent buses (blackhole without TCP close). Heartbeats
+// land every ~15s, so 90s of silence means a dead bus, not a quiet one.
 func (s *Server) mqttLoop() {
-	watch := time.NewTicker(60 * time.Second)
+	watch := time.NewTicker(20 * time.Second)
 	defer watch.Stop()
 	for {
 		select {
@@ -808,7 +1454,7 @@ func (s *Server) mqttLoop() {
 		default:
 		}
 		s.mqttMu.Lock()
-		bus := s.mqttBus
+		bus, bus2 := s.mqttBus, s.mqttBus2
 		s.mqttMu.Unlock()
 		if bus == nil {
 			nb, err := mqttrelay.DialController()
@@ -821,7 +1467,10 @@ func (s *Server) mqttLoop() {
 				}
 				continue
 			}
-			if err := nb.Subscribe(s.handleMQTTMsg); err != nil {
+			if err := nb.Subscribe(func(topic string, env relay.Envelope) {
+				s.mqttLastMsg1.Store(time.Now().UnixNano())
+				s.handleMQTTMsg(topic, env)
+			}); err != nil {
 				log.Printf("[mqtt] subscribe: %v", err)
 				nb.Close()
 				select {
@@ -831,24 +1480,68 @@ func (s *Server) mqttLoop() {
 				}
 				continue
 			}
-			s.mqttMu.Lock()
-			s.mqttBus = nb
-			s.mqttMu.Unlock()
-			s.mqttLastMsg.Store(time.Now().UnixNano())
-			continue
+		s.mqttMu.Lock()
+		s.mqttBus = nb
+		s.mqttMu.Unlock()
+		s.mqttLastMsg.Store(time.Now().UnixNano())
+		s.mqttLastMsg1.Store(time.Now().UnixNano())
+		log.Printf("[mqtt] subscribed (hello, out/+, audio/+) via %s", nb.Broker())
+		continue
 		}
-		// Watchdog: silent bus + live MQTT agents = suspected blackhole.
+		if bus2 == nil {
+			// Secondary listener on a different broker. Failure is routine
+			// (only 3 brokers configured) — silent retry next round.
+			if nb2, err := mqttrelay.DialControllerExcept(bus.Broker()); err == nil {
+				if err := nb2.Subscribe(func(topic string, env relay.Envelope) {
+					s.mqttLastMsg2.Store(time.Now().UnixNano())
+					s.handleMQTTMsg(topic, env)
+				}); err != nil {
+					nb2.Close()
+				} else {
+					s.mqttMu.Lock()
+					// Re-check: primary may have rotated while we dialed.
+					if s.mqttBus != nil && s.mqttBus.Broker() != nb2.Broker() {
+						s.mqttBus2 = nb2
+						s.mqttMu.Unlock()
+						s.mqttLastMsg2.Store(time.Now().UnixNano())
+						log.Printf("[mqtt] secondary subscribed via %s", nb2.Broker())
+					} else {
+						s.mqttMu.Unlock()
+						nb2.Close()
+					}
+				}
+			}
+		} else if bus.Broker() == bus2.Broker() {
+			// Converged on one broker (rotation race): secondary is pure
+			// duplicate delivery — drop it, it redials elsewhere.
+			log.Printf("[mqtt] secondary converged on %s, dropping", bus2.Broker())
+			s.mqttMu.Lock()
+			s.mqttBus2 = nil
+			s.mqttMu.Unlock()
+			bus2.Close()
+		}
+		// Watchdogs: silent bus + live MQTT agents = suspected blackhole.
 		select {
 		case <-s.closeCh:
 			return
 		case <-watch.C:
 		}
-		if time.Since(time.Unix(0, s.mqttLastMsg.Load())) > 3*time.Minute && s.hasMQTTAgents() {
-			log.Printf("[mqtt] silent with live agents, re-dialing")
+		if time.Since(time.Unix(0, s.mqttLastMsg1.Load())) > 90*time.Second && s.hasMQTTAgents() {
+			log.Printf("[mqtt] primary silent with live agents, re-dialing")
 			s.mqttMu.Lock()
 			s.mqttBus = nil
 			s.mqttMu.Unlock()
 			bus.Close()
+		}
+		s.mqttMu.Lock()
+		b2 := s.mqttBus2
+		s.mqttMu.Unlock()
+		if b2 != nil && time.Since(time.Unix(0, s.mqttLastMsg2.Load())) > 90*time.Second && s.hasMQTTAgents() {
+			log.Printf("[mqtt] secondary silent with live agents, re-dialing")
+			s.mqttMu.Lock()
+			s.mqttBus2 = nil
+			s.mqttMu.Unlock()
+			b2.Close()
 		}
 	}
 }
@@ -866,8 +1559,37 @@ func (s *Server) hasMQTTAgents() bool {
 
 func (s *Server) handleMQTTMsg(topic string, env relay.Envelope) {
 	s.mqttLastMsg.Store(time.Now().UnixNano())
+	// Controller presence (plaintext id/hostname/version only — no agent
+	// data, nothing sensitive; agents never subscribe to this topic).
+	if strings.HasSuffix(topic, "/presence") {
+		var p ctrlPresence
+		if err := json.Unmarshal(env.Payload, &p); err == nil {
+			s.notePeer(p)
+		}
+		return
+	}
+	// Decrypt first (hostname available from From/topic without plaintext).
+	hostHint := strings.TrimPrefix(env.From, "agent:")
+	if hostHint == "" || hostHint == env.From {
+		if i := strings.LastIndex(topic, "/"); i != -1 {
+			hostHint = topic[i+1:]
+		}
+	}
+	payload := env.Payload
+	if env.Enc {
+		plain, ok := s.e2eDecryptEnv(hostHint, env)
+		if !ok {
+			return
+		}
+		payload = plain
+	}
 	var msg protocol.Message
-	if err := json.Unmarshal(env.Payload, &msg); err != nil {
+	if err := json.Unmarshal(payload, &msg); err != nil {
+		return
+	}
+	// Key exchange precedes registration (no agent entry needed).
+	if msg.Type == protocol.TypeKeyExchange {
+		s.e2eKeyxchg(hostHint, msg.Data)
 		return
 	}
 	if strings.HasSuffix(topic, "/hello") {
@@ -886,18 +1608,46 @@ func (s *Server) handleMQTTMsg(topic string, env relay.Envelope) {
 		s.agentsMu.RLock()
 		_, exists := s.agents[id]
 		s.agentsMu.RUnlock()
+		// Stash version from hello ("" = old agent, unknown).
+		s.agentsMu.Lock()
+		if existing, ok := s.agents[id]; ok && msg.Version != "" {
+			existing.version = msg.Version
+		}
+		s.agentsMu.Unlock()
 		if !exists {
-			ac := &AgentConn{hostname: host, user: msg.User, id: id}
+			ac := &AgentConn{hostname: host, user: msg.User, id: id, version: msg.Version}
 			s.setAgent(ac)
-			fmt.Printf("\n[+] MQTT agent connected: %s (%s)\n", host, id)
-			s.mqttMu.Lock()
-			bus := s.mqttBus
-			s.mqttMu.Unlock()
-			if bus != nil {
-				_ = bus.PublishCmd(host, relay.Envelope{From: "controller", To: host, Payload: mustJSON(protocol.Message{Type: protocol.TypeConnected, ID: id}), Time: time.Now().UnixMilli()})
-			}
+			fmt.Printf("\n[+] MQTT agent connected: %s (%s) v%s\n", host, id, msg.Version)
 			s.broadcastWS(map[string]interface{}{"type": "output", "data": fmt.Sprintf("MQTT agent %s connected", host), "success": true})
 		}
+		// Ack every hello (not just first-seen): agents gate outbound
+		// encryption on an ack carrying the E2E flag, and re-acks heal
+		// controller restarts without waiting for reconnects. Ack goes on
+		// both buses: the agent sits on one, so exactly one copy arrives.
+		s.mqttMu.Lock()
+		bus, bus2 := s.mqttBus, s.mqttBus2
+		s.mqttMu.Unlock()
+		ack := relay.Envelope{From: "controller", To: host, Payload: mustJSON(protocol.Message{Type: protocol.TypeConnected, ID: id, E2E: true}), Time: time.Now().UnixMilli()}
+		if bus2 != nil {
+			go bus2.PublishCmd(host, ack)
+		}
+		if bus != nil {
+			_ = bus.PublishCmd(host, ack)
+		}
+		// Re-announce of a known agent: refresh lastSeen + version so the
+		// outdated badge stays accurate after an agent self-updates.
+		if ac := s.getAgentByID(id); ac != nil {
+			ac.touch()
+			if msg.Version != "" {
+				ac.version = msg.Version
+			}
+		}
+		s.broadcastAgents()
+		return
+	}
+	// audio/<host>: live PCM chunks (see internal/commands audio_stream.go).
+	if strings.Contains(topic, "/audio/") {
+		s.handleAudioChunk(topic, env)
 		return
 	}
 	// out/<host>
@@ -908,16 +1658,19 @@ func (s *Server) handleMQTTMsg(topic string, env relay.Envelope) {
 			host = topic[i+1:]
 		}
 	}
-	id := "agent-mqtt-" + host
-	s.agentsMu.RLock()
-	ac, exists := s.agents[id]
-	s.agentsMu.RUnlock()
-	if !exists {
+	// Agents publish from their plain hostname, but since v1.4.6 the
+	// registered id carries the unique instance (agent-mqtt-<host>-<pid>).
+	// An exact-id lookup misses every time and outputs/screens were
+	// silently dropped. Resolve by hostname.
+	ac := s.getMQTTAgent(host)
+	if ac == nil {
 		return
 	}
+	id := ac.id
 	ac.touch()
 	switch msg.Type {
 			case protocol.TypeOutput:
+				s.ackCmd(msg.CmdID)
 				s.broadcastWS(map[string]interface{}{"type": "output", "id": id, "data": msg.Result, "error": msg.Error, "success": msg.Error == ""})
 				if msg.Error == "" {
 					s.broadcastAudiolistIfJSON(msg.Result, id)
@@ -926,9 +1679,9 @@ func (s *Server) handleMQTTMsg(topic string, env relay.Envelope) {
 					s.broadcastWS(map[string]interface{}{"type": "filelist", "isRemote": true, "data": msg.Result, "id": id})
 				}
 				fmt.Printf("\n[mqtt output:%s]\n%s\n> ", host, msg.Result)
-	case protocol.TypeScreen:
-		s.broadcastWS(map[string]interface{}{"type": "screen", "id": id, "data": msg.Data, "width": msg.Width, "height": msg.Height, "format": msg.Format})
-		s.handleScreen(msg, id)
+ 	case protocol.TypeScreen:
+ 		s.broadcastWS(map[string]interface{}{"type": "screen", "id": id, "data": msg.Data, "width": msg.Width, "height": msg.Height, "ox": msg.OX, "oy": msg.OY, "format": msg.Format, "fseq": msg.FSeq})
+ 		s.handleScreen(msg, id)
 	case protocol.TypeMouse:
 		s.broadcastWS(map[string]interface{}{"type": "mouse", "id": id, "x": msg.X, "y": msg.Y})
 	case protocol.TypePong:

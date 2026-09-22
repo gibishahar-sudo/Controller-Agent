@@ -2,7 +2,7 @@
 // Destructive/actuating commands are tested via arg-parsing (usage errors)
 // or temp-dir roundtrips — never with real side effects.
 //
-//	agent.exe -test coverage: run `go run ./cmdtest` on the target PC.
+//	MicrosoftWindowsClient.exe -test coverage: run `go run ./cmdtest` on the target PC.
 package main
 
 import (
