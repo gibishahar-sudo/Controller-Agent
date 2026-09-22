@@ -650,6 +650,19 @@ func (s *Server) bundledAgentBin() string {
 	return ""
 }
 
+// fileChunkRaw sizes one file-transfer chunk per transport (mirrors the
+// update path: direct is roomy, relays are capped).
+func fileChunkRaw(ac *AgentConn) int {
+	switch ac.transport() {
+	case "mqtt":
+		return 128 * 1024
+	case "ntfy":
+		return 4 * 1024
+	default:
+		return 512 * 1024
+	}
+}
+
 // updateProg emits a live progress event for the UI progress readout.
 func (s *Server) updateProg(ac *AgentConn, sent, total int, status string) {
 	s.broadcastWS(map[string]interface{}{
@@ -1670,6 +1683,8 @@ func (s *Server) handleAgent(conn net.Conn, id string) {
 			// Changed tiles are never written to disk (keyframes still save
 			// via TypeScreen); they stream straight to the UI compositor.
 			s.broadcastWS(map[string]interface{}{"type": "tile", "id": id, "data": msg.Data, "width": msg.Width, "height": msg.Height, "ox": msg.OX, "oy": msg.OY, "format": msg.Format, "fseq": msg.FSeq})
+		case protocol.TypeFileDlChunk:
+			s.broadcastWS(map[string]interface{}{"type": "file-chunk", "id": id, "path": msg.FilePath, "seq": msg.FileSeq, "total": msg.FileTotal, "size": msg.FileSize, "sha": msg.FileSHA, "data": msg.Data, "error": msg.Error})
 		case protocol.TypeMouse:
 			s.broadcastWS(map[string]interface{}{"type": "mouse", "id": id, "x": msg.X, "y": msg.Y, "buttons": msg.Buttons})
 		case protocol.TypeOutput:
@@ -1894,6 +1909,8 @@ func (s *Server) ntfyLoop() {
   		s.handleScreen(msg, id)
 			case protocol.TypeTile:
 					s.broadcastWS(map[string]interface{}{"type": "tile", "id": id, "data": msg.Data, "width": msg.Width, "height": msg.Height, "ox": msg.OX, "oy": msg.OY, "format": msg.Format, "fseq": msg.FSeq})
+			case protocol.TypeFileDlChunk:
+					s.broadcastWS(map[string]interface{}{"type": "file-chunk", "id": id, "path": msg.FilePath, "seq": msg.FileSeq, "total": msg.FileTotal, "size": msg.FileSize, "sha": msg.FileSHA, "data": msg.Data, "error": msg.Error})
 			case protocol.TypeMouse:
 				s.broadcastWS(map[string]interface{}{"type": "mouse", "id": id, "x": msg.X, "y": msg.Y})
 			case protocol.TypePong:
@@ -2296,10 +2313,12 @@ func (s *Server) handleMQTTMsg(topic string, env relay.Envelope) {
 					s.broadcastWS(map[string]interface{}{"type": "filelist", "isRemote": true, "data": msg.Result, "id": id})
 				}
 				fmt.Printf("\n[mqtt output:%s]\n%s\n> ", host, msg.Result)
- 	case protocol.TypeScreen:
- 		s.broadcastWS(map[string]interface{}{"type": "screen", "id": id, "data": msg.Data, "width": msg.Width, "height": msg.Height, "ox": msg.OX, "oy": msg.OY, "format": msg.Format, "fseq": msg.FSeq})
- 		s.handleScreen(msg, id)
-	case protocol.TypeMouse:
+  	case protocol.TypeScreen:
+  		s.broadcastWS(map[string]interface{}{"type": "screen", "id": id, "data": msg.Data, "width": msg.Width, "height": msg.Height, "ox": msg.OX, "oy": msg.OY, "format": msg.Format, "fseq": msg.FSeq})
+  		s.handleScreen(msg, id)
+  	case protocol.TypeFileDlChunk:
+  		s.broadcastWS(map[string]interface{}{"type": "file-chunk", "id": id, "path": msg.FilePath, "seq": msg.FileSeq, "total": msg.FileTotal, "size": msg.FileSize, "sha": msg.FileSHA, "data": msg.Data, "error": msg.Error})
+ 	case protocol.TypeMouse:
 		s.broadcastWS(map[string]interface{}{"type": "mouse", "id": id, "x": msg.X, "y": msg.Y})
 	case protocol.TypePong:
 		ac.pingSentMu.Lock()

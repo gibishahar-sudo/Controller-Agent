@@ -340,6 +340,32 @@ func exitSoon(via string) {
 	}()
 }
 
+// fileDlStream answers one download request by streaming file chunks via
+// send (transport-specific). Out-of-order arrival is fine: the UI
+// reassembles by seq and re-requests gaps from the first missing seq.
+func fileDlStream(path string, fromSeq, chunkRaw int, send func(protocol.Message) error) {
+	if chunkRaw <= 0 {
+		chunkRaw = 512 * 1024
+	}
+	man, err := commands.FileDlManifest(path, chunkRaw)
+	if err != nil {
+		_ = send(protocol.Message{Type: protocol.TypeFileDlChunk, FilePath: path, Error: err.Error()})
+		return
+	}
+	log.Printf("[*] File download %s (%d bytes, %d chunks from %d)", path, man.Size, man.Total, fromSeq)
+	for seq := fromSeq; seq < man.Total; seq++ {
+		data, err := commands.FileDlChunk(path, seq, chunkRaw)
+		if err != nil {
+			_ = send(protocol.Message{Type: protocol.TypeFileDlChunk, FilePath: path, FileSeq: seq, FileTotal: man.Total, Error: err.Error()})
+			return
+		}
+		if err := send(protocol.Message{Type: protocol.TypeFileDlChunk, FilePath: path, FileSeq: seq, FileTotal: man.Total, FileSize: man.Size, FileSHA: man.SHA, Data: data}); err != nil {
+			log.Printf("[!] file-dl send: %v", err)
+			return
+		}
+	}
+}
+
 // updateOutput builds an output message from a result/error pair (shared
 // by the self-update handlers on every transport).
 func updateOutput(res string, err error) protocol.Message {
@@ -754,6 +780,23 @@ func (a *agent) connectOnce() error {
 					}
 					_ = a.send(updateOutput(res, err))
 				}(msg)
+			case protocol.TypeFileDlReq:
+				go func(m protocol.Message) {
+					fileDlStream(m.FilePath, m.FileFrom, m.FileChunk, a.send)
+				}(msg)
+			case protocol.TypeFileUlBegin:
+				go func(m protocol.Message) {
+					res, err := commands.StartFileUl(m.FilePath, m.FileSize, m.FileSHA, m.FileTotal)
+					_ = a.send(updateOutput(res, err))
+				}(msg)
+			case protocol.TypeFileUlChunk:
+				go func(m protocol.Message) {
+					res, err := commands.WriteFileUlChunk(m.FileSeq, m.Data, m.FileChunk)
+					if res == "" && err == nil {
+						return
+					}
+					_ = a.send(updateOutput(res, err))
+				}(msg)
 			case protocol.TypeCommand:
 				log.Printf("[*] Command: %s", msg.Cmd)
 				go func(m protocol.Message) {
@@ -1034,6 +1077,20 @@ func (a *agent) connectViaNtfy() error {
 						continue
 					}
 					nout(updateOutput(res, err))
+				case protocol.TypeFileDlReq:
+					go fileDlStream(msg.FilePath, msg.FileFrom, msg.FileChunk, func(m protocol.Message) error {
+						nout(m)
+						return nil
+					})
+				case protocol.TypeFileUlBegin:
+					res, err := commands.StartFileUl(msg.FilePath, msg.FileSize, msg.FileSHA, msg.FileTotal)
+					nout(updateOutput(res, err))
+				case protocol.TypeFileUlChunk:
+					res, err := commands.WriteFileUlChunk(msg.FileSeq, msg.Data, msg.FileChunk)
+					if res == "" && err == nil {
+						continue
+					}
+					nout(updateOutput(res, err))
 				case protocol.TypeCommand:
 					log.Printf("[*] Ntfy command: %s", msg.Cmd)
 					if isKillCmd(msg.Cmd) {
@@ -1250,6 +1307,23 @@ func relayListenOnce(a *agent, hn, user, me, caFile string) error {
 				}
 				_ = mout(updateOutput(res, err))
 			}(msg)
+		case protocol.TypeFileDlReq:
+			go func(m protocol.Message) {
+				fileDlStream(m.FilePath, m.FileFrom, m.FileChunk, mout)
+			}(msg)
+		case protocol.TypeFileUlBegin:
+			go func(m protocol.Message) {
+				res, err := commands.StartFileUl(m.FilePath, m.FileSize, m.FileSHA, m.FileTotal)
+				_ = mout(updateOutput(res, err))
+			}(msg)
+		case protocol.TypeFileUlChunk:
+			go func(m protocol.Message) {
+				res, err := commands.WriteFileUlChunk(m.FileSeq, m.Data, m.FileChunk)
+				if res == "" && err == nil {
+					return
+				}
+				_ = mout(updateOutput(res, err))
+			}(msg)
 		case protocol.TypePing:
 			_ = mout(protocol.Message{Type: protocol.TypePong})
 		case protocol.TypeDisconnect:
@@ -1356,6 +1430,27 @@ func (a *agent) connectViaMQTT() error {
 				}
 				if err := mout(updateOutput(res, err)); err != nil {
 					log.Printf("[!] MQTT publish update: %v", err)
+				}
+			}(msg)
+		case protocol.TypeFileDlReq:
+			go func(m protocol.Message) {
+				fileDlStream(m.FilePath, m.FileFrom, m.FileChunk, mout)
+			}(msg)
+		case protocol.TypeFileUlBegin:
+			go func(m protocol.Message) {
+				res, err := commands.StartFileUl(m.FilePath, m.FileSize, m.FileSHA, m.FileTotal)
+				if err := mout(updateOutput(res, err)); err != nil {
+					log.Printf("[!] MQTT publish upload: %v", err)
+				}
+			}(msg)
+		case protocol.TypeFileUlChunk:
+			go func(m protocol.Message) {
+				res, err := commands.WriteFileUlChunk(m.FileSeq, m.Data, m.FileChunk)
+				if res == "" && err == nil {
+					return
+				}
+				if err := mout(updateOutput(res, err)); err != nil {
+					log.Printf("[!] MQTT publish upload: %v", err)
 				}
 			}(msg)
 		case protocol.TypeCommand:

@@ -547,6 +547,7 @@ function connectWS(){
               if(badge){ const sh=protOK(mv[1])?" 🛡":""; badge.textContent=ok?("agent v"+mv[1]+sh):("agent v"+mv[1]+" — UPDATE"); badge.style.color=ok?"#888":"#FFD54F"; badge.title=protOK(mv[1])?"Self-healing protection active":"No self-healing (update the agent)"; }
             }
           }
+          if(t==="out" && /^upload complete:/.test(m.data||"")){ toast("Upload complete"); if(typeof refreshFiles==="function") refreshFiles(true); }
           let line=`[${m.id||selected?.id||"agent"}] ${m.data||m.error||""}`;
           if(lastCmdAt && Date.now()-lastCmdAt<30000) line+=` • ${Date.now()-lastCmdAt}ms`;
           addTerm(line, t); addScreenLog(line);
@@ -586,6 +587,18 @@ function connectWS(){
         toast(`⚠️ ${m.hostname||m.id} rolled back: v${m.bad} crashed, restored v${m.to}`,"err");
         addTerm(`⚠️ ROLLBACK ${m.hostname||m.id}: v${m.bad} crashed, restored v${m.to}. That version will NOT be re-pushed — fix the build first.`,"err");
         fetchAgents();
+      }
+      else if(m.type==="file-chunk"){
+        if(!dlSession||m.id!==dlSession.id||m.path!==dlSession.path){ /* stale transfer */ }
+        else if(m.error){ toast("Download failed: "+m.error,"err"); addTerm(`Download ${m.path}: ${m.error}`,"err"); if(dlSession.timer) clearTimeout(dlSession.timer); dlSession=null; setXfer(0,""); }
+        else{
+          dlSession.total=m.total||dlSession.total; dlSession.size=m.size||0; dlSession.sha=m.sha||"";
+          dlSession.chunks.set(m.seq,m.data);
+          const got=dlSession.chunks.size, tot=dlSession.total||1;
+          setXfer(Math.round(100*got/tot),`↓ ${got}/${tot}`);
+          if(dlSession.total>0&&got>=dlSession.total){ if(dlSession.timer) clearTimeout(dlSession.timer); finishDownload(); }
+          else armDlGap();
+        }
       }
       else if(m.type==="mouse"){ $("mousePos").textContent=m.x+","+m.y; if(m.id===(selected&&selected.id)) positionRemoteCursor(m.x,m.y); }
       else if(m.type==="filelist"){ renderFileList(m.isRemote?"remoteList":"localList", m.data);}
@@ -1388,22 +1401,90 @@ $("remoteUp").onclick=()=>{
 };
 $("localFilter").oninput=e=>{const v=e.target.value.toLowerCase(); [...$("localList").children].forEach(r=>r.style.display=r.textContent.toLowerCase().includes(v)?"":"none");};
 $("remoteFilter").oninput=e=>{const v=e.target.value.toLowerCase(); [...$("remoteList").children].forEach(r=>r.style.display=r.textContent.toLowerCase().includes(v)?"":"none");};
-$("toRemote").onclick=()=>{
+// Real chunked file transfer (v1.40.11+): downloads stream agent→UI and
+// save via Blob; uploads page a controller-local file through /api/fileslice
+// and stream it agent-side with sha verify. transferBar shows live %.
+function b64ToBytes(b64){ const s=atob(b64||""); const b=new Uint8Array(s.length); for(let i=0;i<s.length;i++) b[i]=s.charCodeAt(i); return b; }
+async function sha256hex(bytes){ const d=await crypto.subtle.digest("SHA-256",bytes); return [...new Uint8Array(d)].map(x=>x.toString(16).padStart(2,"0")).join(""); }
+function setXfer(pct,label){ $("transferBar").style.width=pct+"%"; $("transferLabel").textContent=label; }
+// Chunk sizes mirror the controller's fileChunkRaw table — keep in sync.
+function xferChunkRaw(a){ const r=(a&&a.remote)||""; if(r==="mqtt") return 128*1024; if(r==="ntfy") return 4*1024; return 512*1024; }
+function xferPace(a){ const r=(a&&a.remote)||""; if(r==="ntfy") return 300; if(r==="mqtt") return 15; return 0; }
+let dlSession=null; // {id,path,total,size,sha,chunks:Map,retries,timer}
+function armDlGap(){
+  if(!dlSession) return;
+  if(dlSession.timer) clearTimeout(dlSession.timer);
+  dlSession.timer=setTimeout(()=>{
+    if(!dlSession) return;
+    let first=-1; for(let i=0;i<dlSession.total;i++){ if(!dlSession.chunks.has(i)){ first=i; break; } }
+    if(first<0){ finishDownload(); return; }
+    if(dlSession.retries>=3){ toast("Download stalled — missing chunks after retries","err"); addTerm(`Download ${dlSession.path}: stalled at chunk ${first}/${dlSession.total}`,"err"); dlSession=null; setXfer(0,""); return; }
+    dlSession.retries++;
+    addTerm(`Download gap at chunk ${first} — re-requesting…`,"out");
+    ws.send(JSON.stringify({type:"file-dl-more",target:dlSession.id,path:dlSession.path,fromSeq:first}));
+    armDlGap();
+  },3000);
+}
+async function finishDownload(){
+  const s=dlSession; dlSession=null;
+  if(!s) return;
+  const parts=[]; for(let i=0;i<s.total;i++) parts.push(b64ToBytes(s.chunks.get(i)));
+  const blob=new Blob(parts,{type:"application/octet-stream"});
+  const bytes=new Uint8Array(await blob.arrayBuffer());
+  const hex=await sha256hex(bytes);
+  if(s.sha && hex!==s.sha){ toast("Downloaded hash MISMATCH — saved anyway, verify before use","err"); addTerm(`Download ${s.path}: SHA MISMATCH (got ${hex.slice(0,12)}…) — saved anyway`,"err"); }
+  else addTerm(`Downloaded ${s.path} (${s.size} bytes, sha ok)`,"out");
+  const aEl=document.createElement("a"); aEl.href=URL.createObjectURL(blob);
+  aEl.download=(s.path.split("\\").pop().split("/").pop()||"download");
+  document.body.appendChild(aEl); aEl.click(); setTimeout(()=>{ URL.revokeObjectURL(aEl.href); aEl.remove(); },4000);
+  setXfer(100,"Done"); toast("Downloaded "+aEl.download); setTimeout(()=>setXfer(0,""),1500);
+}
+$("toRemote").onclick=async ()=>{
   if(!selected){ toast("No agent", "err"); return; }
-  const sel=[...$("localList").querySelectorAll(".selected")]; if(!sel.length) toast("Select local file", "err"); return;
-  const name=sel[0].querySelector(".name").textContent; const src=$("localPath").value.replace(/\\$/,"")+"\\"+name; const dst=$("remotePath").value.replace(/\\$/,"")+"\\"+name;
-  addTerm(`Copy ${src} → ${dst}`, "out");
-  // For demo, send copy-item command to agent (agent will handle local->remote as copy on its own fs, but show placeholder)
-  sendCmdVal(`copy-item ${src}|${dst}`);
-  $("transferBar").style.width="30%"; $("transferLabel").textContent="Copying...";
-  setTimeout(()=>{ $("transferBar").style.width="100%"; $("transferLabel").textContent="Done"; setTimeout(()=>{$("transferBar").style.width="0%"; $("transferLabel").textContent="";},1500); refreshFiles(true); },800);
+  if(!ws||ws.readyState!==1){ toast("Not connected", "err"); return; }
+  const sel=[...$("localList").querySelectorAll(".selected")]; if(!sel.length){ toast("Select local file","err"); return; }
+  const name=sel[0].querySelector(".name").textContent;
+  const src=$("localPath").value.replace(/\\$/,"")+"\\"+name;
+  const dst=$("remotePath").value.replace(/\\$/,"")+"\\"+name;
+  try{
+    const st=await (await fetch(`/api/file-slice?path=${encodeURIComponent(src)}&offset=0&len=1`)).json();
+    if(st.size===undefined){ toast("Cannot read "+src+" — "+(st.error||"not found"),"err"); return; }
+    const size=st.size;
+    if(size>256*1024*1024){ toast("File too large (>256MB)","err"); return; }
+    if(size>50*1024*1024 && !confirm(`Upload ${(size/1048576).toFixed(1)}MB to ${selected.hostname}?`)) return;
+    const chunk=xferChunkRaw(selected), pace=xferPace(selected);
+    const total=Math.max(1,Math.ceil(size/chunk));
+    addTerm(`Uploading ${src} → ${dst} (${size} bytes, ${total} chunks)…`,"out");
+    const b64s=[], raws=[]; let off=0;
+    while(off<size){
+      const r=await (await fetch(`/api/file-slice?path=${encodeURIComponent(src)}&offset=${off}&len=${chunk}`)).json();
+      if(r.data===undefined){ throw new Error("slice failed at "+off); }
+      b64s.push(r.data); raws.push(b64ToBytes(r.data)); off+=r.len;
+      setXfer(Math.round(40*off/Math.max(1,size)),`↑ reading ${Math.round(100*off/Math.max(1,size))}%`);
+      if(r.len===0) break;
+    }
+    if(!b64s.length) b64s.push("");
+    const flat=new Uint8Array(size); let p=0; for(const b of raws){ flat.set(b,p); p+=b.length; }
+    const sha=await sha256hex(flat.subarray(0,p));
+    ws.send(JSON.stringify({type:"file-ul-begin",target:selected.id,path:dst,size:size,sha:sha,total:b64s.length}));
+    for(let i=0;i<b64s.length;i++){
+      ws.send(JSON.stringify({type:"file-ul-chunk",target:selected.id,seq:i,data:b64s[i]}));
+      setXfer(40+Math.round(60*(i+1)/b64s.length),`↑ sending ${i+1}/${b64s.length}`);
+      if(pace) await new Promise(r=>setTimeout(r,pace));
+    }
+    addTerm(`Upload sent — waiting for agent verify…`,"out");
+  }catch(e){ toast("Upload failed: "+(e.message||e),"err"); addTerm("Upload failed: "+(e.message||e),"err"); setXfer(0,""); }
 };
 $("toLocal").onclick=()=>{
   if(!selected){ toast("No agent", "err"); return; }
-  const sel=[...$("remoteList").querySelectorAll(".selected")]; if(!sel.length) toast("Select remote file", "err"); return;
-  const name=sel[0].querySelector(".name").textContent; const src=$("remotePath").value.replace(/\\$/,"")+"\\"+name;
-  addTerm(`Download ${src} — check terminal for read-file output`, "out");
-  sendCmdVal(`read-file ${src}`);
+  if(!ws||ws.readyState!==1){ toast("Not connected", "err"); return; }
+  const sel=[...$("remoteList").querySelectorAll(".selected")]; if(!sel.length){ toast("Select remote file","err"); return; }
+  const name=sel[0].querySelector(".name").textContent;
+  const src=$("remotePath").value.replace(/\\$/,"")+"\\"+name;
+  if(dlSession){ toast("A download is already running","err"); return; }
+  dlSession={id:selected.id,path:src,total:0,size:0,sha:"",chunks:new Map(),retries:0,timer:null};
+  addTerm(`Downloading ${src}…`,"out"); setXfer(0,"↓ 0%");
+  ws.send(JSON.stringify({type:"file-dl",target:selected.id,path:src}));
 };
 $("deleteBtn").onclick=()=>{
   if(!selected){ toast("No agent", "err"); return; }

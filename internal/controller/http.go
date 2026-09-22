@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io/fs"
@@ -62,6 +63,52 @@ func (s *Server) startHTTP(addr, dir string) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{"path": p, "entries": out})
+	})
+	// /api/file-slice reads one slice of a controller-local file as base64
+	// (the upload path: the browser pages a local file through the
+	// controller to the agent without ever holding it whole server-side).
+	mux.HandleFunc("/api/file-slice", func(w http.ResponseWriter, r *http.Request) {
+		p := r.URL.Query().Get("path")
+		if p == "" {
+			http.Error(w, "path required", http.StatusBadRequest)
+			return
+		}
+		var offset int64
+		var length int64 = 512 * 1024
+		if v := r.URL.Query().Get("offset"); v != "" {
+			fmt.Sscanf(v, "%d", &offset)
+		}
+		if v := r.URL.Query().Get("len"); v != "" {
+			fmt.Sscanf(v, "%d", &length)
+		}
+		if length <= 0 || length > 1024*1024 {
+			length = 512 * 1024
+		}
+		if offset < 0 {
+			offset = 0
+		}
+		f, err := os.Open(p)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		defer f.Close()
+		st, err := f.Stat()
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		if st.IsDir() {
+			http.Error(w, "not a file", http.StatusBadRequest)
+			return
+		}
+		buf := make([]byte, length)
+		n, _ := f.ReadAt(buf, offset)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"path": p, "size": st.Size(), "offset": offset, "len": n,
+			"data": base64.StdEncoding.EncodeToString(buf[:n]),
+		})
 	})
 	mux.HandleFunc("/api/cmd", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -514,7 +561,50 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 			if ac == nil {
 				continue
 			}
-			_ = s.sendToAgent(ac, protocol.Message{Type: protocol.TypeScreenshotRequest, Quality: quality, Monitor: monitor, AllMonitors: allMonitors})
+			scale := 0.0
+			if f, ok := msg["scale"].(float64); ok {
+				scale = f
+			}
+			tiles, _ := msg["tiles"].(bool)
+			_ = s.sendToAgent(ac, protocol.Message{Type: protocol.TypeScreenshotRequest, Quality: quality, Monitor: monitor, AllMonitors: allMonitors, Scale: scale, Tiles: tiles})
+		case "file-dl", "file-dl-more":
+			path, _ := msg["path"].(string)
+			ac := s.getAgentByID(target)
+			if ac == nil || path == "" {
+				continue
+			}
+			from := 0
+			if f, ok := msg["fromSeq"].(float64); ok && f > 0 {
+				from = int(f)
+			}
+			_ = s.sendToAgent(ac, protocol.Message{Type: protocol.TypeFileDlReq, FilePath: path, FileFrom: from, FileChunk: fileChunkRaw(ac)})
+		case "file-ul-begin":
+			path, _ := msg["path"].(string)
+			sha, _ := msg["sha"].(string)
+			ac := s.getAgentByID(target)
+			if ac == nil || path == "" {
+				continue
+			}
+			var size int64
+			if f, ok := msg["size"].(float64); ok {
+				size = int64(f)
+			}
+			total := 0
+			if f, ok := msg["total"].(float64); ok {
+				total = int(f)
+			}
+			_ = s.sendToAgent(ac, protocol.Message{Type: protocol.TypeFileUlBegin, FilePath: path, FileSize: size, FileSHA: sha, FileTotal: total, FileChunk: fileChunkRaw(ac)})
+		case "file-ul-chunk":
+			data, _ := msg["data"].(string)
+			ac := s.getAgentByID(target)
+			if ac == nil || data == "" {
+				continue
+			}
+			seq := 0
+			if f, ok := msg["seq"].(float64); ok {
+				seq = int(f)
+			}
+			_ = s.sendToAgent(ac, protocol.Message{Type: protocol.TypeFileUlChunk, FileSeq: seq, Data: data, FileChunk: fileChunkRaw(ac)})
 		case "ping":
 			ac := s.getAgentByID(target)
 			if ac != nil {

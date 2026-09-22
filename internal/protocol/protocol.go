@@ -56,6 +56,18 @@ type Message struct {
 	// Auth (in TypeConnect/hello): agent token from token.txt. Empty =
 	// untokened install (accepted unless the controller enforces auth).
 	Auth string `json:"auth,omitempty"`
+	// Chunked file transfer (Files tab, both directions). Download:
+	// controller sends FileDlReq{path, fromSeq, chunkBytes}; the agent
+	// streams FileDlChunk{seq, total, size, sha, data}. Upload: controller
+	// sends FileUlBegin{path, size, sha, total} then FileUlChunk{seq,
+	// data}; the agent reassembles, verifies, and writes.
+	FilePath  string `json:"filePath,omitempty"`
+	FileSeq   int    `json:"fileSeq,omitempty"`
+	FileTotal int    `json:"fileTotal,omitempty"`
+	FileSize  int64  `json:"fileSize,omitempty"`
+	FileSHA   string `json:"fileSHA,omitempty"`
+	FileFrom  int    `json:"fileFrom,omitempty"`
+	FileChunk int    `json:"fileChunk,omitempty"`
 }
 
 // FileEntry mirrors the Files tab JSON shape.
@@ -88,5 +100,9 @@ const (
 	TypeFileList          = "filelist" // structured file list (preferred over output-sniffing)
 	TypeUpdateBegin       = "update_begin"
 	TypeUpdateChunk       = "update_chunk"
+	TypeFileDlReq         = "file_dl_req"   // controller -> agent: stream file chunks
+	TypeFileDlChunk       = "file_dl_chunk" // agent -> controller: one file chunk
+	TypeFileUlBegin       = "file_ul_begin" // controller -> agent: incoming file manifest
+	TypeFileUlChunk       = "file_ul_chunk" // controller -> agent: one upload chunk
 	TypeKeyExchange       = "keyxchg" // agent -> controller: RSA-wrapped AES data key (see relay.SealPayload)
 )
