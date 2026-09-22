@@ -683,6 +683,7 @@ type dlToSession struct {
 	size      int64
 	sha       string
 	have      map[int]bool
+	started   time.Time
 }
 
 func (s *Server) dlToKey(id, remote string) string { return id + "\x00" + remote }
@@ -698,7 +699,7 @@ func (s *Server) startDlTo(ac *AgentConn, remote, local string) {
 	}
 	s.dlTo[s.dlToKey(ac.id, remote)] = &dlToSession{
 		localPath: local, part: local + ".part",
-		chunkRaw: chunkRaw, have: map[int]bool{},
+		chunkRaw: chunkRaw, have: map[int]bool{}, started: time.Now(),
 	}
 	s.dlToMu.Unlock()
 	_ = os.Remove(local + ".part")
@@ -728,6 +729,10 @@ func (s *Server) dlToFail(id string, sess *dlToSession, remote, why string) {
 func (s *Server) feedDlTo(id string, sess *dlToSession, msg protocol.Message) {
 	if msg.Error != "" {
 		s.dlToFail(id, sess, msg.FilePath, msg.Error)
+		return
+	}
+	if time.Since(sess.started) > 30*time.Minute {
+		s.dlToFail(id, sess, msg.FilePath, "save stalled over 30min — retry the download")
 		return
 	}
 	if sess.total == 0 && msg.FileTotal > 0 {

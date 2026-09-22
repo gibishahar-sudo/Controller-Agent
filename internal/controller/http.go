@@ -194,9 +194,17 @@ func (s *Server) startHTTP(addr, dir string) {
 	// (the upload path: the browser pages a local file through the
 	// controller to the agent without ever holding it whole server-side).
 	mux.HandleFunc("/api/file-slice", func(w http.ResponseWriter, r *http.Request) {
+		// Always JSON (even on error): the UI parses unconditionally, and a
+		// file deleted mid-upload must surface as a clean message, not a
+		// syntax explosion.
+		fail := func(code int, msg string) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(code)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
+		}
 		p := r.URL.Query().Get("path")
 		if p == "" {
-			http.Error(w, "path required", http.StatusBadRequest)
+			fail(http.StatusBadRequest, "path required")
 			return
 		}
 		var offset int64
@@ -215,17 +223,17 @@ func (s *Server) startHTTP(addr, dir string) {
 		}
 		f, err := os.Open(p)
 		if err != nil {
-			http.Error(w, err.Error(), 500)
+			fail(500, "open: "+err.Error())
 			return
 		}
 		defer f.Close()
 		st, err := f.Stat()
 		if err != nil {
-			http.Error(w, err.Error(), 500)
+			fail(500, "stat: "+err.Error())
 			return
 		}
 		if st.IsDir() {
-			http.Error(w, "not a file", http.StatusBadRequest)
+			fail(http.StatusBadRequest, "not a file (pick files, or zip the folder first)")
 			return
 		}
 		buf := make([]byte, length)
