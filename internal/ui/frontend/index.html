@@ -592,7 +592,7 @@ function connectWS(){
       }
       else if(m.type==="file-chunk"){
         if(!dlSession||m.id!==dlSession.id||m.path!==dlSession.path){ /* stale transfer */ }
-        else if(m.error){ toast("Download failed: "+m.error,"err"); addTerm(`Download ${m.path}: ${m.error}`,"err"); if(dlSession.timer) clearTimeout(dlSession.timer); dlSession=null; setXfer(0,""); }
+        else if(m.error){ toast("Download failed: "+m.error,"err"); addTerm(`Download ${m.path}: ${m.error}`,"err"); if(dlSession.timer) clearTimeout(dlSession.timer); dlSession=null; setXfer(0,""); pumpDlQueue(); }
         else{
           dlSession.total=m.total||dlSession.total; dlSession.size=m.size||0; dlSession.sha=m.sha||"";
           dlSession.chunks.set(m.seq,m.data);
@@ -1374,9 +1374,20 @@ function renderFileList(id, data){
   try{
     const j=JSON.parse(data); const entries=j.entries||[];
     entries.forEach(e=>{
-      const row=document.createElement("div"); row.className="file-row"; row.dataset.size=e.size||0;
+      const row=document.createElement("div"); row.className="file-row"; row.dataset.size=e.size||0; row.dataset.isdir=e.isDirectory?"1":"";
       row.innerHTML=`<span style="width:16px">${e.isDirectory?"📁":"📄"}</span><span class="name">${e.name}</span><span class="size">${e.isDirectory?"":(e.size>1024? (e.size/1024).toFixed(1)+"KB": e.size+" B")}</span><span class="mod">${e.lastModified? e.lastModified.slice(0,10):""}</span>`;
-      row.onclick=()=>{ row.classList.toggle("selected"); };
+      row.onclick=(ev)=>{
+        // Click toggles; shift-click selects a range (multi-select for
+        // batch transfers).
+        const rows=[...el.children].filter(r=>r.classList&&r.classList.contains("file-row"));
+        const idx=rows.indexOf(row);
+        if(ev.shiftKey&&el._lastIdx!==undefined&&el._lastIdx>=0){
+          const a=Math.min(el._lastIdx,idx), b=Math.max(el._lastIdx,idx);
+          const on=!row.classList.contains("selected");
+          rows.forEach((r,i)=>{ if(i>=a&&i<=b) r.classList.toggle("selected",on); });
+        }else row.classList.toggle("selected");
+        el._lastIdx=idx;
+      };
       row.ondblclick=()=>{
         const cur=$(id==="localList"?"localPath":"remotePath");
         if(e.isDirectory){ cur.value = (cur.value.replace(/\\$/,"")+"\\"+e.name); refreshFiles(id==="localList"?false:true); }
@@ -1470,7 +1481,9 @@ function setXfer(pct,label){ $("transferBar").style.width=pct+"%"; $("transferLa
 // Chunk sizes mirror the controller's fileChunkRaw table — keep in sync.
 function xferChunkRaw(a){ const r=(a&&a.remote)||""; if(r==="mqtt") return 128*1024; if(r==="ntfy") return 4*1024; return 512*1024; }
 function xferPace(a){ const r=(a&&a.remote)||""; if(r==="ntfy") return 300; if(r==="mqtt") return 15; return 0; }
-let dlSession=null; // {id,path,total,size,sha,chunks:Map,retries,timer}
+let dlSession=null; // {id,path,saveName,total,size,sha,chunks:Map,retries,timer,mode,kind}
+let dlQueue=[]; // queued browser downloads {path,saveName}
+let ulActive=0; // uploads currently streaming (for the queue readout)
 function armDlGap(){
   if(!dlSession) return;
   if(dlSession.timer) clearTimeout(dlSession.timer);
@@ -1478,7 +1491,7 @@ function armDlGap(){
     if(!dlSession) return;
     let first=-1; for(let i=0;i<dlSession.total;i++){ if(!dlSession.chunks.has(i)){ first=i; break; } }
     if(first<0){ finishDownload(); return; }
-    if(dlSession.retries>=3){ toast("Download stalled — missing chunks after retries","err"); addTerm(`Download ${dlSession.path}: stalled at chunk ${first}/${dlSession.total}`,"err"); dlSession=null; setXfer(0,""); return; }
+    if(dlSession.retries>=3){ toast("Download stalled — missing chunks after retries","err"); addTerm(`Download ${dlSession.path}: stalled at chunk ${first}/${dlSession.total}`,"err"); dlSession=null; setXfer(0,""); pumpDlQueue(); return; }
     dlSession.retries++;
     addTerm(`Download gap at chunk ${first} — re-requesting…`,"out");
     ws.send(JSON.stringify({type:"file-dl-more",target:dlSession.id,path:dlSession.path,fromSeq:first}));
@@ -1492,38 +1505,43 @@ async function finishDownload(){
   const blob=new Blob(parts,{type:"application/octet-stream"});
   const bytes=new Uint8Array(await blob.arrayBuffer());
   const hex=await sha256hex(bytes);
-  if(s.mode==="preview"){ renderPreview(s.kind||"text", bytes, s.path); setXfer(100,"Done"); setTimeout(()=>setXfer(0,""),1500); return; }
+  if(s.mode==="preview"){ renderPreview(s.kind||"text", bytes, s.path); setXfer(100,"Done"); setTimeout(()=>setXfer(0,""),1500); pumpDlQueue(); return; }
   if(s.sha && hex!==s.sha){ toast("Downloaded hash MISMATCH — saved anyway, verify before use","err"); addTerm(`Download ${s.path}: SHA MISMATCH (got ${hex.slice(0,12)}…) — saved anyway`,"err"); }
   else addTerm(`Downloaded ${s.path} (${s.size} bytes, sha ok)`,"out");
   const aEl=document.createElement("a"); aEl.href=URL.createObjectURL(blob);
-  aEl.download=(s.path.split("\\").pop().split("/").pop()||"download");
+  aEl.download=s.saveName||(s.path.split("\\").pop().split("/").pop()||"download");
   document.body.appendChild(aEl); aEl.click(); setTimeout(()=>{ URL.revokeObjectURL(aEl.href); aEl.remove(); },4000);
   setXfer(100,"Done"); toast("Downloaded "+aEl.download); setTimeout(()=>setXfer(0,""),1500);
+  pumpDlQueue();
 }
-$("toRemote").onclick=async ()=>{
-  if(!selected){ toast("No agent", "err"); return; }
-  if(!ws||ws.readyState!==1){ toast("Not connected", "err"); return; }
-  const sel=[...$("localList").querySelectorAll(".selected")]; if(!sel.length){ toast("Select local file","err"); return; }
-  const name=sel[0].querySelector(".name").textContent;
-  const src=$("localPath").value.replace(/\\$/,"")+"\\"+name;
-  const dstDef=$("remotePath").value.replace(/\\$/,"")+"\\"+name;
-  const dst=prompt("Upload to (remote path):", dstDef);
-  if(!dst) return;
+function startDl(item){
+  dlSession={id:selected.id,path:item.path,saveName:item.saveName,total:0,size:0,sha:"",chunks:new Map(),retries:0,timer:null,mode:"save"};
+  addTerm(`Downloading ${item.path}…`,"out"); setXfer(0,"↓ 0%");
+  ws.send(JSON.stringify({type:"file-dl",target:selected.id,path:item.path}));
+}
+function pumpDlQueue(){
+  if(dlSession||!dlQueue.length) return;
+  const q=dlQueue.length;
+  const item=dlQueue.shift();
+  if(q>1) addTerm(`Download queue: ${q-1} remaining after this one`,"out");
+  startDl(item);
+}
+async function uploadOne(src, dst, tag){
+  ulActive++;
   try{
     const st=await (await fetch(`/api/file-slice?path=${encodeURIComponent(src)}&offset=0&len=1`)).json();
-    if(st.size===undefined){ toast("Cannot read "+src+" — "+(st.error||"not found"),"err"); return; }
+    if(st.size===undefined){ toast("Cannot read "+src,"err"); return; }
     const size=st.size;
-    if(size>256*1024*1024){ toast("File too large (>256MB)","err"); return; }
-    if(size>50*1024*1024 && !confirm(`Upload ${(size/1048576).toFixed(1)}MB to ${selected.hostname}?`)) return;
+    if(size>256*1024*1024){ toast("File too large (>256MB): "+src,"err"); return; }
     const chunk=xferChunkRaw(selected), pace=xferPace(selected);
     const total=Math.max(1,Math.ceil(size/chunk));
-    addTerm(`Uploading ${src} → ${dst} (${size} bytes, ${total} chunks)…`,"out");
+    addTerm(`${tag}Uploading ${src} → ${dst} (${size} bytes, ${total} chunks)…`,"out");
     const b64s=[], raws=[]; let off=0;
     while(off<size){
       const r=await (await fetch(`/api/file-slice?path=${encodeURIComponent(src)}&offset=${off}&len=${chunk}`)).json();
       if(r.data===undefined){ throw new Error("slice failed at "+off); }
       b64s.push(r.data); raws.push(b64ToBytes(r.data)); off+=r.len;
-      setXfer(Math.round(40*off/Math.max(1,size)),`↑ reading ${Math.round(100*off/Math.max(1,size))}%`);
+      setXfer(Math.round(40*off/Math.max(1,size)),`${tag}↑ reading ${Math.round(100*off/Math.max(1,size))}%`);
       if(r.len===0) break;
     }
     if(!b64s.length) b64s.push("");
@@ -1532,22 +1550,58 @@ $("toRemote").onclick=async ()=>{
     ws.send(JSON.stringify({type:"file-ul-begin",target:selected.id,path:dst,size:size,sha:sha,total:b64s.length}));
     for(let i=0;i<b64s.length;i++){
       ws.send(JSON.stringify({type:"file-ul-chunk",target:selected.id,seq:i,data:b64s[i]}));
-      setXfer(40+Math.round(60*(i+1)/b64s.length),`↑ sending ${i+1}/${b64s.length}`);
+      setXfer(40+Math.round(60*(i+1)/b64s.length),`${tag}↑ sending ${i+1}/${b64s.length}`);
       if(pace) await new Promise(r=>setTimeout(r,pace));
     }
-    addTerm(`Upload sent — waiting for agent verify…`,"out");
-  }catch(e){ toast("Upload failed: "+(e.message||e),"err"); addTerm("Upload failed: "+(e.message||e),"err"); setXfer(0,""); }
+    addTerm(`${tag}Upload sent — waiting for agent verify…`,"out");
+  }catch(e){ toast("Upload failed: "+(e.message||e),"err"); addTerm(`${tag}Upload failed: `+(e.message||e),"err"); setXfer(0,""); }
+  finally{ ulActive--; }
+}
+$("toRemote").onclick=async ()=>{
+  if(!selected){ toast("No agent", "err"); return; }
+  if(!ws||ws.readyState!==1){ toast("Not connected", "err"); return; }
+  const sel=[...$("localList").querySelectorAll(".selected")]; if(!sel.length){ toast("Select local files","err"); return; }
+  if(ulActive>0){ toast("An upload is already running","err"); return; }
+  const dir=$("remotePath").value.replace(/\\$/,"");
+  const ldir=$("localPath").value.replace(/\\$/,"");
+  let n=0;
+  for(const row of sel){
+    const name=row.querySelector(".name").textContent;
+    const isDir=row.dataset.isdir==="1";
+    n++;
+    const tag=sel.length>1?`[${n}/${sel.length}] `:"";
+    try{
+      if(isDir){
+        const z=await fileOp("zip", ldir+"\\"+name);
+        if(!z.zipPath) throw new Error("zip failed");
+        const dst=prompt(`Upload folder ${name} as zip to (remote path):`, dir+"\\"+name+".zip");
+        if(!dst) continue;
+        await uploadOne(z.zipPath, dst, tag);
+        addTerm(`${tag}On the remote, expand with: expand-item ${dst}|${dst.replace(/\.zip$/i,"")}`,"out");
+      }else{
+        const src=ldir+"\\"+name;
+        const dst=prompt(`Upload to (remote path):`, dir+"\\"+name);
+        if(!dst) continue;
+        await uploadOne(src, dst, tag);
+      }
+    }catch(e){ toast("Upload failed: "+(e.message||e),"err"); }
+  }
+  setXfer(100,"Done"); setTimeout(()=>setXfer(0,""),1500);
+  refreshFiles(true);
 };
 $("toLocal").onclick=()=>{
   if(!selected){ toast("No agent", "err"); return; }
   if(!ws||ws.readyState!==1){ toast("Not connected", "err"); return; }
-  const sel=[...$("remoteList").querySelectorAll(".selected")]; if(!sel.length){ toast("Select remote file","err"); return; }
-  const name=sel[0].querySelector(".name").textContent;
-  const src=$("remotePath").value.replace(/\\$/,"")+"\\"+name;
-  if(dlSession){ toast("A download is already running","err"); return; }
-  dlSession={id:selected.id,path:src,total:0,size:0,sha:"",chunks:new Map(),retries:0,timer:null};
-  addTerm(`Downloading ${src}…`,"out"); setXfer(0,"↓ 0%");
-  ws.send(JSON.stringify({type:"file-dl",target:selected.id,path:src}));
+  const sel=[...$("remoteList").querySelectorAll(".selected")]; if(!sel.length){ toast("Select remote files","err"); return; }
+  if(dlSession){ toast("A preview is running — wait for it first","err"); return; }
+  const dir=$("remotePath").value.replace(/\\$/,"");
+  sel.forEach(row=>{
+    const name=row.querySelector(".name").textContent;
+    const isDir=row.dataset.isdir==="1";
+    dlQueue.push({path:dir+"\\"+name, saveName:isDir?name+".zip":name});
+  });
+  addTerm(`Queued ${sel.length} download(s)…`,"out");
+  pumpDlQueue();
 };
 async function fileOp(op, path, dst, content){
   const r=await fetch("/api/file-op",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({op,path,dst,content})});
@@ -1622,9 +1676,14 @@ $("dlToBtn").onclick=()=>{
   ws.send(JSON.stringify({type:"file-dl-to",target:selected.id,remotePath:src,localPath:dst}));
 };
 $("queueBtn").onclick=()=>{
-  const q=$("transferLabel");
-  q.textContent = q.textContent ? "" : "Queue: 0 pending";
-  addTerm("Transfer queue (stub) — use →/← for now", "out");
+  const parts=[];
+  if(dlSession) parts.push(`↓ active: ${dlSession.path.split("\\").pop()} (${dlSession.chunks.size}/${dlSession.total||"?"})`);
+  if(dlQueue.length) parts.push(`↓ queued: ${dlQueue.length}`);
+  if(ulActive>0) parts.push(`↑ active: ${ulActive}`);
+  const msg=parts.length?parts.join(" • "):"Queue empty";
+  $("transferLabel").textContent=msg;
+  addTerm("Transfer queue: "+msg, "out");
+  toast(msg);
 };
 $("addFav").onclick=()=>{
   const p=prompt("Favorite path:", "C:\\Tools");

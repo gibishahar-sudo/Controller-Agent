@@ -347,14 +347,23 @@ func fileDlStream(path string, fromSeq, chunkRaw int, send func(protocol.Message
 	if chunkRaw <= 0 {
 		chunkRaw = 512 * 1024
 	}
-	man, err := commands.FileDlManifest(path, chunkRaw)
+	// Directories auto-zip (deterministic temp file, removed after).
+	realPath, displayName, cleanup, err := commands.ResolveDlSource(path)
 	if err != nil {
 		_ = send(protocol.Message{Type: protocol.TypeFileDlChunk, FilePath: path, Error: err.Error()})
 		return
 	}
-	log.Printf("[*] File download %s (%d bytes, %d chunks from %d)", path, man.Size, man.Total, fromSeq)
+	if cleanup {
+		defer os.Remove(realPath)
+	}
+	man, err := commands.FileDlManifest(realPath, chunkRaw)
+	if err != nil {
+		_ = send(protocol.Message{Type: protocol.TypeFileDlChunk, FilePath: path, Error: err.Error()})
+		return
+	}
+	log.Printf("[*] File download %s (%s, %d bytes, %d chunks from %d)", path, displayName, man.Size, man.Total, fromSeq)
 	for seq := fromSeq; seq < man.Total; seq++ {
-		data, err := commands.FileDlChunk(path, seq, chunkRaw)
+		data, err := commands.FileDlChunk(realPath, seq, chunkRaw)
 		if err != nil {
 			_ = send(protocol.Message{Type: protocol.TypeFileDlChunk, FilePath: path, FileSeq: seq, FileTotal: man.Total, Error: err.Error()})
 			return

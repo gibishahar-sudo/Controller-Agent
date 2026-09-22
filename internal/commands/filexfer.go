@@ -1,13 +1,17 @@
 package commands
 
 import (
+	"archive/zip"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
+	"time"
 )
 
 // Chunked file transfer engine (both directions). Downloads stream straight
@@ -24,6 +28,72 @@ type FileManifest struct {
 	Total int
 }
 
+// ZipDirToTemp packs a directory into a deterministic zip (sorted entries,
+// fixed timestamps so re-zips are byte-identical and gap-fill resumes stay
+// consistent). Returns the temp zip path; caller removes it.
+func ZipDirToTemp(srcDir string) (string, error) {
+	var files []string
+	if err := filepath.Walk(srcDir, func(p string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			files = append(files, p)
+		}
+		return nil
+	}); err != nil {
+		return "", err
+	}
+	sort.Strings(files)
+	tmp, err := os.CreateTemp("", "rmmdl-*.zip")
+	if err != nil {
+		return "", err
+	}
+	zw := zip.NewWriter(tmp)
+	for _, f := range files {
+		rel, err := filepath.Rel(srcDir, f)
+		if err != nil {
+			continue
+		}
+		hdr := &zip.FileHeader{Name: filepath.ToSlash(rel), Method: zip.Deflate}
+		hdr.SetModTime(time.Unix(0, 0))
+		w, err := zw.CreateHeader(hdr)
+		if err != nil {
+			continue
+		}
+		in, err := os.Open(f)
+		if err != nil {
+			continue
+		}
+		_, _ = io.Copy(w, in)
+		in.Close()
+	}
+	_ = zw.Close()
+	_ = tmp.Close()
+	return tmp.Name(), nil
+}
+
+// ResolveDlSource maps a download request to a streamable file: plain files
+// pass through, directories become a deterministic temp zip (caller deletes
+// when cleanup is true).
+func ResolveDlSource(path string) (realPath, displayName string, cleanup bool, err error) {
+	if path == "" {
+		return "", "", false, fmt.Errorf("path required")
+	}
+	st, err := os.Stat(path)
+	if err != nil {
+		return "", "", false, err
+	}
+	if !st.IsDir() {
+		return path, filepath.Base(path), false, nil
+	}
+	zp, err := ZipDirToTemp(path)
+	if err != nil {
+		return "", "", false, err
+	}
+	return zp, filepath.Base(path) + ".zip", true, nil
+}
+
 // FileDlManifest stats a download source and hashes it.
 func FileDlManifest(path string, chunkRaw int) (*FileManifest, error) {
 	if path == "" {
@@ -37,7 +107,7 @@ func FileDlManifest(path string, chunkRaw int) (*FileManifest, error) {
 		return nil, err
 	}
 	if st.IsDir() {
-		return nil, fmt.Errorf("not a file: %s", path)
+		return nil, fmt.Errorf("not a file: %s (request the folder to auto-zip)", path)
 	}
 	if st.Size() > MaxFileXfer {
 		return nil, fmt.Errorf("file too large (%d bytes, cap %d)", st.Size(), MaxFileXfer)

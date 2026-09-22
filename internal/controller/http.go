@@ -1,9 +1,11 @@
 package controller
 
 import (
+	"archive/zip"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"net"
@@ -11,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -131,8 +134,57 @@ func (s *Server) startHTTP(addr, dir string) {
 				fail(err.Error())
 				return
 			}
+		case "zip":
+			// Pack a controller-local folder into a temp zip for upload.
+			st, err := os.Stat(req.Path)
+			if err != nil || !st.IsDir() {
+				fail("not a folder: " + req.Path)
+				return
+			}
+			var files []string
+			if err := filepath.Walk(req.Path, func(p string, info os.FileInfo, err error) error {
+				if err != nil {
+					return err
+				}
+				if !info.IsDir() {
+					files = append(files, p)
+				}
+				return nil
+			}); err != nil {
+				fail(err.Error())
+				return
+			}
+			sort.Strings(files)
+			tmp, err := os.CreateTemp("", "rmmup-*.zip")
+			if err != nil {
+				fail(err.Error())
+				return
+			}
+			zw := zip.NewWriter(tmp)
+			for _, f := range files {
+				rel, err := filepath.Rel(req.Path, f)
+				if err != nil {
+					continue
+				}
+				hdr := &zip.FileHeader{Name: filepath.ToSlash(rel), Method: zip.Deflate}
+				w, err := zw.CreateHeader(hdr)
+				if err != nil {
+					continue
+				}
+				in, err := os.Open(f)
+				if err != nil {
+					continue
+				}
+				_, _ = io.Copy(w, in)
+				in.Close()
+			}
+			_ = zw.Close()
+			_ = tmp.Close()
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok", "zipPath": tmp.Name()})
+			return
 		default:
-			fail("unknown op (mkdir|delete|move|write)")
+			fail("unknown op (mkdir|delete|move|write|zip)")
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
