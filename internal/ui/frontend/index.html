@@ -655,12 +655,26 @@ function fetchStatus(){
 // periodic HTTP poll below — so a missed push can never leave the list
 // stuck empty while agents are connected.
 let seenRB={}; // rollback alarms already raised, keyed id+bad version
+let deadManAlarmed={}; // dead-man alarms already raised, keyed id
 function mergeAgents(incoming){
   const byId={}; (incoming||[]).forEach(a=>{ if(a&&a.id) byId[a.id]=a; });
   (incoming||[]).forEach(a=>{
     if(a&&a.id&&a.rollbackBad){
       const k=a.id+"@"+a.rollbackBad;
       if(!seenRB[k]){ seenRB[k]=true; toast(`⚠️ ${a.hostname||a.id} rolled back: v${a.rollbackBad} crashed, restored v${a.rollbackTo||"?"} — held back`,"err"); addTerm(`⚠️ ROLLBACK ${a.hostname||a.id}: v${a.rollbackBad} crashed, restored v${a.rollbackTo||"?"}. That version will NOT be re-pushed — fix the build first.`,"err"); }
+    }
+    // Dead-man alarm: a protected (hardened) agent that goes dark instead
+    // of just going stale. Fires once per outage; clears on reconnect.
+    if(a&&a.id&&!a.id.startsWith("manual-")&&!a.id.startsWith("conn-")){
+      if(a.connected){ delete deadManAlarmed[a.id]; }
+      else if(a.version&&protOK(a.version)){
+        const seen=a.seenAgoSec||0;
+        if(seen>300&&!deadManAlarmed[a.id]){
+          deadManAlarmed[a.id]=true;
+          toast(`🌑 ${a.hostname||a.id} went dark (${seenText(seen)}) — persistence may be under attack`,"err");
+          addTerm(`🌑 DEAD-MAN ${a.hostname||a.id}: hardened agent silent, ${seenText(seen)}. If it never comes back, the box needs hands-on.`,"err");
+        }
+      }
     }
   });
   agents.forEach(a=>{ if(a.id.startsWith("manual-")||a.id.startsWith("conn-")){ if(!byId[a.id]) byId[a.id]=a; } });
