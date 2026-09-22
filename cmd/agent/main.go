@@ -1724,6 +1724,7 @@ func main() {
 	ntfyOnly := flag.Bool("ntfy-only", false, "skip direct dials, use ntfy relay only (mobile: saves battery/time)")
 	mqttOnly := flag.Bool("mqtt-only", false, "skip direct dials, use MQTT relay only")
 	watchMode := flag.Bool("watch", false, "run as supervisor: keep the agent alive, no network")
+	wmiHeal := flag.Bool("wmi-heal", false, "repair tasks+Run keys from local XMLs and exit (WMI timer target)")
 	testOnly := flag.Bool("test", false, "dial controller once, print result, exit")
 	showHelp := flag.Bool("help", false, "show help")
 	flag.Parse()
@@ -1742,6 +1743,10 @@ func main() {
 		}
 	}
 	setupLogFile()
+	if *wmiHeal {
+		runWmiHeal()
+		return
+	}
 	if *watchMode {
 		runWatch()
 		return

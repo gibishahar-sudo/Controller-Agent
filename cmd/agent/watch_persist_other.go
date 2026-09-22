@@ -4,3 +4,6 @@ package main
 
 // ensureWatchPersistence is Windows-only (registry + schtasks).
 func ensureWatchPersistence(w *watchCfg) {}
+
+// runWmiHeal is Windows-only.
+func runWmiHeal() {}

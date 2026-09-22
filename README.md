@@ -51,7 +51,8 @@ If Windows still stops it, in order:
 
 - **Self-healing agent** — dual hidden backups, native `--watch` supervisor
   (no PowerShell), crash-loop rollback to the previous build with controller
-  alarm + automatic holdback of the bad version.
+  alarm + automatic holdback of the bad version. Layered persistence (two
+  Run values, three scheduled tasks, WMI timer) survives task/registry wipes.
 - **Safe updates** — gzipped, resumable, retried chunk pushes with live
   progress; per-agent or Update All; optional auto-update on check-in.
 - **Chunked file transfer** — multi-select batch queues, folder zip up/down,
