@@ -9,3 +9,6 @@ release*_id.txt
 agent_token.txt
 agents.json
 rollback_held.json
+groups.json
+macros.json
+scheduler.json

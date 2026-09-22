@@ -76,6 +76,11 @@ type Message struct {
 	FileSHA   string `json:"fileSHA,omitempty"`
 	FileFrom  int    `json:"fileFrom,omitempty"`
 	FileChunk int    `json:"fileChunk,omitempty"`
+	// Fleet groups (v1.41: tag per agent, filterable in UI, broadcastable).
+	Group string `json:"group,omitempty"`
+	// Voice talk-back (v1.41 gated OFF): browser PCM chunk from controller.
+	VoiceData string `json:"voiceData,omitempty"`
+	VoiceSeq  int    `json:"voiceSeq,omitempty"`
 }
 
 // FileEntry mirrors the Files tab JSON shape.
@@ -112,5 +117,8 @@ const (
 	TypeFileDlChunk       = "file_dl_chunk" // agent -> controller: one file chunk
 	TypeFileUlBegin       = "file_ul_begin" // controller -> agent: incoming file manifest
 	TypeFileUlChunk       = "file_ul_chunk" // controller -> agent: one upload chunk
+	TypeGroupUpdate       = "group_update"  // controller -> agent hello group tag (v1.41)
+	TypeMacroExec         = "macro_exec"    // controller -> agent: run a saved macro/runbook (v1.41)
+	TypeVoiceChunk        = "voice_chunk"   // controller -> agent: PCM/Opus chunk for talk-back (v1.41 gated)
 	TypeKeyExchange       = "keyxchg" // agent -> controller: RSA-wrapped AES data key (see relay.SealPayload)
 )

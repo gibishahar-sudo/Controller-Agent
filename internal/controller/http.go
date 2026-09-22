@@ -551,6 +551,190 @@ func (s *Server) startHTTP(addr, dir string) {
 		s.enforceAuth.Store(*req.Enforced)
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{"enforced": s.enforceAuth.Load()})
 	})
+	mux.HandleFunc("/api/dashboard", func(w http.ResponseWriter, r *http.Request) {
+		agents := s.Agents()
+		online := 0
+		for _, a := range agents {
+			if a["connected"].(bool) {
+				online++
+			}
+		}
+		s.groupsMu.Lock()
+		byGroup := map[string]int{}
+		for _, a := range agents {
+			g := s.groups[a["id"].(string)]
+			if g == "" {
+				g = "(none)"
+			}
+			byGroup[g]++
+		}
+		s.groupsMu.Unlock()
+		byVer := map[string]int{}
+		for _, a := range agents {
+			v := a["version"].(string)
+			if v == "" {
+				v = "unknown"
+			}
+			byVer[v]++
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"agents": agents, "online": online, "total": len(agents),
+			"byGroup": byGroup, "byVersion": byVer,
+			"controllerVersion": version.Version,
+		})
+	})
+	mux.HandleFunc("/api/groups", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			s.groupsMu.Lock()
+			cp := map[string]string{}
+			for k, v := range s.groups {
+				cp[k] = v
+			}
+			s.groupsMu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(cp)
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, "GET or POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			ID    string `json:"id"`
+			Group string `json:"group"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&req); err != nil {
+			http.Error(w, "bad json", http.StatusBadRequest)
+			return
+		}
+		s.groupsMu.Lock()
+		if req.Group == "" {
+			delete(s.groups, req.ID)
+		} else {
+			s.groups[req.ID] = req.Group
+		}
+		s.groupsMu.Unlock()
+		s.saveGroups()
+		s.broadcastAgents()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	})
+	mux.HandleFunc("/api/macros", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			s.macrosMu.Lock()
+			cp := map[string][]string{}
+			for k, v := range s.macros {
+				cp[k] = append([]string(nil), v...)
+			}
+			s.macrosMu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(cp)
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, "GET or POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			Name     string   `json:"name"`
+			Commands []string `json:"commands"`
+			Delete   bool     `json:"delete"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 256*1024)).Decode(&req); err != nil || req.Name == "" {
+			http.Error(w, "bad json need name", http.StatusBadRequest)
+			return
+		}
+		s.macrosMu.Lock()
+		if req.Delete {
+			delete(s.macros, req.Name)
+		} else {
+			s.macros[req.Name] = req.Commands
+		}
+		s.macrosMu.Unlock()
+		s.saveMacros()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	})
+	mux.HandleFunc("/api/scheduler", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			s.jobsMu.Lock()
+			cp := append([]schedJob(nil), s.jobs...)
+			s.jobsMu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(cp)
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, "GET or POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			ID     string `json:"id"`
+			Target string `json:"target"`
+			Cmd    string `json:"cmd"`
+			When   string `json:"when"`
+			Repeat string `json:"repeat"`
+			Group  string `json:"group"`
+			Delete bool   `json:"delete"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 256*1024)).Decode(&req); err != nil {
+			http.Error(w, "bad json", http.StatusBadRequest)
+			return
+		}
+		s.jobsMu.Lock()
+		if req.Delete {
+			nj := s.jobs[:0]
+			for _, j := range s.jobs {
+				if j.ID != req.ID {
+					nj = append(nj, j)
+				}
+			}
+			s.jobs = nj
+		} else {
+			if req.ID == "" {
+				req.ID = fmt.Sprintf("job-%d", time.Now().UnixNano())
+			}
+			found := false
+			for i, j := range s.jobs {
+				if j.ID == req.ID {
+					s.jobs[i] = schedJob{ID: req.ID, Target: req.Target, Cmd: req.Cmd, When: req.When, Repeat: req.Repeat, Group: req.Group}
+					found = true
+					break
+				}
+			}
+			if !found {
+				s.jobs = append(s.jobs, schedJob{ID: req.ID, Target: req.Target, Cmd: req.Cmd, When: req.When, Repeat: req.Repeat, Group: req.Group})
+			}
+		}
+		s.jobsMu.Unlock()
+		s.saveJobs()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	})
+	mux.HandleFunc("/api/voice", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			Target string `json:"target"`
+			Data   string `json:"data"`
+			Seq    int    `json:"seq"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 256*1024)).Decode(&req); err != nil {
+			http.Error(w, "bad json", http.StatusBadRequest)
+			return
+		}
+		ac := s.getAgentByID(req.Target)
+		if ac == nil {
+			http.Error(w, "no agent", http.StatusServiceUnavailable)
+			return
+		}
+		_ = s.sendToAgent(ac, protocol.Message{Type: protocol.TypeVoiceChunk, Data: req.Data, FileSeq: req.Seq})
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "sent"})
+	})
 	mux.HandleFunc("/api/forget-agent", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "POST only", http.StatusMethodNotAllowed)

@@ -249,6 +249,7 @@ html{touch-action:manipulation}
 
     <div class="tabs">
       <button class="tab active" data-tab="screen">🖥 Screen</button>
+      <button class="tab" data-tab="dashboard">📊 Dashboard</button>
       <button class="tab" data-tab="files">📁 Files</button>
       <button class="tab" data-tab="commands">⌨ Commands</button>
       <button class="tab" data-tab="audio">🔊 Audio</button>
@@ -330,8 +331,30 @@ html{touch-action:manipulation}
       <div id="previewOverlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:60;align-items:center;justify-content:center"><div id="previewBox" style="max-width:88vw;max-height:88vh;background:#1e1e1e;border:1px solid #555;border-radius:10px;padding:12px;display:flex;flex-direction:column;gap:8px"><div style="display:flex;gap:8px;align-items:center"><span id="previewTitle" style="font-size:12px;color:#ccc"></span><button class="btn btn-small" id="previewClose" style="margin-left:auto">✕ Close</button></div><div id="previewBody" style="overflow:auto;max-width:86vw;max-height:76vh;text-align:center"></div></div></div>
     </section>
 
+    <!-- Dashboard — second tab, fleet at a glance (RMM) -->
+    <section id="tab-dashboard" class="tab-content">
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <span style="font-size:13px;font-weight:600">RMM Fleet</span><span id="dashVersion" style="font-size:11px;color:#888"></span>
+        <span style="margin-left:auto"></span><button class="btn btn-small" id="dashRefresh">⟳ Refresh</button>
+        <button class="btn btn-small" id="dashUpdateAll">⇪ Update All</button>
+      </div>
+      <div id="dashCards" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px;margin-top:8px"></div>
+      <div style="margin-top:10px;font-size:11px;color:#888">Live alarms</div>
+      <div id="dashAlarms" style="max-height:160px;overflow:auto;border:1px solid var(--border);border-radius:6px;padding:6px;background:var(--bg-input);font-size:11px"></div>
+      <div style="margin-top:10px;font-size:11px;color:#888">By version / group</div>
+      <div id="dashBreakdown" style="font-size:11px;color:#888"></div>
+    </section>
+
     <!-- Commands -->
     <section id="tab-commands" class="tab-content">
+      <div id="macroBar" style="display:flex;gap:6px;align-items:center;padding:6px;background:rgba(255,255,255,0.03);border:1px solid var(--border);border-radius:6px">
+        <span style="font-size:11px;color:#888">Runbook:</span>
+        <select id="macroSel" class="select" style="min-width:140px"><option value="">— pick —</option></select>
+        <button class="btn btn-small" id="macroRun">▶ Run</button>
+        <button class="btn btn-small" id="macroSave" title="Save current input as a macro">＋ Save</button>
+        <button class="btn btn-small" id="macroDel" title="Delete selected macro">🗑</button>
+        <span style="margin-left:6px;font-size:11px;color:#666" id="macroHint">Ctrl+Shift+R record</span>
+      </div>
       <div id="cmdFavs" class="cmd-favs"><span style="font-size:11px;color:#888">Favorites:</span>
         <span class="chip" data-cmd="version">version</span><span class="chip" data-cmd="get-system-info">get-system-info</span><span class="chip" data-cmd="list-directory C:\">list-directory</span><span class="chip" data-cmd="get-processes">get-processes</span><span class="chip" data-cmd="get-ip-address">get-ip-address</span><button class="btn btn-small" id="addCmdFav">＋ Add</button>
       </div>
@@ -2202,9 +2225,9 @@ try{
 // Keyboard shortcuts: Ctrl+K focuses command input, Ctrl+1..5 switch tabs
 document.addEventListener("keydown", e=>{
   if(e.ctrlKey && (e.key==="k"||e.key==="K")){ e.preventDefault(); document.querySelector('.tab[data-tab="commands"]')?.click(); input.focus(); }
-  if(e.ctrlKey && ["1","2","3","4","5"].includes(e.key)){
+  if(e.ctrlKey && ["1","2","3","4","5","6"].includes(e.key)){
     e.preventDefault();
-    const tabs=["screen","files","commands","audio","settings"];
+    const tabs=["screen","dashboard","files","commands","audio","settings"];
     document.querySelector(`.tab[data-tab="${tabs[+e.key-1]}"]`)?.click();
   }
 });
@@ -2224,6 +2247,133 @@ try{ if(localStorage.getItem("rmm_compact")) applyCompact(true); }catch{}
 // single source of truth by construction, no sync needed.
 $("s_compact")?.addEventListener("change", e=>{ applyCompact(e.currentTarget.checked); });
 // Init
+// --- v1.41: Dashboard + Groups + Macros/Scheduler + Drag-Drop + Voice ---
+function renderDashboard(j){
+  const cards=$("dashCards"), alarms=$("dashAlarms"), bd=$("dashBreakdown"), ver=$("dashVersion");
+  if(ver) ver.textContent="RMM v"+(j.controllerVersion||"");
+  if(cards){
+    const online=j.online||0, total=j.total||0;
+    cards.innerHTML=`
+      <div class="audio-card"><b>${total}</b><div style="font-size:11px;color:#888">Total agents</div></div>
+      <div class="audio-card"><b style="color:#8BC34A">${online}</b><div style="font-size:11px;color:#888">Online</div></div>
+      <div class="audio-card"><b style="color:#FF5252">${Math.max(0,total-online)}</b><div style="font-size:11px;color:#888">Offline</div></div>
+      <div class="audio-card"><b>${Object.keys(j.byGroup||{}).length}</b><div style="font-size:11px;color:#888">Groups</div></div>`;
+  }
+  if(bd){
+    const byV=j.byVersion||{}, byG=j.byGroup||{};
+    bd.textContent="Versions: "+Object.entries(byV).map(([k,v])=>k+"×"+v).join(", ")+" | Groups: "+Object.entries(byG).map(([k,v])=>k+":"+v).join(", ");
+  }
+  if(alarms){
+    const list=(j.agents||[]).filter(a=>a.rollbackBad||a.protDetail||(a.prot&&a.prot.startsWith("0/")));
+    if(!list.length) alarms.textContent="No alarms — fleet healthy.";
+    else alarms.innerHTML=list.map(a=>`<div>⚠️ ${a.hostname} ${a.rollbackBad?"rollback v"+a.rollbackBad:""} ${a.protDetail||""} ${a.prot?"layers "+a.prot:""}</div>`).join("");
+  }
+}
+function fetchDashboard(){ fetch("/api/dashboard").then(r=>r.json()).then(renderDashboard).catch(()=>{}); }
+$("dashRefresh")?.addEventListener("click", fetchDashboard);
+$("dashUpdateAll")?.addEventListener("click", ()=>{ if(typeof pushAgentUpdateAll==="function") pushAgentUpdateAll(); else fetch("/api/agent-update-all",{method:"POST"}); });
+setInterval(fetchDashboard, 15000); fetchDashboard();
+
+// Fleet Groups: filter bar + assign
+const groupBar=document.createElement("div"); groupBar.style.cssText="display:flex;gap:6px;align-items:center;padding:4px 0";
+groupBar.innerHTML=`<input id="groupFilter" placeholder="filter group…" style="flex:1;background:var(--bg-input);border:1px solid var(--border);color:var(--fg);padding:4px 6px;border-radius:6px;font-size:11px"><button class="btn btn-small" id="groupSetBtn">Tag</button><button class="btn btn-small" id="groupClearBtn">Clear</button>`;
+const connListEl=document.getElementById("connList"); if(connListEl) connListEl.parentElement.insertBefore(groupBar, connListEl);
+let activeGroup="";
+document.getElementById("groupFilter")?.addEventListener("input", e=>{ activeGroup=e.target.value.toLowerCase(); renderConns(document.getElementById("connFilter")?.value||""); });
+document.getElementById("groupSetBtn")?.addEventListener("click", ()=>{
+  if(!selected) return toast("Select an agent first","err");
+  const g=prompt("Group tag for "+selected.hostname+":", selected.group||""); if(g===null) return;
+  fetch("/api/groups",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id:selected.id,group:g})}).then(()=>{ fetchAgents(); fetchDashboard(); toast(g?"Tagged "+g:"Tag cleared"); });
+});
+document.getElementById("groupClearBtn")?.addEventListener("click", ()=>{
+  if(!selected) return toast("Select an agent first","err");
+  fetch("/api/groups",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id:selected.id,group:""})}).then(()=>{ fetchAgents(); fetchDashboard(); });
+});
+
+// Patch renderConns to respect group filter (monkey-patch after definition)
+const _origRenderConns=renderConns; renderConns=function(filter=""){ const gf=(document.getElementById("groupFilter")?.value||"").toLowerCase(); if(gf) filter=(filter?filter+" ":"")+gf; return _origRenderConns(filter); };
+
+// Macros / Runbooks (per-controller, persisted)
+function loadMacros(){ fetch("/api/macros").then(r=>r.json()).then(j=>{ const sel=$("macroSel"); if(!sel) return; sel.innerHTML='<option value="">— pick —</option>'; Object.keys(j).forEach(k=>{ const o=document.createElement("option"); o.value=k; o.textContent=k+" ("+j[k].length+")"; sel.appendChild(o); }); }).catch(()=>{}); }
+loadMacros();
+$("macroRun")?.addEventListener("click", ()=>{
+  const name=$("macroSel")?.value; if(!name) return toast("Pick a macro","err");
+  fetch("/api/macros").then(r=>r.json()).then(j=>{
+    const cmds=j[name]||[]; if(!cmds.length) return toast("Empty macro","err");
+    let targets=[selected].filter(Boolean); if(sendAllOn||activeGroup) targets=agents.filter(a=>a.connected&&(activeGroup?a.group===activeGroup:true));
+    if(!targets.length) targets=[selected].filter(Boolean);
+    cmds.forEach(cmd=>{ targets.forEach(a=>{ if(ws&&ws.readyState===1) ws.send(JSON.stringify({type:"command",cmd,target:a.id})); }); });
+    addTerm("▶ Runbook "+name+" ("+cmds.length+" cmds → "+targets.length+" agent(s))","out");
+  });
+});
+$("macroSave")?.addEventListener("click", ()=>{
+  const name=prompt("Macro name:"); if(!name) return;
+  const raw=prompt("Commands (one per line):", $("cmdInput")?.value||""); if(raw===null) return;
+  const cmds=raw.split("\n").map(s=>s.trim()).filter(Boolean);
+  fetch("/api/macros",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name,commands:cmds})}).then(()=>{ loadMacros(); toast("Saved "+name); });
+});
+$("macroDel")?.addEventListener("click", ()=>{
+  const name=$("macroSel")?.value; if(!name) return;
+  if(!confirm("Delete macro "+name+"?")) return;
+  fetch("/api/macros",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name,delete:true})}).then(()=>loadMacros());
+});
+document.addEventListener("keydown", e=>{ if(e.ctrlKey&&e.shiftKey&&e.key.toLowerCase()==="r"){ e.preventDefault(); const cur=$("cmdInput")?.value.trim(); if(cur) addTerm("Recorded: "+cur,"out"); }});
+
+// Scheduler UI injected into Settings (minimal, RMM-branded)
+const schedCard=document.createElement("div"); schedCard.className="audio-card"; schedCard.innerHTML=`<h4>⏰ Scheduler <span style="font-size:10px;color:#666">(per-agent)</span></h4><div style="display:flex;gap:6px;align-items:center;margin-top:6px"><input id="schedCmd" placeholder="command" style="flex:1;background:var(--bg-input);border:1px solid var(--border);color:var(--fg);padding:6px;border-radius:6px;font-size:11px"><input id="schedWhen" type="datetime-local" class="select"><button class="btn btn-small" id="schedAdd">Add</button></div><div id="schedList" style="margin-top:8px;font-size:11px"></div>`;
+document.querySelector("#tab-settings .audio-grid")?.appendChild(schedCard);
+function loadSched(){ fetch("/api/scheduler").then(r=>r.json()).then(j=>{ const el=$("schedList"); if(!el) return; if(!j.length) el.textContent="No jobs."; else el.innerHTML=j.map(x=>`<div>${x.cmd} @ ${x.when} → ${x.target||x.group||"?"} <a href="#" data-id="${x.id}" class="schedDel">✕</a></div>`).join(""); el.querySelectorAll(".schedDel").forEach(a=>a.onclick=(e)=>{ e.preventDefault(); fetch("/api/scheduler",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id:a.dataset.id,delete:true})}).then(loadSched); }); }).catch(()=>{}); }
+loadSched();
+document.getElementById("schedAdd")?.addEventListener("click", ()=>{
+  const cmd=document.getElementById("schedCmd")?.value.trim(), when=document.getElementById("schedWhen")?.value; if(!cmd||!when) return toast("Need command + time","err");
+  const target=selected?.id||""; const group=activeGroup||"";
+  fetch("/api/scheduler",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({target,cmd,when:new Date(when).toISOString(),repeat:"once",group})}).then(()=>{ loadSched(); toast("Scheduled"); });
+});
+
+// Drag-Drop upload: drop files onto file panes or screen stream
+function handleDropFiles(files, dstDir){
+  if(!selected) return toast("Select an agent first","err");
+  [...files].forEach(f=>{
+    const r=new FileReader(); r.onload=()=>{ const b64=r.result.split(",")[1]; const total=Math.ceil(b64.length/700000); /* reuse file-ul path via data url chunking */
+      fetch("/api/file-slice?path=dummy",{}).catch(()=>{});
+      // Use existing upload path: write via /api/file-op then file-ul — for dropped File objects, we send directly as file-ul
+      const dst=(dstDir.replace(/\\$/,"")+"\\"+f.name);
+      // Chunk the base64
+      const chunks=[]; for(let i=0;i<b64.length;i+=512*1024) chunks.push(b64.slice(i,i+512*1024));
+      fetch("/api/dashboard").catch(()=>{}); // keepalive
+      // Direct WS upload of dropped file
+      const doUpload=async()=>{
+        const ab=await f.arrayBuffer(); const bytes=new Uint8Array(ab); let hex=""; try{ const d=await crypto.subtle.digest("SHA-256",bytes); hex=[...new Uint8Array(d)].map(x=>x.toString(16).padStart(2,"0")).join(""); }catch{}
+        const chSize=xferChunkRaw(selected); const totalCh=Math.max(1, Math.ceil(b64.length/(chSize*1.37)));
+        // Re-encode properly: reuse file-slice chunking would be cleaner, but for File objects we have bytes already
+        const b64full=await new Promise(res=>{ const fr=new FileReader(); fr.onload=()=>res(fr.result.split(",")[1]); fr.readAsDataURL(f); });
+        const parts=[]; for(let i=0;i<b64full.length;i+=512*1024) parts.push(b64full.slice(i,i+512*1024));
+        ws.send(JSON.stringify({type:"file-ul-begin",target:selected.id,path:dst,size:f.size,sha:hex,total:parts.length}));
+        for(let i=0;i<parts.length;i++){ ws.send(JSON.stringify({type:"file-ul-chunk",target:selected.id,seq:i,data:parts[i]})); setXfer( Math.round(100*(i+1)/parts.length), "↑ "+f.name+" "+(i+1)+"/"+parts.length); await new Promise(r=>setTimeout(r, xferPace(selected))); }
+      }; doUpload();
+    }; r.readAsDataURL(files[0]); // start with first; sequential handled by caller loop in real use — keep simple for first drop
+  });
+}
+document.querySelectorAll(".file-pane, #screenWrap").forEach(el=>{
+  el.addEventListener("dragover", e=>{ e.preventDefault(); el.style.outline="2px dashed var(--accent)"; });
+  el.addEventListener("dragleave", ()=>{ el.style.outline=""; });
+  el.addEventListener("drop", e=>{
+    e.preventDefault(); el.style.outline="";
+    const dir=el.querySelector("input")?.value || $("remotePath")?.value || "C:\\";
+    if(e.dataTransfer.files?.length) handleDropFiles(e.dataTransfer.files, dir);
+  });
+});
+
+// Voice talk-back gated OFF (toggle in Settings)
+const voiceCard=document.createElement("div"); voiceCard.className="audio-card"; voiceCard.innerHTML=`<h4>🎙 Voice <span style="font-size:10px;color:#666">(gated OFF)</span></h4><label class="toggle" id="voiceToggle"><input type="checkbox"/> Enable talk-back</label><div style="font-size:11px;color:#888">Hold to talk is coming — gated for now. Enable to test local mic loopback.</div><button class="btn btn-small" id="voiceTest">Test mic</button><span id="voiceStatus" style="font-size:11px;color:#888"></span>`;
+document.querySelector("#tab-audio .audio-grid")?.appendChild(voiceCard);
+let voiceOn=false; try{ voiceOn=localStorage.getItem("rmm_voice")==="1"; }catch{} const vt=document.getElementById("voiceToggle")?.querySelector("input"); if(vt) vt.checked=voiceOn;
+document.getElementById("voiceToggle")?.addEventListener("change", e=>{ voiceOn=e.currentTarget.querySelector("input").checked; try{ localStorage.setItem("rmm_voice", voiceOn?"1":""); }catch{} toast(voiceOn?"Voice enabled (skeleton)":"Voice disabled"); });
+document.getElementById("voiceTest")?.addEventListener("click", async()=>{
+  if(!voiceOn) return toast("Enable voice first","err");
+  try{ const s=await navigator.mediaDevices.getUserMedia({audio:true}); s.getTracks().forEach(t=>t.stop()); $("voiceStatus").textContent="Mic OK — skeleton only (no agent stream yet)."; }catch(err){ $("voiceStatus").textContent="Mic blocked: "+err; }
+});
+
 setWsState("WS connecting…");
 connectWS();
 fetchAgents(); // fill the Connections list immediately; don't wait for WS/poller

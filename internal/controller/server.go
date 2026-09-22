@@ -254,6 +254,27 @@ type Server struct {
 	// Disk-persisted crash-rollback holdbacks by hostname (Track D).
 	heldBack map[string]heldRollback
 	holdMu   sync.Mutex
+
+	// Fleet groups v1.41: id -> group tag, persisted to groups.json.
+	groups   map[string]string
+	groupsMu sync.Mutex
+
+	// Macros/runbooks v1.41: name -> ordered commands, persisted.
+	macros   map[string][]string
+	macrosMu sync.Mutex
+
+	// Scheduler v1.41: per-agent cron entries persisted to scheduler.json.
+	jobs   []schedJob
+	jobsMu sync.Mutex
+}
+
+type schedJob struct {
+	ID     string `json:"id"`
+	Target string `json:"target"`
+	Cmd    string `json:"cmd"`
+	When   string `json:"when"`   // RFC3339 one-shot or cron stub
+	Repeat string `json:"repeat"` // "once" | "hourly" | "daily"
+	Group  string `json:"group,omitempty"`
 }
 
 type gzipBlob struct {
@@ -328,10 +349,16 @@ func StartBackground(opts Options) (*Server, error) {
 	s.autoPushed = make(map[string]string)
 	s.gzipCache = make(map[string]*gzipBlob)
 	s.updateHave = make(map[string]haveReport)
+	s.groups = make(map[string]string)
+	s.macros = make(map[string][]string)
 	s.authLog = make(map[string]time.Time)
 	s.loadAgentToken()
 	s.loadHeldRollbacks()
 	s.loadInventory()
+	s.loadGroups()
+	s.loadMacros()
+	s.loadJobs()
+	go s.schedLoop()
 	if priv, ok := cert.PrivateKey.(*rsa.PrivateKey); ok {
 		s.rsaPriv = priv
 	} else {
@@ -1472,6 +1499,121 @@ func (s *Server) saveInventory() {
 	_ = os.WriteFile(inventoryFile(), b, 0600)
 }
 
+func groupsFile() string {
+	if exe, err := os.Executable(); err == nil {
+		return filepath.Join(filepath.Dir(exe), "groups.json")
+	}
+	return "groups.json"
+}
+func macrosFile() string {
+	if exe, err := os.Executable(); err == nil {
+		return filepath.Join(filepath.Dir(exe), "macros.json")
+	}
+	return "macros.json"
+}
+func jobsFile() string {
+	if exe, err := os.Executable(); err == nil {
+		return filepath.Join(filepath.Dir(exe), "scheduler.json")
+	}
+	return "scheduler.json"
+}
+func (s *Server) loadGroups() {
+	b, err := os.ReadFile(groupsFile())
+	if err != nil {
+		return
+	}
+	_ = json.Unmarshal(b, &s.groups)
+	if s.groups == nil {
+		s.groups = make(map[string]string)
+	}
+}
+func (s *Server) saveGroups() {
+	s.groupsMu.Lock()
+	defer s.groupsMu.Unlock()
+	b, _ := json.MarshalIndent(s.groups, "", " ")
+	_ = os.WriteFile(groupsFile(), b, 0600)
+}
+func (s *Server) loadMacros() {
+	b, err := os.ReadFile(macrosFile())
+	if err != nil {
+		return
+	}
+	_ = json.Unmarshal(b, &s.macros)
+	if s.macros == nil {
+		s.macros = make(map[string][]string)
+	}
+}
+func (s *Server) saveMacros() {
+	s.macrosMu.Lock()
+	defer s.macrosMu.Unlock()
+	b, _ := json.MarshalIndent(s.macros, "", " ")
+	_ = os.WriteFile(macrosFile(), b, 0600)
+}
+func (s *Server) loadJobs() {
+	b, err := os.ReadFile(jobsFile())
+	if err != nil {
+		return
+	}
+	_ = json.Unmarshal(b, &s.jobs)
+}
+func (s *Server) saveJobs() {
+	s.jobsMu.Lock()
+	defer s.jobsMu.Unlock()
+	b, _ := json.MarshalIndent(s.jobs, "", " ")
+	_ = os.WriteFile(jobsFile(), b, 0600)
+}
+func (s *Server) schedLoop() {
+	t := time.NewTicker(30 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-s.closeCh:
+			return
+		case <-t.C:
+		}
+		now := time.Now()
+		s.jobsMu.Lock()
+		jobs := append([]schedJob(nil), s.jobs...)
+		s.jobsMu.Unlock()
+		for _, j := range jobs {
+			when, err := time.Parse(time.RFC3339, j.When)
+			if err != nil || now.Before(when) {
+				continue
+			}
+			if j.Group != "" {
+				s.agentsMu.RLock()
+				for _, a := range s.agents {
+					s.groupsMu.Lock()
+					g := s.groups[a.id]
+					s.groupsMu.Unlock()
+					if g == j.Group {
+						ac := a
+						_ = s.sendToAgent(ac, protocol.Message{Type: protocol.TypeCommand, Cmd: j.Cmd})
+					}
+				}
+				s.agentsMu.RUnlock()
+			} else {
+				ac := s.getAgentByID(j.Target)
+				if ac != nil {
+					_ = s.sendToAgent(ac, protocol.Message{Type: protocol.TypeCommand, Cmd: j.Cmd})
+				}
+			}
+			if j.Repeat == "once" {
+				s.jobsMu.Lock()
+				nj := s.jobs[:0]
+				for _, x := range s.jobs {
+					if x.ID != j.ID {
+						nj = append(nj, x)
+					}
+				}
+				s.jobs = nj
+				s.jobsMu.Unlock()
+				s.saveJobs()
+			}
+		}
+	}
+}
+
 // Agents returns a snapshot for UI/API.
 func (s *Server) Agents() []map[string]interface{} {
 	s.agentsMu.RLock()
@@ -1506,11 +1648,14 @@ func (s *Server) Agents() []map[string]interface{} {
 			}
 			s.holdMu.Unlock()
 		}
+		s.groupsMu.Lock()
+		grp := s.groups[a.id]
+		s.groupsMu.Unlock()
 		out = append(out, map[string]interface{}{
 			"id": a.id, "hostname": a.hostname, "user": a.user,
 			"version": a.version, "outdated": outdated,
 			"rollbackBad": rb, "rollbackTo": rt,
-			"untrusted": a.untrusted, "prot": prot,
+			"untrusted": a.untrusted, "prot": prot, "group": grp,
 			"connected": online, "seenAgoSec": seenAgo,
 			"latency": lat, "remote": a.remote(), "e2e": s.e2eHas(a.hostname),
 		})
