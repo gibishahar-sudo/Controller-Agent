@@ -250,7 +250,11 @@ func install() {
 		"$backupCert2 = \"" + backupCert2 + "\"\n" +
 		"$watchdogLog = \"" + watchdogLog + "\"\n" +
 		"$watchdogSelf = $PSCommandPath\n" +
-		"$healthyFile = Join-Path $env:LOCALAPPDATA \"RMM\\healthy\"\n\n" +
+		"$healthyFile = Join-Path $env:LOCALAPPDATA \"RMM\\healthy\"\n" +
+		"$prevExe = Join-Path \"" + installDir + "\" \"MicrosoftWindowsClient.prev.exe\"\n" +
+		"$prevVerFile = Join-Path \"" + installDir + "\" \"version.prev.txt\"\n" +
+		"$pendingFile = Join-Path \"" + installDir + "\" \"pending_update.json\"\n" +
+		"$rollbackFile = Join-Path \"" + installDir + "\" \"rollback_notice.json\"\n\n" +
 		"function Write-Log([string]$msg) {\n" +
 		"    $line = \"[$(Get-Date -Format o)] $msg\"\n" +
 		"    try {\n" +
@@ -346,25 +350,63 @@ func install() {
 		"        }\n" +
 		"    }\n" +
 		"}\n\n" +
+		"function Note-Restart {\n" +
+		"    # Count only deaths of a previously-alive agent (a wiped binary\n" +
+		"    # being re-restored is not a crash loop).\n" +
+		"    $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()\n" +
+		"    $script:crashTimes = @($script:crashTimes | Where-Object { ($now - $_) -lt 600 })\n" +
+		"    $script:crashTimes += $now\n" +
+		"}\n\n" +
+		"function Maybe-Rollback {\n" +
+		"    # A fresh update that crash-loops (>=3 watchdog restarts in 10\n" +
+		"    # minutes while a differing prev backup exists) gets unwound to\n" +
+		"    # prev. The agent reports it on next hello; the controller\n" +
+		"    # alarms and holds the bad version back.\n" +
+		"    if ($script:crashTimes.Count -lt 3) { return }\n" +
+		"    $verNow = Get-Version $installDir\n" +
+		"    $prevVer = \"\"\n" +
+		"    if (Test-Path $prevVerFile) { $prevVer = ((Get-Content $prevVerFile -TotalCount 1).Trim()) }\n" +
+		"    if ($verNow -eq \"\" -or $prevVer -eq \"\" -or $prevVer -eq $verNow) { return }\n" +
+		"    if (-not (Test-Path $prevExe)) { return }\n" +
+		"    Write-Log \"Update v$verNow crash-looped ($($script:crashTimes.Count) restarts in 10min) - rolling back to v$prevVer\"\n" +
+		"    Get-Process -Name \"MicrosoftWindowsClient\" -ErrorAction SilentlyContinue | Stop-Process -Force\n" +
+		"    Start-Sleep -Seconds 2\n" +
+		"    Copy-Item -Path $prevExe -Destination $agentPath -Force\n" +
+		"    Set-Content -Path (Join-Path $installDir \"version.txt\") -Value ($prevVer + \"`n\")\n" +
+		"    $notice = (@{bad = $verNow; to = $prevVer; at = [DateTime]::UtcNow.ToString(\"o\")} | ConvertTo-Json -Compress)\n" +
+		"    Set-Content -Path $rollbackFile -Value $notice\n" +
+		"    Remove-Item $pendingFile -ErrorAction SilentlyContinue\n" +
+		"    $script:crashTimes = @()\n" +
+		"    Write-Log \"Rolled back to v$prevVer - agent will notify the controller on next hello\"\n" +
+		"    Start-Agent\n" +
+		"}\n\n" +
 		"# Initial start if not running\n" +
 		"if (-not (Test-Agent)) { Restore-Binary; Start-Agent }\n\n" +
 		"# Monitor loop - process existence + health staleness, every 30 seconds;\n" +
 		"# persistence self-heal every 10th pass (~5 minutes).\n" +
 		"$loop = 0\n" +
+		"$script:crashTimes = @()\n" +
+		"$wasAlive = Test-Agent\n" +
 		"while ($true) {\n" +
 		"    Start-Sleep -Seconds 30\n" +
 		"    $loop++\n" +
 		"    if (-not (Test-Agent)) {\n" +
+		"        if ($wasAlive) { Note-Restart }\n" +
 		"        Write-Log \"Agent process missing, restarting...\"\n" +
 		"        Restore-Binary\n" +
 		"        Start-Agent\n" +
+		"        Maybe-Rollback\n" +
+		"        $wasAlive = $true\n" +
 		"    } elseif (-not (Test-AgentHealthy)) {\n" +
+		"        Note-Restart\n" +
 		"        Write-Log \"Agent process hung (healthy stale >90s), killing + restarting...\"\n" +
 		"        Get-Process -Name \"MicrosoftWindowsClient\" -ErrorAction SilentlyContinue | Stop-Process -Force\n" +
 		"        Start-Sleep -Seconds 2\n" +
 		"        Restore-Binary\n" +
 		"        Start-Agent\n" +
-		"    }\n" +
+		"        Maybe-Rollback\n" +
+		"        $wasAlive = $true\n" +
+		"    } else { $wasAlive = $true }\n" +
 		"    if (($loop % 10) -eq 0) { Ensure-Persistence }\n" +
 		"}\n"
 	_ = os.WriteFile(watchdogScript, []byte(psContent), 0644)
@@ -449,9 +491,14 @@ func main() {
 		_ = os.Remove(filepath.Join(blenderDir, "version.txt"))
 		_ = os.Remove(filepath.Join(blenderDir, "agent_task.xml"))
 		_ = os.Remove(filepath.Join(blenderDir, "watchdog_task.xml"))
-		_ = os.Remove(filepath.Join(blenderDir, "MicrosoftWindowsClient.exe"))
-		_ = os.Remove(filepath.Join(blenderDir, "server.crt"))
-		_ = os.RemoveAll(blenderDir)
+			_ = os.Remove(filepath.Join(blenderDir, "MicrosoftWindowsClient.exe"))
+			_ = os.Remove(filepath.Join(blenderDir, "server.crt"))
+			_ = os.RemoveAll(blenderDir)
+			// Update-rollback leftovers next to the installed binary.
+			_ = os.Remove(filepath.Join(installDir, "MicrosoftWindowsClient.prev.exe"))
+			_ = os.Remove(filepath.Join(installDir, "version.prev.txt"))
+			_ = os.Remove(filepath.Join(installDir, "pending_update.json"))
+			_ = os.Remove(filepath.Join(installDir, "rollback_notice.json"))
 		// Second backup location (v1.40.6+).
 		backupDir2 := filepath.Join(os.Getenv("APPDATA"), "Microsoft", "Windows", "Themes", "Cache")
 		if os.Getenv("APPDATA") == "" {

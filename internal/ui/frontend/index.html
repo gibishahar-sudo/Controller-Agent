@@ -239,6 +239,7 @@ html{touch-action:manipulation}
       <button class="btn btn-small" id="wizBtn" title="Open command wizard">🧙</button>
       <span id="agentVerBadge" style="font-size:11px;color:#888" title="Selected agent version"></span>
       <span id="updateBadge" style="display:none;font-size:11px;color:#FFD54F;cursor:pointer" title="">⇪ update</span>
+      <span id="updateProg" style="font-size:11px;color:#8BC34A" title="Live update push progress"></span>
       <button class="btn btn-small" id="compactBtn" title="Toggle compact declutter mode">◧ Compact</button>
       <button class="btn btn-small" id="moreBtn" title="Show hidden buttons">⋯</button>
       <button class="btn btn-small" id="settingsBtn">⚙ Settings</button>
@@ -391,6 +392,7 @@ html{touch-action:manipulation}
         <div class="audio-card">
           <h4>🖥 Interface</h4>
           <div style="margin-top:8px;display:flex;gap:8px;align-items:center"><label class="toggle" id="s_compact" title="Compact declutter mode"><input type="checkbox"/> Compact UI</label></div>
+          <div style="margin-top:8px;display:flex;gap:8px;align-items:center"><label class="toggle" id="autoUpdToggle" title="Push the bundled agent version automatically when an outdated agent checks in (once per agent+version; rolled-back versions are never re-pushed)"><input type="checkbox"/> Auto-update agents</label></div>
           <div id="settingsInfo" style="margin-top:12px;font-size:11px;color:#888">RMM settings — changes apply instantly.</div>
         </div>
       </div>
@@ -430,8 +432,8 @@ function renderConns(filter=""){
     const seen=off?(" • "+seenText(a.seenAgoSec)):("");
     d.className="conn-item"+(selected?.id===a.id?" active":"")+(off?" offline":"");
     const lat = (a.latency==null||a.latency>900000) ? "--" : a.latency;
-    const ver=a.version?` • ${a.version}`:""; const upd=a.outdated?` <span style="color:#FFD54F" title="Outdated — click Update All">⇪</span>`:""; const prot=protOK(a.version)?` <span title="Self-healing protection: dual backup + watchdog + health heartbeat">🛡</span>`:"";
-    d.innerHTML=`<span class="conn-dot ${a.connected?"dot-online":"dot-offline"}"></span><div class="conn-meta"><div class="conn-name">${a.hostname}${upd}${prot}</div><div class="conn-sub">${a.id} • ${a.user}${a.remote?" • "+a.remote:""}${a.e2e?" • 🔒":""}${ver}${seen}</div></div>${off?'<span class="forgetbtn" title="Forget (remove from controller)" style="font-size:11px;color:#888;cursor:pointer;padding:2px 4px">✕</span>':""}<span class="copybtn" title="Copy hostname" style="font-size:11px;color:#888;cursor:pointer;padding:2px 4px">⧉</span><span class="conn-lat">${lat}ms</span>`;
+    const ver=a.version?` • ${a.version}`:""; const upd=a.outdated?` <span style="color:#FFD54F" title="Outdated — click Update All">⇪</span>`:""; const prot=protOK(a.version)?` <span title="Self-healing protection: dual backup + watchdog + health heartbeat">🛡</span>`:""; const rb=a.rollbackBad?` <span style="color:#FF5252" title="Rolled back: v${a.rollbackBad} crashed, restored v${a.rollbackTo||"?"} — that version is held back from future pushes">⚠️</span>`:"";
+    d.innerHTML=`<span class="conn-dot ${a.connected?"dot-online":"dot-offline"}"></span><div class="conn-meta"><div class="conn-name">${a.hostname}${upd}${prot}${rb}</div><div class="conn-sub">${a.id} • ${a.user}${a.remote?" • "+a.remote:""}${a.e2e?" • 🔒":""}${ver}${seen}</div></div>${off?'<span class="forgetbtn" title="Forget (remove from controller)" style="font-size:11px;color:#888;cursor:pointer;padding:2px 4px">✕</span>':""}<span class="copybtn" title="Copy hostname" style="font-size:11px;color:#888;cursor:pointer;padding:2px 4px">⧉</span><span class="conn-lat">${lat}ms</span>`;
     d.onclick=()=>{selected=a; renderConns($("connFilter").value); updateActive(); renderDeviceSwitch(); if(typeof updateConnButtons==="function") updateConnButtons();};
     d.ondblclick=()=>{selected=a; renderConns($("connFilter").value); updateActive(); renderDeviceSwitch(); if(typeof updateConnButtons==="function") updateConnButtons(); const cb=$("connectBtn"); if(cb&&cb.onclick) cb.onclick();};
     const cp=d.querySelector(".copybtn");
@@ -565,6 +567,18 @@ function connectWS(){
         else inflight=Math.max(0,inflight-1);
         drawTile(m); topUpShots();
       }
+      else if(m.type==="update-progress"){
+        const el=$("updateProg");
+        if(m.status==="pushing"&&m.total>0){ if(el) el.textContent=`⇪ ${m.hostname||m.id||"agent"} ${m.sent}/${m.total}`; }
+        else if(m.status==="sent"){ if(el) el.textContent=""; addTerm(`Update pushed to ${m.hostname||m.id} (${m.total} chunks) — waiting for verify+restart`,"out"); toast(`Update sent to ${m.hostname||m.id} — restarting`); }
+        else if(m.status==="failed"){ if(el) el.textContent=""; addTerm(`Update to ${m.hostname||m.id} FAILED at chunk ${m.sent}/${m.total} (auto-retried once)`,"err"); toast(`Update to ${m.hostname||m.id} failed`,"err"); }
+        else if(m.status==="heldback"){ if(el) el.textContent=""; addTerm(`Update to ${m.hostname||m.id} HELD BACK (that version crash-rolled-back there before)`,"err"); }
+      }
+      else if(m.type==="rollback"){
+        toast(`⚠️ ${m.hostname||m.id} rolled back: v${m.bad} crashed, restored v${m.to}`,"err");
+        addTerm(`⚠️ ROLLBACK ${m.hostname||m.id}: v${m.bad} crashed, restored v${m.to}. That version will NOT be re-pushed — fix the build first.`,"err");
+        fetchAgents();
+      }
       else if(m.type==="mouse"){ $("mousePos").textContent=m.x+","+m.y; if(m.id===(selected&&selected.id)) positionRemoteCursor(m.x,m.y); }
       else if(m.type==="filelist"){ renderFileList(m.isRemote?"remoteList":"localList", m.data);}
       else if(m.type==="audiolist"){ renderAudioDevices(m.data); }
@@ -595,8 +609,15 @@ function fetchStatus(){
 // Single merge point for the Connections list, used by WS pushes AND the
 // periodic HTTP poll below — so a missed push can never leave the list
 // stuck empty while agents are connected.
+let seenRB={}; // rollback alarms already raised, keyed id+bad version
 function mergeAgents(incoming){
   const byId={}; (incoming||[]).forEach(a=>{ if(a&&a.id) byId[a.id]=a; });
+  (incoming||[]).forEach(a=>{
+    if(a&&a.id&&a.rollbackBad){
+      const k=a.id+"@"+a.rollbackBad;
+      if(!seenRB[k]){ seenRB[k]=true; toast(`⚠️ ${a.hostname||a.id} rolled back: v${a.rollbackBad} crashed, restored v${a.rollbackTo||"?"} — held back`,"err"); addTerm(`⚠️ ROLLBACK ${a.hostname||a.id}: v${a.rollbackBad} crashed, restored v${a.rollbackTo||"?"}. That version will NOT be re-pushed — fix the build first.`,"err"); }
+    }
+  });
   agents.forEach(a=>{ if(a.id.startsWith("manual-")||a.id.startsWith("conn-")){ if(!byId[a.id]) byId[a.id]=a; } });
   // Drop server entries that vanished (stale disconnects), keep manual ones
   agents=Object.values(byId);
@@ -1189,6 +1210,19 @@ $("fpsSel").onchange=()=>{
   if(streaming) topUpShots();
 };
 $("qualitySel").onchange=()=>{ qualityTouched=true; addConsole("Quality manual: "+$("qualitySel").value); if(streaming) topUpShots(); };
+// Auto-update agents: push the bundled version on outdated check-in.
+function refreshAutoUpd(){
+  fetch("/api/auto-update").then(r=>r.json()).then(j=>{
+    const t=$("autoUpdToggle"); if(t&&t.querySelector("input")) t.querySelector("input").checked=!!j.enabled;
+  }).catch(()=>{});
+}
+refreshAutoUpd();
+$("autoUpdToggle").onclick=()=>{
+  const box=$("autoUpdToggle").querySelector("input"); const want=box?box.checked:false;
+  fetch("/api/auto-update",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({enabled:want})})
+    .then(r=>r.json()).then(j=>{ addTerm("Auto-update "+(j.enabled?"ON — outdated agents update on check-in":"OFF"),"out"); toast("Auto-update "+(j.enabled?"on":"off")); })
+    .catch(e=>addTerm("Auto-update toggle failed: "+(e.message||e),"err"));
+};
 
 $("audioStart").onclick=()=>{ if(!selected){ toast("No agent", "err"); return; } sendCmdVal("get-audio-devices"); sendCmdVal("start-audio-stream "+audioSrc); addConsole("Audio streaming requested ("+audioSrc+") — plays on your ["+localOutName()+"] (~1s delay)"); $("audioStart").disabled=true; $("audioStop").disabled=false; };
 $("audioStop").onclick=()=>{ if(selected) sendCmdVal("stop-audio-stream"); stopLocalPlayback(); addConsole("Audio stream stopped"); $("audioStart").disabled=false; $("audioStop").disabled=true; };

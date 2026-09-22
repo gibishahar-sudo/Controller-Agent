@@ -400,6 +400,21 @@ func instanceID() string {
 	return fmt.Sprintf("%s-%d", hn, os.Getpid())
 }
 
+// rollbackNotice, when non-nil, reports a watchdog-executed rollback of a
+// crash-looping update. Attached to every hello so the controller alarms
+// and holds back the bad version.
+var rollbackNotice *commands.RollbackNotice
+
+// helloMsg builds the TypeConnect announcement, carrying any rollback report.
+func helloMsg(hn, user string) protocol.Message {
+	m := protocol.Message{Type: protocol.TypeConnect, Hostname: hn, User: user, Instance: instanceID(), Version: version.DesktopAgentVersion}
+	if rollbackNotice != nil {
+		m.RollbackBad = rollbackNotice.Bad
+		m.RollbackTo = rollbackNotice.To
+	}
+	return m
+}
+
 func hostnameAndUser() (string, string) {
 	hn, _ := os.Hostname()
 	if hn == "" {
@@ -598,7 +613,7 @@ func (a *agent) connectOnce() error {
 
 	// Send connect
 	hn, user := hostnameAndUser()
-	if err := a.send(protocol.Message{Type: protocol.TypeConnect, Hostname: hn, User: user, Instance: instanceID(), Version: version.DesktopAgentVersion}); err != nil {
+	if err := a.send(helloMsg(hn, user)); err != nil {
 		conn.Close()
 		return fmt.Errorf("send connect: %w", err)
 	}
@@ -822,7 +837,7 @@ func (a *agent) connectViaNtfy() error {
 		log.Printf("[*] E2E unavailable (%v), relay payloads stay plaintext", err)
 	}
 	announce := func() {
-		_ = relay.PublishTo(me, "controller", protocol.Message{Type: protocol.TypeConnect, Hostname: hn, User: user, Instance: instanceID(), Version: version.DesktopAgentVersion})
+		_ = relay.PublishTo(me, "controller", helloMsg(hn, user))
 		if wrapped, ok := commands.E2EWrapped(); ok {
 			_ = relay.PublishTo(me, "controller", protocol.Message{Type: protocol.TypeKeyExchange, Hostname: hn, Instance: instanceID(), Data: wrapped})
 		}
@@ -1147,7 +1162,7 @@ func relayListenOnce(a *agent, hn, user, me, caFile string) error {
 		return err
 	}
 	announce := func() {
-		_ = bus.Publish("hello", relay.Envelope{From: me, To: "", Payload: mustJSON(protocol.Message{Type: protocol.TypeConnect, Hostname: hn, User: user, Instance: instanceID(), Version: version.DesktopAgentVersion}), Time: nowMillis()})
+		_ = bus.Publish("hello", relay.Envelope{From: me, To: "", Payload: mustJSON(helloMsg(hn, user)), Time: nowMillis()})
 		if wrapped, ok := commands.E2EWrapped(); ok {
 			_ = bus.Publish("out/"+hn, relay.Envelope{From: me, To: "controller", Payload: mustJSON(protocol.Message{Type: protocol.TypeKeyExchange, Hostname: hn, Instance: instanceID(), Data: wrapped}), Time: nowMillis()})
 		}
@@ -1304,7 +1319,7 @@ func (a *agent) connectViaMQTT() error {
 	}
 
 	announce := func() {
-		if err := bus.Publish("hello", relay.Envelope{From: me, To: "", Payload: mustJSON(protocol.Message{Type: protocol.TypeConnect, Hostname: hn, User: user, Instance: instanceID(), Version: version.DesktopAgentVersion}), Time: nowMillis()}); err != nil {
+		if err := bus.Publish("hello", relay.Envelope{From: me, To: "", Payload: mustJSON(helloMsg(hn, user)), Time: nowMillis()}); err != nil {
 			dlog.Printf("[listen] announce failed: %v", err)
 			return
 		}
@@ -1525,6 +1540,12 @@ func main() {
 	healthyStop := make(chan struct{})
 	defer close(healthyStop)
 	go startHealthyHeartbeat(healthyStop)
+	// Crash-rollback reporting: if the watchdog restored the previous
+	// binary after a crash loop, tell the controller on every hello.
+	rollbackNotice = commands.LoadRollbackNotice()
+	// Update self-confirm: surviving 90s clears the prev backup + pending
+	// claim; crashing first leaves them for the watchdog to roll back.
+	go commands.ConfirmUpdate()
 
 	if *showHelp {
 		flag.Usage()

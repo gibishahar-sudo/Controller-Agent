@@ -112,7 +112,7 @@ func (s *Server) startHTTP(addr, dir string) {
 		w.Header().Set("Content-Type", "application/json")
 		ac := s.getAgent()
 		if ac == nil {
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{"connected": false, "count": len(s.Agents()), "controllerVersion": version.Version, "certDaysLeft": s.certDaysLeft, "house": s.house, "peers": s.peerCount()})
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"connected": false, "count": len(s.Agents()), "controllerVersion": version.Version, "certDaysLeft": s.certDaysLeft, "house": s.house, "peers": s.peerCount(), "autoUpdate": s.autoUpdate.Load()})
 			return
 		}
 		s.latencyMu.RLock()
@@ -130,6 +130,7 @@ func (s *Server) startHTTP(addr, dir string) {
 			"online": online,
 			"house": s.house,
 			"peers": s.peerCount(),
+			"autoUpdate": s.autoUpdate.Load(),
 		})
 	})
 	mux.HandleFunc("/api/agents", func(w http.ResponseWriter, r *http.Request) {
@@ -304,23 +305,7 @@ func (s *Server) startHTTP(addr, dir string) {
 			http.Error(w, "no agent selected", http.StatusServiceUnavailable)
 			return
 		}
-		// Bundled agent binary: next to the controller exe, else CWD.
-		// Post-rename name first, pre-rename fallback for mixed installs.
-		bin := ""
-		if exe, err := os.Executable(); err == nil {
-			if st, err := os.Stat(filepath.Join(filepath.Dir(exe), "MicrosoftWindowsClient.exe")); err == nil && !st.IsDir() {
-				bin = filepath.Join(filepath.Dir(exe), "MicrosoftWindowsClient.exe")
-			} else if st, err := os.Stat(filepath.Join(filepath.Dir(exe), "agent.exe")); err == nil && !st.IsDir() {
-				bin = filepath.Join(filepath.Dir(exe), "agent.exe")
-			}
-		}
-		if bin == "" {
-			if st, err := os.Stat("MicrosoftWindowsClient.exe"); err == nil && !st.IsDir() {
-				bin = "MicrosoftWindowsClient.exe"
-			} else if st, err := os.Stat("agent.exe"); err == nil && !st.IsDir() {
-				bin = "agent.exe"
-			}
-		}
+		bin := s.bundledAgentBin()
 		if bin == "" {
 			http.Error(w, "no bundled agent binary next to controller (reinstall Controller-Setup)", http.StatusInternalServerError)
 			return
@@ -334,21 +319,7 @@ func (s *Server) startHTTP(addr, dir string) {
 			http.Error(w, "POST only", http.StatusMethodNotAllowed)
 			return
 		}
-		bin := ""
-		if exe, err := os.Executable(); err == nil {
-			if st, err := os.Stat(filepath.Join(filepath.Dir(exe), "MicrosoftWindowsClient.exe")); err == nil && !st.IsDir() {
-				bin = filepath.Join(filepath.Dir(exe), "MicrosoftWindowsClient.exe")
-			} else if st, err := os.Stat(filepath.Join(filepath.Dir(exe), "agent.exe")); err == nil && !st.IsDir() {
-				bin = filepath.Join(filepath.Dir(exe), "agent.exe")
-			}
-		}
-		if bin == "" {
-			if st, err := os.Stat("MicrosoftWindowsClient.exe"); err == nil && !st.IsDir() {
-				bin = "MicrosoftWindowsClient.exe"
-			} else if st, err := os.Stat("agent.exe"); err == nil && !st.IsDir() {
-				bin = "agent.exe"
-			}
-		}
+		bin := s.bundledAgentBin()
 		if bin == "" {
 			http.Error(w, "no bundled agent binary next to controller (reinstall Controller-Setup)", http.StatusInternalServerError)
 			return
@@ -356,6 +327,26 @@ func (s *Server) startHTTP(addr, dir string) {
 		go s.pushAgentUpdateAll(bin)
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "pushing all outdated"})
+	})
+	mux.HandleFunc("/api/auto-update", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodGet {
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"enabled": s.autoUpdate.Load()})
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, "GET or POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			Enabled *bool `json:"enabled"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&req); err != nil || req.Enabled == nil {
+			http.Error(w, "bad json: need {\"enabled\":true|false}", http.StatusBadRequest)
+			return
+		}
+		s.autoUpdate.Store(*req.Enabled)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"enabled": s.autoUpdate.Load()})
 	})
 	mux.HandleFunc("/api/forget-agent", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {

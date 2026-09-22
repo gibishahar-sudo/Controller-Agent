@@ -43,6 +43,12 @@ type Message struct {
 	UpdateSHA   string `json:"updateSHA,omitempty"`
 	UpdateTotal int    `json:"updateTotal,omitempty"`
 	UpdateSeq   int    `json:"updateSeq,omitempty"`
+	// Crash-rollback report (in TypeConnect/hello): the watchdog restored
+	// the previous binary after the new one crash-looped. RollbackBad is
+	// the crashed version, RollbackTo the restored one. The controller
+	// raises an alarm and holds back re-pushing the bad version.
+	RollbackBad string `json:"rollbackBad,omitempty"`
+	RollbackTo  string `json:"rollbackTo,omitempty"`
 }
 
 // FileEntry mirrors the Files tab JSON shape.
