@@ -313,7 +313,7 @@ func StartAudioStream(source string) (string, error) {
 	}
 	fmt.Printf("[audio-stream] publishing via %s\n", bus.Broker())
 	script := captureSnippet + fmt.Sprintf("[RmmCap]::Capture(%d, %d)", flow, loopback)
-	cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-command", script)
+	cmd := hideWindow(exec.Command("powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-command", script))
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		bus.Close()

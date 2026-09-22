@@ -1617,7 +1617,7 @@ function b64ToBytes(b64){ const s=atob(b64||""); const b=new Uint8Array(s.length
 async function sha256hex(bytes){ const d=await crypto.subtle.digest("SHA-256",bytes); return [...new Uint8Array(d)].map(x=>x.toString(16).padStart(2,"0")).join(""); }
 function setXfer(pct,label){ $("transferBar").style.width=pct+"%"; $("transferLabel").textContent=label; }
 // Chunk sizes mirror the controller's fileChunkRaw table — keep in sync.
-function xferChunkRaw(a){ const r=(a&&a.remote)||""; if(r==="mqtt") return 256*1024; if(r==="ntfy") return 8*1024; return 512*1024; }
+function xferChunkRaw(a){ const r=(a&&a.remote)||""; if(r==="mqtt") return 128*1024; if(r==="ntfy") return 2*1024; return 512*1024; }
 function xferPace(a){ const r=(a&&a.remote)||""; if(r==="ntfy") return 150; if(r==="mqtt") return 5; return 0; }
 let dlSession=null; // {id,path,saveName,total,size,sha,chunks:Map,retries,timer,mode,kind}
 let dlQueue=[]; // queued browser downloads {path,saveName}

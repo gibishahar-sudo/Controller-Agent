@@ -686,15 +686,16 @@ func (s *Server) bundledAgentBin() string {
 	return ""
 }
 
-// fileChunkRaw sizes one file-transfer chunk per transport (mirrors the
-// update path: direct is roomy, relays are capped). Bumped mqtt 128→256KB
-// in 1.41.2 so PNG previews (and all file transfers) need half the chunks.
+// fileChunkRaw sizes one file-transfer chunk per transport. HARD LIMITS:
+// ntfy.sh rejects messages over 4096 bytes, so ntfy chunks stay at 2KB raw
+// (~2.7KB base64 + envelope ≈ 3KB total — do NOT raise this). MQTT is roomy
+// (HiveMQ verified ≥100KB) but 128KB keeps loss blast radius small.
 func fileChunkRaw(ac *AgentConn) int {
 	switch ac.transport() {
 	case "mqtt":
-		return 256 * 1024
+		return 128 * 1024
 	case "ntfy":
-		return 8 * 1024
+		return 2 * 1024
 	default:
 		return 512 * 1024
 	}
@@ -1047,12 +1048,14 @@ func (s *Server) pushAgentUpdate(ac *AgentConn, bin string) bool {
 		// Big chunks + 4 parallel lanes: chunk reassembly is
 		// order-tolerant, so lanes multiply throughput instead of
 		// paying one broker RTT per chunk.
-		chunkRaw = 256 * 1024
+		chunkRaw = 128 * 1024
 		pacing = 15 * time.Millisecond
 		haveTimeout = 10 * time.Second
 		lanes = 4
 	case "ntfy":
-		chunkRaw = 4 * 1024
+		// 2KB raw: ntfy.sh hard-rejects messages over 4096 bytes
+		// (base64 + envelope must fit — do NOT raise this).
+		chunkRaw = 2 * 1024
 		pacing = 500 * time.Millisecond
 		haveTimeout = 30 * time.Second
 		slowWarn = " (ntfy is slow even gzipped — direct/MQTT preferred)"

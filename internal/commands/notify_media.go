@@ -106,7 +106,7 @@ func killSpeakChild() {
 		return
 	}
 	if pid, err := strconv.Atoi(strings.TrimSpace(string(b))); err == nil && pid > 0 {
-		_ = exec.Command("taskkill", "/F", "/PID", strconv.Itoa(pid)).Run()
+		_ = hideWindow(exec.Command("taskkill", "/F", "/PID", strconv.Itoa(pid))).Run()
 	}
 	_ = os.Remove(speakPidFile())
 }

