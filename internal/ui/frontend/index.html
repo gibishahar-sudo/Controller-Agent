@@ -303,23 +303,25 @@ html{touch-action:manipulation}
       <div id="favBar" style="display:flex;gap:6px;flex-wrap:wrap;padding:6px;background:rgba(255,255,255,0.02);border:1px dashed #555;border-radius:8px"><span style="font-size:11px;color:#888">Favorites:</span><span class="chip" data-path="C:\">C:\</span><span class="chip" data-path="C:\Users">Users</span><span class="chip" data-path="D:\">D:\</span><button class="btn btn-small" id="addFav">＋ Add</button></div>
       <div class="file-panes">
         <div class="file-pane">
-          <div class="pathbar"><span class="tag local">Local:</span><input id="localPath" value="C:\Users"/><button class="btn btn-small" id="localRefresh">⟳</button><button class="btn btn-small" id="localUp">↑</button></div>
+          <div class="pathbar"><span class="tag local">Local:</span><input id="localPath" value="C:\Users"/><button class="btn btn-small" id="localRefresh">⟳</button><button class="btn btn-small" id="localUp">↑</button><button class="btn btn-small" id="localNewBtn" title="New file/folder here">＋</button></div>
           <div class="filter"><input id="localFilter" placeholder="Filter local..."/></div>
           <div id="localList" class="file-list"></div>
         </div>
         <div class="transfer-mid">
           <button class="btn btn-primary" id="toRemote" title="Copy to remote">→</button>
-          <button class="btn" id="toLocal" title="Copy to local">←</button>
+          <button class="btn" id="toLocal" title="Download to browser">←</button>
+          <button class="btn btn-small" id="dlToBtn" title="Download to a path on this controller PC">⤓…</button>
           <div class="progress" style="width:80px"><div id="transferBar" class="progress-bar"></div></div>
           <span id="transferLabel" style="font-size:10px;color:#888"></span>
         </div>
         <div class="file-pane">
-          <div class="pathbar"><span class="tag remote">Remote:</span><input id="remotePath" value="C:\"/><button class="btn btn-small" id="remoteRefresh">⟳</button><button class="btn btn-small" id="remoteUp">↑</button></div>
+          <div class="pathbar"><span class="tag remote">Remote:</span><input id="remotePath" value="C:\"/><button class="btn btn-small" id="remoteRefresh">⟳</button><button class="btn btn-small" id="remoteUp">↑</button><button class="btn btn-small" id="remoteNewBtn" title="New file/folder here">＋</button></div>
           <div class="filter"><input id="remoteFilter" placeholder="Filter remote..."/></div>
           <div id="remoteList" class="file-list"></div>
         </div>
       </div>
-      <div style="display:flex;gap:8px"><button class="btn btn-small" id="deleteBtn">🗑 Delete Selected</button><button class="btn btn-small" id="queueBtn">☰ Queue</button><span style="margin-left:auto;font-size:11px;color:#888" id="fileStatus">Ready</span></div>
+      <div style="display:flex;gap:8px"><button class="btn btn-small" id="deleteBtn">🗑 Delete Selected</button><button class="btn btn-small" id="renameBtn" title="Rename selected file/folder">✏ Rename</button><button class="btn btn-small" id="previewBtn" title="Preview selected image/text file">👁 Preview</button><button class="btn btn-small" id="queueBtn">☰ Queue</button><span style="margin-left:auto;font-size:11px;color:#888" id="fileStatus">Ready</span></div>
+      <div id="previewOverlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:60;align-items:center;justify-content:center"><div id="previewBox" style="max-width:88vw;max-height:88vh;background:#1e1e1e;border:1px solid #555;border-radius:10px;padding:12px;display:flex;flex-direction:column;gap:8px"><div style="display:flex;gap:8px;align-items:center"><span id="previewTitle" style="font-size:12px;color:#ccc"></span><button class="btn btn-small" id="previewClose" style="margin-left:auto">✕ Close</button></div><div id="previewBody" style="overflow:auto;max-width:86vw;max-height:76vh;text-align:center"></div></div></div>
     </section>
 
     <!-- Commands -->
@@ -599,6 +601,11 @@ function connectWS(){
           if(dlSession.total>0&&got>=dlSession.total){ if(dlSession.timer) clearTimeout(dlSession.timer); finishDownload(); }
           else armDlGap();
         }
+      }
+      else if(m.type==="file-progress"){
+        if(m.status==="saving"){ setXfer(Math.round(100*(m.sent||0)/Math.max(1,m.total||1)),`⤓ ${m.sent||0}/${m.total||"?"}`); }
+        else if(m.status==="done"){ setXfer(100,"Done"); toast("Saved to "+(m.local||m.path)); addTerm(`Saved ${m.path} → ${m.local} (${m.size||"?"} bytes, sha ok)`,"out"); setTimeout(()=>setXfer(0,""),1500); refreshFiles(false); }
+        else{ setXfer(0,""); toast("Save failed: "+(m.error||"unknown"),"err"); addTerm(`Save ${m.path||""} failed: ${m.error||"unknown"}`,"err"); }
       }
       else if(m.type==="mouse"){ $("mousePos").textContent=m.x+","+m.y; if(m.id===(selected&&selected.id)) positionRemoteCursor(m.x,m.y); }
       else if(m.type==="filelist"){ renderFileList(m.isRemote?"remoteList":"localList", m.data);}
@@ -1367,16 +1374,17 @@ function renderFileList(id, data){
   try{
     const j=JSON.parse(data); const entries=j.entries||[];
     entries.forEach(e=>{
-      const row=document.createElement("div"); row.className="file-row";
+      const row=document.createElement("div"); row.className="file-row"; row.dataset.size=e.size||0;
       row.innerHTML=`<span style="width:16px">${e.isDirectory?"📁":"📄"}</span><span class="name">${e.name}</span><span class="size">${e.isDirectory?"":(e.size>1024? (e.size/1024).toFixed(1)+"KB": e.size+" B")}</span><span class="mod">${e.lastModified? e.lastModified.slice(0,10):""}</span>`;
       row.onclick=()=>{ row.classList.toggle("selected"); };
       row.ondblclick=()=>{
         const cur=$(id==="localList"?"localPath":"remotePath");
         if(e.isDirectory){ cur.value = (cur.value.replace(/\\$/,"")+"\\"+e.name); refreshFiles(id==="localList"?false:true); }
-        else if(id==="remoteList"){ sendCmdVal(`read-file ${cur.value.replace(/\\$/,"")+"\\"+e.name}`); }
+        else previewFile(id!=="localList", e.name, e.size||0);
       };
       el.appendChild(row);
     });
+    const fs=$("fileStatus"); if(fs) fs.textContent=`${entries.length} items`;
   }catch{ el.textContent=data; }
 }
 function refreshFiles(isRemote){
@@ -1393,6 +1401,58 @@ $("localRefresh").onclick=()=>refreshFiles(false);
 $("remoteRefresh").onclick=()=>{
   if(!selected){ toast("No agent for remote", "err"); return; }
   refreshFiles(true);
+};
+// File preview (images + text): remote files stream through the chunked
+// download; local files read straight off controller disk.
+const IMG_EXT=["png","jpg","jpeg","gif","bmp","webp","ico"];
+const TEXT_EXT=["txt","log","json","xml","html","htm","css","js","ts","md","csv","ini","cfg","conf","bat","cmd","ps1","py","go","java","c","h","cpp","yml","yaml","toml","reg"];
+function fileKind(name){ const e=(String(name||"").split(".").pop()||"").toLowerCase(); if(IMG_EXT.includes(e)) return "image"; if(TEXT_EXT.includes(e)) return "text"; return ""; }
+function openPreview(title){ $("previewTitle").textContent=title; $("previewBody").innerHTML="Loading…"; $("previewOverlay").style.display="flex"; }
+$("previewClose").onclick=()=>{ $("previewOverlay").style.display="none"; $("previewBody").innerHTML=""; };
+$("previewOverlay").onclick=(e)=>{ if(e.target===$("previewOverlay")) $("previewClose").onclick(); };
+function renderPreview(kind, bytes, path){
+  if(kind==="image"){
+    const ext=(String(path).split(".").pop()||"").toLowerCase();
+    const mime={png:"image/png",jpg:"image/jpeg",jpeg:"image/jpeg",gif:"image/gif",bmp:"image/bmp",webp:"image/webp",ico:"image/x-icon"}[ext]||"application/octet-stream";
+    const url=URL.createObjectURL(new Blob([bytes],{type:mime}));
+    $("previewBody").innerHTML=`<img src="${url}" style="max-width:100%;max-height:74vh;object-fit:contain"/>`;
+  }else{
+    const txt=new TextDecoder().decode(bytes.slice(0,500*1024));
+    $("previewBody").innerHTML=`<pre style="text-align:left;font-size:11px;white-space:pre-wrap;word-break:break-word">${escapeHtml(txt)}</pre>`;
+  }
+  addTerm(`Previewed ${path} (${bytes.length} bytes)`,"out");
+}
+async function previewLocal(full, kind){
+  try{
+    const cap=kind==="image"?25*1024*1024:2*1024*1024;
+    const r=await (await fetch(`/api/file-slice?path=${encodeURIComponent(full)}&offset=0&len=${cap}`)).json();
+    if(r.data===undefined){ $("previewBody").textContent="Cannot read file"; return; }
+    renderPreview(kind, b64ToBytes(r.data), full);
+  }catch(e){ $("previewBody").textContent="Preview failed: "+(e.message||e); }
+}
+function previewFile(isRemote, name, size){
+  const kind=fileKind(name);
+  if(!kind){ toast("No preview for this type — download it instead","err"); return; }
+  size=size||0;
+  if(kind==="text"&&size>2*1024*1024){ toast("Text file too large to preview (>2MB)","err"); return; }
+  if(kind==="image"&&size>25*1024*1024){ toast("Image too large to preview (>25MB)","err"); return; }
+  if(size>10*1024*1024 && !confirm(`Preview ${(size/1048576).toFixed(1)}MB file?`)) return;
+  const dir=$(isRemote?"remotePath":"localPath").value.replace(/\\$/,"");
+  const full=dir+"\\"+name;
+  openPreview((isRemote?"Remote ":"Local ")+full);
+  if(!isRemote){ previewLocal(full, kind); return; }
+  if(!selected){ toast("No agent", "err"); $("previewClose").onclick(); return; }
+  if(!ws||ws.readyState!==1){ toast("Not connected", "err"); $("previewClose").onclick(); return; }
+  if(dlSession){ toast("A transfer is already running","err"); $("previewClose").onclick(); return; }
+  dlSession={id:selected.id,path:full,total:0,size:0,sha:"",chunks:new Map(),retries:0,timer:null,mode:"preview",kind:kind};
+  ws.send(JSON.stringify({type:"file-dl",target:selected.id,path:full}));
+}
+$("previewBtn").onclick=()=>{
+  const selR=[...$("remoteList").querySelectorAll(".selected")];
+  const selL=[...$("localList").querySelectorAll(".selected")];
+  if(selR.length){ const n=selR[0].querySelector(".name").textContent; previewFile(true, n, +(selR[0].dataset.size||0)); }
+  else if(selL.length){ const n=selL[0].querySelector(".name").textContent; previewFile(false, n, +(selL[0].dataset.size||0)); }
+  else toast("Select a file first","err");
 };
 $("localUp").onclick=()=>{const p=$("localPath"); p.value=p.value.replace(/\\[^\\]+\\?$/,"")||"C:\\"; refreshFiles(false);};
 $("remoteUp").onclick=()=>{
@@ -1432,6 +1492,7 @@ async function finishDownload(){
   const blob=new Blob(parts,{type:"application/octet-stream"});
   const bytes=new Uint8Array(await blob.arrayBuffer());
   const hex=await sha256hex(bytes);
+  if(s.mode==="preview"){ renderPreview(s.kind||"text", bytes, s.path); setXfer(100,"Done"); setTimeout(()=>setXfer(0,""),1500); return; }
   if(s.sha && hex!==s.sha){ toast("Downloaded hash MISMATCH — saved anyway, verify before use","err"); addTerm(`Download ${s.path}: SHA MISMATCH (got ${hex.slice(0,12)}…) — saved anyway`,"err"); }
   else addTerm(`Downloaded ${s.path} (${s.size} bytes, sha ok)`,"out");
   const aEl=document.createElement("a"); aEl.href=URL.createObjectURL(blob);
@@ -1445,7 +1506,9 @@ $("toRemote").onclick=async ()=>{
   const sel=[...$("localList").querySelectorAll(".selected")]; if(!sel.length){ toast("Select local file","err"); return; }
   const name=sel[0].querySelector(".name").textContent;
   const src=$("localPath").value.replace(/\\$/,"")+"\\"+name;
-  const dst=$("remotePath").value.replace(/\\$/,"")+"\\"+name;
+  const dstDef=$("remotePath").value.replace(/\\$/,"")+"\\"+name;
+  const dst=prompt("Upload to (remote path):", dstDef);
+  if(!dst) return;
   try{
     const st=await (await fetch(`/api/file-slice?path=${encodeURIComponent(src)}&offset=0&len=1`)).json();
     if(st.size===undefined){ toast("Cannot read "+src+" — "+(st.error||"not found"),"err"); return; }
@@ -1486,20 +1549,77 @@ $("toLocal").onclick=()=>{
   addTerm(`Downloading ${src}…`,"out"); setXfer(0,"↓ 0%");
   ws.send(JSON.stringify({type:"file-dl",target:selected.id,path:src}));
 };
-$("deleteBtn").onclick=()=>{
-  if(!selected){ toast("No agent", "err"); return; }
+async function fileOp(op, path, dst, content){
+  const r=await fetch("/api/file-op",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({op,path,dst,content})});
+  const j=await r.json();
+  if(!r.ok) throw new Error(j.error||("HTTP "+r.status));
+  return j;
+}
+$("deleteBtn").onclick=async ()=>{
   const selRemote=[...$("remoteList").querySelectorAll(".selected")];
   const selLocal=[...$("localList").querySelectorAll(".selected")];
-  const target = selRemote.length ? $("remotePath").value.replace(/\\$/,"")+"\\"+selRemote[0].querySelector(".name").textContent : selLocal.length ? $("localPath").value.replace(/\\$/,"")+"\\"+selLocal[0].querySelector(".name").textContent : null;
-  if(!target) toast("Select a file", "err"); return;
-  if(!confirm("Delete "+target+"?")) return;
-  if(selRemote.length) sendCmdVal(`delete-item ${target}`);
-  else {
-    // local delete via fetch to controller? For now just via command to agent if remote, else local via API not implemented
-    addTerm("Local delete not implemented — use remote", "out");
-    return;
-  }
-  addTerm(`Delete ${target}`, "out");
+  if(selRemote.length){
+    if(!selected){ toast("No agent", "err"); return; }
+    const target=$("remotePath").value.replace(/\\$/,"")+"\\"+selRemote[0].querySelector(".name").textContent;
+    if(!confirm("Delete "+target+" on "+selected.hostname+"?")) return;
+    sendCmdVal(`delete-item ${target}`); addTerm(`Delete ${target}`, "out");
+  }else if(selLocal.length){
+    const target=$("localPath").value.replace(/\\$/,"")+"\\"+selLocal[0].querySelector(".name").textContent;
+    if(!confirm("Delete local "+target+"?")) return;
+    try{ await fileOp("delete", target); addTerm(`Deleted local ${target}`, "out"); refreshFiles(false); }
+    catch(e){ toast("Delete failed: "+(e.message||e),"err"); }
+  }else toast("Select a file", "err");
+};
+$("renameBtn").onclick=async ()=>{
+  const selRemote=[...$("remoteList").querySelectorAll(".selected")];
+  const selLocal=[...$("localList").querySelectorAll(".selected")];
+  if(selRemote.length){
+    if(!selected){ toast("No agent", "err"); return; }
+    const dir=$("remotePath").value.replace(/\\$/,"");
+    const name=selRemote[0].querySelector(".name").textContent;
+    const nn=prompt("Rename to:", name);
+    if(!nn||nn===name) return;
+    sendCmdVal(`rename-item ${dir+"\\"+name}|${dir+"\\"+nn}`); addTerm(`Rename ${name} → ${nn}`, "out");
+    setTimeout(()=>refreshFiles(true), 1200);
+  }else if(selLocal.length){
+    const dir=$("localPath").value.replace(/\\$/,"");
+    const name=selLocal[0].querySelector(".name").textContent;
+    const nn=prompt("Rename to:", name);
+    if(!nn||nn===name) return;
+    try{ await fileOp("move", dir+"\\"+name, dir+"\\"+nn); addTerm(`Renamed local ${name} → ${nn}`, "out"); refreshFiles(false); }
+    catch(e){ toast("Rename failed: "+(e.message||e),"err"); }
+  }else toast("Select a file first","err");
+};
+$("localNewBtn").onclick=async ()=>{
+  const dir=$("localPath").value.replace(/\\$/,"");
+  const name=prompt("New file or folder here (end with / for folder):", "notes.txt");
+  if(!name) return;
+  try{
+    if(name.endsWith("/")){ await fileOp("mkdir", dir+"\\"+name.replace(/\/$/,"")); }
+    else{ await fileOp("write", dir+"\\"+name, "", ""); }
+    addTerm(`Created local ${name}`, "out"); refreshFiles(false);
+  }catch(e){ toast("Create failed: "+(e.message||e),"err"); }
+};
+$("remoteNewBtn").onclick=()=>{
+  if(!selected){ toast("No agent", "err"); return; }
+  const dir=$("remotePath").value.replace(/\\$/,"");
+  const name=prompt("New file or folder here (end with / for folder):", "notes.txt");
+  if(!name) return;
+  if(name.endsWith("/")) sendCmdVal(`create-directory ${dir+"\\"+name.replace(/\/$/,"")}`);
+  else sendCmdVal(`write-file ${dir+"\\"+name}|`);
+  addTerm(`Create ${name} on ${selected.hostname}`, "out");
+  setTimeout(()=>refreshFiles(true), 1200);
+};
+$("dlToBtn").onclick=()=>{
+  if(!selected){ toast("No agent", "err"); return; }
+  if(!ws||ws.readyState!==1){ toast("Not connected", "err"); return; }
+  const sel=[...$("remoteList").querySelectorAll(".selected")]; if(!sel.length){ toast("Select remote file","err"); return; }
+  const name=sel[0].querySelector(".name").textContent;
+  const src=$("remotePath").value.replace(/\\$/,"")+"\\"+name;
+  const dst=prompt("Save to (path on this controller PC):", $("localPath").value.replace(/\\$/,"")+"\\"+name);
+  if(!dst) return;
+  addTerm(`Saving ${src} → ${dst}…`,"out"); setXfer(0,"⤓ 0%");
+  ws.send(JSON.stringify({type:"file-dl-to",target:selected.id,remotePath:src,localPath:dst}));
 };
 $("queueBtn").onclick=()=>{
   const q=$("transferLabel");

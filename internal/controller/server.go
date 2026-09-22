@@ -234,6 +234,11 @@ type Server struct {
 	updateHave map[string]haveReport
 	haveMu     sync.Mutex
 
+	// Server-side download sessions ("save to a path on this PC"),
+	// keyed by agent id + NUL + remote path.
+	dlTo   map[string]*dlToSession
+	dlToMu sync.Mutex
+
 	// Agent registration token (Track B): agents presenting a wrong token
 	// are rejected; empty-token agents are accepted as untrusted unless
 	// enforcement is on.
@@ -660,6 +665,133 @@ func fileChunkRaw(ac *AgentConn) int {
 		return 4 * 1024
 	default:
 		return 512 * 1024
+	}
+}
+
+// dlToSession is a server-side download: agent chunks land straight in a
+// controller-local .part file (for "save to a path on this PC"), renamed
+// into place on completion. Keyed by agent id + remote path.
+type dlToSession struct {
+	localPath string
+	part      string
+	chunkRaw  int
+	total     int
+	size      int64
+	sha       string
+	have      map[int]bool
+}
+
+func (s *Server) dlToKey(id, remote string) string { return id + "\x00" + remote }
+
+// startDlTo begins a server-side save (replaces any prior one for the same
+// file) and kicks the agent streaming.
+func (s *Server) startDlTo(ac *AgentConn, remote, local string) {
+	chunkRaw := fileChunkRaw(ac)
+	_ = os.MkdirAll(filepath.Dir(local), 0755)
+	s.dlToMu.Lock()
+	if s.dlTo == nil {
+		s.dlTo = map[string]*dlToSession{}
+	}
+	s.dlTo[s.dlToKey(ac.id, remote)] = &dlToSession{
+		localPath: local, part: local + ".part",
+		chunkRaw: chunkRaw, have: map[int]bool{},
+	}
+	s.dlToMu.Unlock()
+	_ = os.Remove(local + ".part")
+	_ = s.sendToAgent(ac, protocol.Message{Type: protocol.TypeFileDlReq, FilePath: remote, FileFrom: 0, FileChunk: chunkRaw})
+}
+
+// handleFileDlChunk fans one agent chunk out to the browser AND feeds any
+// active server-side save session for the same file.
+func (s *Server) handleFileDlChunk(id string, msg protocol.Message) {
+	s.dlToMu.Lock()
+	sess := s.dlTo[s.dlToKey(id, msg.FilePath)]
+	s.dlToMu.Unlock()
+	if sess != nil {
+		s.feedDlTo(id, sess, msg)
+	}
+	s.broadcastWS(map[string]interface{}{"type": "file-chunk", "id": id, "path": msg.FilePath, "seq": msg.FileSeq, "total": msg.FileTotal, "size": msg.FileSize, "sha": msg.FileSHA, "data": msg.Data, "error": msg.Error})
+}
+
+func (s *Server) dlToFail(id string, sess *dlToSession, remote, why string) {
+	s.dlToMu.Lock()
+	delete(s.dlTo, s.dlToKey(id, remote))
+	s.dlToMu.Unlock()
+	_ = os.Remove(sess.part)
+	s.broadcastWS(map[string]interface{}{"type": "file-progress", "id": id, "path": remote, "local": sess.localPath, "status": "failed", "error": why})
+}
+
+func (s *Server) feedDlTo(id string, sess *dlToSession, msg protocol.Message) {
+	if msg.Error != "" {
+		s.dlToFail(id, sess, msg.FilePath, msg.Error)
+		return
+	}
+	if sess.total == 0 && msg.FileTotal > 0 {
+		sess.total = msg.FileTotal
+		sess.size = msg.FileSize
+		sess.sha = msg.FileSHA
+		if int64(sess.total)*int64(sess.chunkRaw) > 300<<20 {
+			s.dlToFail(id, sess, msg.FilePath, "file too large")
+			return
+		}
+	}
+	raw, err := base64.StdEncoding.DecodeString(msg.Data)
+	if err != nil {
+		s.dlToFail(id, sess, msg.FilePath, "bad chunk encoding")
+		return
+	}
+	f, err := os.OpenFile(sess.part, os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		s.dlToFail(id, sess, msg.FilePath, err.Error())
+		return
+	}
+	_, err = f.WriteAt(raw, int64(msg.FileSeq)*int64(sess.chunkRaw))
+	f.Close()
+	if err != nil {
+		s.dlToFail(id, sess, msg.FilePath, err.Error())
+		return
+	}
+	sess.have[msg.FileSeq] = true
+	s.broadcastWS(map[string]interface{}{"type": "file-progress", "id": id, "path": msg.FilePath, "local": sess.localPath, "sent": len(sess.have), "total": sess.total, "status": "saving"})
+	if sess.total > 0 && len(sess.have) >= sess.total {
+		if st, err := os.Stat(sess.part); err != nil || st.Size() != sess.size {
+			s.dlToFail(id, sess, msg.FilePath, "size mismatch")
+			return
+		}
+		if sess.sha != "" {
+			f, err := os.Open(sess.part)
+			if err != nil {
+				s.dlToFail(id, sess, msg.FilePath, err.Error())
+				return
+			}
+			h := sha256.New()
+			buf := make([]byte, 1024*1024)
+			for {
+				n, err := f.Read(buf)
+				if n > 0 {
+					h.Write(buf[:n])
+				}
+				if err != nil {
+					break
+				}
+			}
+			f.Close()
+			if hex.EncodeToString(h.Sum(nil)) != sess.sha {
+				s.dlToFail(id, sess, msg.FilePath, "hash mismatch")
+				return
+			}
+		}
+		_ = os.Remove(sess.localPath)
+		if err := os.Rename(sess.part, sess.localPath); err != nil {
+			s.dlToFail(id, sess, msg.FilePath, err.Error())
+			return
+		}
+		s.dlToMu.Lock()
+		delete(s.dlTo, s.dlToKey(id, msg.FilePath))
+		s.dlToMu.Unlock()
+		log.Printf("[file] saved %s -> %s (%d bytes)", msg.FilePath, sess.localPath, sess.size)
+		s.broadcastWS(map[string]interface{}{"type": "file-progress", "id": id, "path": msg.FilePath, "local": sess.localPath, "sent": sess.total, "total": sess.total, "size": sess.size, "status": "done"})
+		s.broadcastWS(map[string]interface{}{"type": "output", "id": id, "data": fmt.Sprintf("Saved %s -> %s (%d bytes, sha ok)", msg.FilePath, sess.localPath, sess.size), "success": true})
 	}
 }
 
@@ -1684,7 +1816,7 @@ func (s *Server) handleAgent(conn net.Conn, id string) {
 			// via TypeScreen); they stream straight to the UI compositor.
 			s.broadcastWS(map[string]interface{}{"type": "tile", "id": id, "data": msg.Data, "width": msg.Width, "height": msg.Height, "ox": msg.OX, "oy": msg.OY, "format": msg.Format, "fseq": msg.FSeq})
 		case protocol.TypeFileDlChunk:
-			s.broadcastWS(map[string]interface{}{"type": "file-chunk", "id": id, "path": msg.FilePath, "seq": msg.FileSeq, "total": msg.FileTotal, "size": msg.FileSize, "sha": msg.FileSHA, "data": msg.Data, "error": msg.Error})
+			s.handleFileDlChunk(id, msg)
 		case protocol.TypeMouse:
 			s.broadcastWS(map[string]interface{}{"type": "mouse", "id": id, "x": msg.X, "y": msg.Y, "buttons": msg.Buttons})
 		case protocol.TypeOutput:
@@ -1910,7 +2042,7 @@ func (s *Server) ntfyLoop() {
 			case protocol.TypeTile:
 					s.broadcastWS(map[string]interface{}{"type": "tile", "id": id, "data": msg.Data, "width": msg.Width, "height": msg.Height, "ox": msg.OX, "oy": msg.OY, "format": msg.Format, "fseq": msg.FSeq})
 			case protocol.TypeFileDlChunk:
-					s.broadcastWS(map[string]interface{}{"type": "file-chunk", "id": id, "path": msg.FilePath, "seq": msg.FileSeq, "total": msg.FileTotal, "size": msg.FileSize, "sha": msg.FileSHA, "data": msg.Data, "error": msg.Error})
+					s.handleFileDlChunk(id, msg)
 			case protocol.TypeMouse:
 				s.broadcastWS(map[string]interface{}{"type": "mouse", "id": id, "x": msg.X, "y": msg.Y})
 			case protocol.TypePong:
@@ -2317,7 +2449,7 @@ func (s *Server) handleMQTTMsg(topic string, env relay.Envelope) {
   		s.broadcastWS(map[string]interface{}{"type": "screen", "id": id, "data": msg.Data, "width": msg.Width, "height": msg.Height, "ox": msg.OX, "oy": msg.OY, "format": msg.Format, "fseq": msg.FSeq})
   		s.handleScreen(msg, id)
   	case protocol.TypeFileDlChunk:
-  		s.broadcastWS(map[string]interface{}{"type": "file-chunk", "id": id, "path": msg.FilePath, "seq": msg.FileSeq, "total": msg.FileTotal, "size": msg.FileSize, "sha": msg.FileSHA, "data": msg.Data, "error": msg.Error})
+  		s.handleFileDlChunk(id, msg)
  	case protocol.TypeMouse:
 		s.broadcastWS(map[string]interface{}{"type": "mouse", "id": id, "x": msg.X, "y": msg.Y})
 	case protocol.TypePong:

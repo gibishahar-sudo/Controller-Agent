@@ -64,6 +64,80 @@ func (s *Server) startHTTP(addr, dir string) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{"path": p, "entries": out})
 	})
+	// /api/file-op manages controller-local files (the Files tab local
+	// pane): mkdir, delete, move/rename, write (small content, 1MB cap).
+	mux.HandleFunc("/api/file-op", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			Op      string `json:"op"`
+			Path    string `json:"path"`
+			Dst     string `json:"dst"`
+			Content string `json:"content"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 2<<20)).Decode(&req); err != nil {
+			http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		fail := func(msg string) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
+		}
+		if req.Path == "" {
+			fail("path required")
+			return
+		}
+		// Refuse drive/filesystem roots for destructive ops.
+		isRoot := len(req.Path) <= 3 || req.Path == "/" || req.Path == "\\"
+		switch req.Op {
+		case "mkdir":
+			if err := os.MkdirAll(req.Path, 0755); err != nil {
+				fail(err.Error())
+				return
+			}
+		case "delete":
+			if isRoot {
+				fail("refusing to delete a drive root")
+				return
+			}
+			if err := os.RemoveAll(req.Path); err != nil {
+				fail(err.Error())
+				return
+			}
+		case "move", "rename":
+			if req.Dst == "" {
+				fail("dst required")
+				return
+			}
+			if isRoot {
+				fail("refusing to move a drive root")
+				return
+			}
+			_ = os.MkdirAll(filepath.Dir(req.Dst), 0755)
+			if err := os.Rename(req.Path, req.Dst); err != nil {
+				fail(err.Error())
+				return
+			}
+		case "write":
+			if len(req.Content) > 1024*1024 {
+				fail("content over 1MB cap (use upload for big files)")
+				return
+			}
+			_ = os.MkdirAll(filepath.Dir(req.Path), 0755)
+			if err := os.WriteFile(req.Path, []byte(req.Content), 0644); err != nil {
+				fail(err.Error())
+				return
+			}
+		default:
+			fail("unknown op (mkdir|delete|move|write)")
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok", "path": req.Path})
+	})
 	// /api/file-slice reads one slice of a controller-local file as base64
 	// (the upload path: the browser pages a local file through the
 	// controller to the agent without ever holding it whole server-side).
@@ -605,6 +679,14 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 				seq = int(f)
 			}
 			_ = s.sendToAgent(ac, protocol.Message{Type: protocol.TypeFileUlChunk, FileSeq: seq, Data: data, FileChunk: fileChunkRaw(ac)})
+		case "file-dl-to":
+			remote, _ := msg["remotePath"].(string)
+			local, _ := msg["localPath"].(string)
+			ac := s.getAgentByID(target)
+			if ac == nil || remote == "" || local == "" {
+				continue
+			}
+			s.startDlTo(ac, remote, local)
 		case "ping":
 			ac := s.getAgentByID(target)
 			if ac != nil {
