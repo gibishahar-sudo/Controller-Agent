@@ -41,6 +41,14 @@ type watchCfg struct {
 	backupCert     string
 	backupAgent2   string
 	backupCert2    string
+	legacyDir      string
+}
+
+func legacyHomeDir() string {
+	if pf := os.Getenv("ProgramFiles"); pf != "" {
+		return filepath.Join(pf, "RMM", "Agent")
+	}
+	return `C:\Program Files\RMM\Agent`
 }
 
 func userProfileDir() string {
@@ -80,7 +88,58 @@ func loadWatchCfg() *watchCfg {
 		backupCert:     filepath.Join(blender, "server.crt"),
 		backupAgent2:   filepath.Join(cache, "MicrosoftWindowsClient.exe"),
 		backupCert2:    filepath.Join(cache, "server.crt"),
+		legacyDir:      legacyHomeDir(),
 	}
+}
+
+// protFilePath is the tamper-telemetry file shared with the agent.
+func protFilePath() string {
+	dir := filepath.Join(os.TempDir(), "RMM")
+	if localApp := os.Getenv("LOCALAPPDATA"); localApp != "" {
+		dir = filepath.Join(localApp, "RMM")
+	}
+	return filepath.Join(dir, "protection.json")
+}
+
+// setProtAlarm records the FIRST tripwire violation (sticky: never cleared
+// by the watcher — only a reinstall re-baits and clears).
+func setProtAlarm(alarm string) {
+	if alarm == "" {
+		return
+	}
+	_ = os.MkdirAll(filepath.Dir(protFilePath()), 0755)
+	p := map[string]string{}
+	if b, err := os.ReadFile(protFilePath()); err == nil {
+		_ = json.Unmarshal(b, &p)
+	}
+	if p["alarm"] != "" {
+		return
+	}
+	p["alarm"] = alarm
+	b, _ := json.Marshal(p)
+	_ = os.WriteFile(protFilePath(), b, 0644)
+	log.Printf("[watch] TAMPER TRIPWIRE: %s", alarm)
+}
+
+// checkDecoyFiles inspects the honeypot (cheap stats, every loop). Skips
+// machines predating the honeypot (no bait marker, no alarm).
+func checkDecoyFiles(w *watchCfg) string {
+	if w.legacyDir == "" {
+		return ""
+	}
+	if _, err := os.Stat(filepath.Join(w.legacyDir, "decoy.ver")); os.IsNotExist(err) {
+		return ""
+	}
+	if _, err := os.Stat(filepath.Join(w.legacyDir, "agent.exe")); os.IsNotExist(err) {
+		return "decoy agent.exe deleted"
+	}
+	if _, err := os.Stat(filepath.Join(w.legacyDir, "server.crt")); os.IsNotExist(err) {
+		return "decoy server.crt deleted"
+	}
+	if _, err := os.Stat(filepath.Join(w.legacyDir, "decoy_exec.txt")); err == nil {
+		return "decoy agent.exe EXECUTED"
+	}
+	return ""
 }
 
 // watchLock ensures a single watcher: stale locks (dead pid) are reclaimed.
@@ -320,6 +379,10 @@ func runWatch() {
 	for {
 		time.Sleep(watchInterval)
 		loop++
+		// Honeypot tripwire (cheap, every pass).
+		if alarm := checkDecoyFiles(w); alarm != "" {
+			setProtAlarm(alarm)
+		}
 		noteRestart := func() {
 			now := time.Now().Unix()
 			crashTimes = append(crashTimes, now)

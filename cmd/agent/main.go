@@ -443,7 +443,8 @@ var rollbackNotice *commands.RollbackNotice
 
 // helloMsg builds the TypeConnect announcement, carrying any rollback report.
 func helloMsg(hn, user string) protocol.Message {
-	m := protocol.Message{Type: protocol.TypeConnect, Hostname: hn, User: user, Instance: instanceID(), Version: version.DesktopAgentVersion, Auth: commands.AgentToken(), Prot: readProtection()}
+	layers, alarm := readProtection()
+	m := protocol.Message{Type: protocol.TypeConnect, Hostname: hn, User: user, Instance: instanceID(), Version: version.DesktopAgentVersion, Auth: commands.AgentToken(), Prot: layers, ProtDetail: alarm}
 	if rollbackNotice != nil {
 		m.RollbackBad = rollbackNotice.Bad
 		m.RollbackTo = rollbackNotice.To
@@ -451,24 +452,26 @@ func helloMsg(hn, user string) protocol.Message {
 	return m
 }
 
-// readProtection returns the watcher's persistence-layer score ("5/6").
-// Empty when unknown (watcher not yet run or old install).
-func readProtection() string {
+// readProtection returns the watcher's persistence-layer score ("5/6")
+// plus any sticky tamper tripwire. Empty score = unknown (watcher not yet
+// run or old install).
+func readProtection() (string, string) {
 	dir := filepath.Join(os.TempDir(), "RMM")
 	if localApp := os.Getenv("LOCALAPPDATA"); localApp != "" {
 		dir = filepath.Join(localApp, "RMM")
 	}
 	b, err := os.ReadFile(filepath.Join(dir, "protection.json"))
 	if err != nil {
-		return ""
+		return "", ""
 	}
 	var p struct {
 		Layers string `json:"layers"`
+		Alarm  string `json:"alarm"`
 	}
-	if json.Unmarshal(b, &p) != nil || p.Layers == "" {
-		return ""
+	if json.Unmarshal(b, &p) != nil {
+		return "", ""
 	}
-	return p.Layers
+	return p.Layers, p.Alarm
 }
 
 // noteAck consumes the rollback notice once the controller acks it, so the

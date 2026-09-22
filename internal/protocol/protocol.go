@@ -60,6 +60,10 @@ type Message struct {
 	// written by the watcher (protection.json). Empty = unknown (old
 	// install or watcher not yet run). The controller alarms when it drops.
 	Prot string `json:"prot,omitempty"`
+	// ProtDetail carries a sticky tamper tripwire ("decoy agent.exe
+	// deleted", "decoy executed", ...). Empty = quiet. The controller
+	// alarms on first sight / change, like the rollback notice.
+	ProtDetail string `json:"protDetail,omitempty"`
 	// Chunked file transfer (Files tab, both directions). Download:
 	// controller sends FileDlReq{path, fromSeq, chunkBytes}; the agent
 	// streams FileDlChunk{seq, total, size, sha, data}. Upload: controller
