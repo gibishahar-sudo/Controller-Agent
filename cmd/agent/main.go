@@ -1437,7 +1437,7 @@ func (a *agent) connectViaMQTT() error {
 	announce()
 	announceTicker := time.NewTicker(15 * time.Second)
 	defer announceTicker.Stop()
-	mouseTicker := time.NewTicker(300 * time.Millisecond)
+	mouseTicker := time.NewTicker(150 * time.Millisecond) // MQTT is cheap: near-direct cursor feel
 	defer mouseTicker.Stop()
 	lastX, lastY := -1, -1
 	for {

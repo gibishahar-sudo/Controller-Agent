@@ -858,12 +858,17 @@ func (s *Server) pushAgentUpdate(ac *AgentConn, bin string) bool {
 	chunkRaw := 512 * 1024
 	pacing := time.Duration(0)
 	haveTimeout := 4 * time.Second
+	lanes := 1
 	slowWarn := ""
 	switch ac.transport() {
 	case "mqtt":
-		chunkRaw = 64 * 1024
-		pacing = 100 * time.Millisecond
+		// Big chunks + 4 parallel lanes: chunk reassembly is
+		// order-tolerant, so lanes multiply throughput instead of
+		// paying one broker RTT per chunk.
+		chunkRaw = 256 * 1024
+		pacing = 15 * time.Millisecond
 		haveTimeout = 10 * time.Second
+		lanes = 4
 	case "ntfy":
 		chunkRaw = 4 * 1024
 		pacing = 500 * time.Millisecond
@@ -899,30 +904,60 @@ func (s *Server) pushAgentUpdate(ac *AgentConn, bin string) bool {
 		s.updateProg(ac, total, total, "sent")
 		return true
 	}
-	sent := len(have)
+	// Multi-lane send: chunks are independent (the agent reassembles by
+	// seq), so parallel lanes trade one-RTT-per-chunk serial latency for
+	// throughput. Serial transports keep lanes == 1.
+	var sent atomic.Int64
+	sent.Store(int64(len(have)))
+	jobs := make(chan int, len(missing))
 	for _, i := range missing {
-		end := (i + 1) * chunkRaw
-		if end > len(payload.data) {
-			end = len(payload.data)
-		}
-		chunk := protocol.Message{
-			Type:      protocol.TypeUpdateChunk,
-			UpdateSeq: i,
-			Data:      base64.StdEncoding.EncodeToString(payload.data[i*chunkRaw : end]),
-		}
-		if err := s.sendWithRetry(ac, chunk, fmt.Sprintf("chunk %d", i)); err != nil {
-			log.Printf("[update] %v", err)
-			s.updateProg(ac, sent, total, "failed")
-			return false
-		}
-		sent++
-		if sent%20 == 0 || sent == total {
-			log.Printf("[update] %s: %d/%d chunks", ac.id, sent, total)
-			s.updateProg(ac, sent, total, "pushing")
-		}
-		if pacing > 0 {
-			time.Sleep(pacing)
-		}
+		jobs <- i
+	}
+	close(jobs)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var wg sync.WaitGroup
+	var failOnce sync.Once
+	var failed error
+	for l := 0; l < lanes; l++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range jobs {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+				end := (i + 1) * chunkRaw
+				if end > len(payload.data) {
+					end = len(payload.data)
+				}
+				chunk := protocol.Message{
+					Type:      protocol.TypeUpdateChunk,
+					UpdateSeq: i,
+					Data:      base64.StdEncoding.EncodeToString(payload.data[i*chunkRaw : end]),
+				}
+				if err := s.sendWithRetry(ac, chunk, fmt.Sprintf("chunk %d", i)); err != nil {
+					log.Printf("[update] %v", err)
+					failOnce.Do(func() { failed = err; cancel() })
+					return
+				}
+				n := int(sent.Add(1))
+				if n%20 == 0 || n == total {
+					log.Printf("[update] %s: %d/%d chunks", ac.id, n, total)
+					s.updateProg(ac, n, total, "pushing")
+				}
+				if pacing > 0 {
+					time.Sleep(pacing)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	if failed != nil {
+		s.updateProg(ac, int(sent.Load()), total, "failed")
+		return false
 	}
 	log.Printf("[update] %s: all chunks sent, waiting for agent verify+restart", ac.id)
 	s.updateProg(ac, total, total, "sent")
@@ -963,14 +998,30 @@ func (s *Server) pushAgentUpdateAll(bin string) (pushed, skipped, offline, heldb
 		return 0, skipped, offline, heldback
 	}
 	s.broadcastWS(map[string]interface{}{"type": "output", "data": fmt.Sprintf("update-all: pushing %d agent(s) (%d up to date, %d offline, %d held back skipped)", len(targets), skipped, offline, heldback), "success": true})
+	// Fleet fan-out: direct/MQTT pushes run up to 3 at a time (independent
+	// agents, independent topics); ntfy stays strictly serial with a gap
+	// because that bus is rate-limited.
+	sem := make(chan struct{}, 3)
+	var wg sync.WaitGroup
 	for _, id := range targets {
 		ac := s.getAgentByID(id)
 		if ac == nil {
 			continue
 		}
-		s.pushAgentUpdate(ac, bin)
-		time.Sleep(800 * time.Millisecond)
+		if ac.transport() == "ntfy" {
+			s.pushAgentUpdate(ac, bin)
+			time.Sleep(800 * time.Millisecond)
+			continue
+		}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(t *AgentConn) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			s.pushAgentUpdate(t, bin)
+		}(ac)
 	}
+	wg.Wait()
 	return len(targets), skipped, offline, heldback
 }
 
