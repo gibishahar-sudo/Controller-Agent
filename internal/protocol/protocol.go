@@ -43,12 +43,19 @@ type Message struct {
 	UpdateSHA   string `json:"updateSHA,omitempty"`
 	UpdateTotal int    `json:"updateTotal,omitempty"`
 	UpdateSeq   int    `json:"updateSeq,omitempty"`
+	UpdateGzip  bool   `json:"updateGzip,omitempty"` // chunk bytes are gzip of the binary (smaller pushes)
 	// Crash-rollback report (in TypeConnect/hello): the watchdog restored
 	// the previous binary after the new one crash-looped. RollbackBad is
 	// the crashed version, RollbackTo the restored one. The controller
 	// raises an alarm and holds back re-pushing the bad version.
 	RollbackBad string `json:"rollbackBad,omitempty"`
 	RollbackTo  string `json:"rollbackTo,omitempty"`
+	// RollbackAck (in TypeConnected): controller recorded the rollback.
+	// The agent then stops re-reporting and clears its notice file.
+	RollbackAck bool `json:"rollbackAck,omitempty"`
+	// Auth (in TypeConnect/hello): agent token from token.txt. Empty =
+	// untokened install (accepted unless the controller enforces auth).
+	Auth string `json:"auth,omitempty"`
 }
 
 // FileEntry mirrors the Files tab JSON shape.

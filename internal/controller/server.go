@@ -19,6 +19,8 @@ package controller
 
 import (
 	"bufio"
+	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -37,6 +39,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -86,7 +89,10 @@ type AgentConn struct {
 	// back re-pushing the bad version.
 	rollbackBad string
 	rollbackTo  string
-	mu          sync.Mutex
+	// untrusted marks agents that connected without a registration token
+	// (accepted only while auth enforcement is off).
+	untrusted bool
+	mu        sync.Mutex
 
 	lastSeenMu sync.Mutex
 	lastSeen   time.Time
@@ -218,6 +224,38 @@ type Server struct {
 	autoUpdate atomic.Bool
 	autoMu     sync.Mutex
 	autoPushed map[string]string
+
+	// Compressed update payloads, keyed by agent version (12MB exe gzips
+	// to ~4MB, so relay pushes take a third of the time).
+	gzipCache map[string]*gzipBlob
+	gzipMu    sync.Mutex
+	// Resume reports from agents ("update resume have N/M ranges ..."),
+	// keyed by agent id. Lets an interrupted push send only missing chunks.
+	updateHave map[string]haveReport
+	haveMu     sync.Mutex
+
+	// Agent registration token (Track B): agents presenting a wrong token
+	// are rejected; empty-token agents are accepted as untrusted unless
+	// enforcement is on.
+	agentToken  string
+	enforceAuth atomic.Bool
+	authLogMu   sync.Mutex
+	authLog     map[string]time.Time
+
+	// Disk-persisted crash-rollback holdbacks by hostname (Track D).
+	heldBack map[string]heldRollback
+	holdMu   sync.Mutex
+}
+
+type gzipBlob struct {
+	data []byte
+	sha  string
+}
+
+type haveReport struct {
+	have  map[int]bool
+	total int
+	at    time.Time
 }
 
 type wsClient struct {
@@ -279,6 +317,12 @@ func StartBackground(opts Options) (*Server, error) {
 	s.tlsCfg = &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
 	s.e2eKeys = make(map[string][32]byte)
 	s.autoPushed = make(map[string]string)
+	s.gzipCache = make(map[string]*gzipBlob)
+	s.updateHave = make(map[string]haveReport)
+	s.authLog = make(map[string]time.Time)
+	s.loadAgentToken()
+	s.loadHeldRollbacks()
+	s.loadInventory()
 	if priv, ok := cert.PrivateKey.(*rsa.PrivateKey); ok {
 		s.rsaPriv = priv
 	} else {
@@ -630,11 +674,162 @@ func (s *Server) sendWithRetry(ac *AgentConn, msg protocol.Message, what string)
 	}
 }
 
+// gzipPayload compresses the agent binary once per version (cached).
+func (s *Server) gzipPayload(ver string, data []byte) *gzipBlob {
+	s.gzipMu.Lock()
+	defer s.gzipMu.Unlock()
+	if b, ok := s.gzipCache[ver]; ok && len(b.data) > 0 {
+		return b
+	}
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	_, _ = zw.Write(data)
+	_ = zw.Close()
+	sum := sha256.Sum256(buf.Bytes())
+	b := &gzipBlob{data: buf.Bytes(), sha: hex.EncodeToString(sum[:])}
+	s.gzipCache[ver] = b
+	log.Printf("[update] gzipped %d -> %d bytes (%.0f%%)", len(data), len(b.data), 100*float64(len(b.data))/float64(len(data)))
+	return b
+}
+
+// parseHaveRanges parses "0-9,12,15-20" into a set (inverse of the agent's
+// rangesOf; total bounds the result).
+func parseHaveRanges(rs string, total int) map[int]bool {
+	have := map[int]bool{}
+	for _, p := range strings.Split(rs, ",") {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if lo, hi, ok := strings.Cut(p, "-"); ok {
+			a, err1 := strconv.Atoi(strings.TrimSpace(lo))
+			b, err2 := strconv.Atoi(strings.TrimSpace(hi))
+			if err1 != nil || err2 != nil {
+				continue
+			}
+			for i := a; i <= b && i < total; i++ {
+				if i >= 0 {
+					have[i] = true
+				}
+			}
+		} else if n, err := strconv.Atoi(p); err == nil && n >= 0 && n < total {
+			have[n] = true
+		}
+	}
+	return have
+}
+
+// noteUpdateHave records an agent's resume report ("update resume have N/M
+// ranges ...") from any transport's output path.
+func (s *Server) noteUpdateHave(id, result string) {
+	idx := strings.Index(result, "update resume have ")
+	if idx < 0 {
+		return
+	}
+	rest := result[idx+len("update resume have "):]
+	fields := strings.Fields(rest)
+	if len(fields) < 1 {
+		return
+	}
+	frac := strings.Split(fields[0], "/")
+	if len(frac) != 2 {
+		return
+	}
+	total, err := strconv.Atoi(frac[1])
+	if err != nil || total <= 0 {
+		return
+	}
+	have := map[int]bool{}
+	if i := strings.Index(rest, "ranges "); i >= 0 {
+		have = parseHaveRanges(rest[i+len("ranges "):], total)
+	}
+	s.haveMu.Lock()
+	s.updateHave[id] = haveReport{have: have, total: total, at: time.Now()}
+	s.haveMu.Unlock()
+	log.Printf("[update] %s resume: has %d/%d chunks", id, len(have), total)
+}
+
+// awaitHave waits for the agent's resume report after update_begin (the
+// agent replies from its on-disk chunk cache). Returns the have-set, which
+// is empty on timeout (fresh full push).
+func (s *Server) awaitHave(id string, since time.Time, timeout time.Duration) map[int]bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		s.haveMu.Lock()
+		rep, ok := s.updateHave[id]
+		s.haveMu.Unlock()
+		if ok && rep.at.After(since) {
+			return rep.have
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	return map[int]bool{}
+}
+
 // pushAgentUpdate streams the bundled agent binary to one agent in
-// per-transport chunks. The agent verifies SHA256, stashes the running exe
-// as prev, swaps, and restarts (a crash loop gets rolled back by the
-// watchdog, which then notifies us via hello). Progress lands in the UI
-// live via update-progress events. Returns true if all chunks were sent.
+// per-transport chunks. The payload is gzipped (~3x smaller), the agent
+// verifies SHA256, stashes the running exe as prev, swaps, and restarts (a
+// crash loop gets rolled back by the watchdog, which then notifies us via
+// hello). An interrupted push resumes: the agent reports cached chunks and
+// only missing ones are sent. Progress lands in the UI live via
+// update-progress events. Returns true if all chunks were sent.
+
+// loadAgentToken reads the shared agent registration secret (creating one
+// on first run next to the controller exe, else CWD).
+func (s *Server) loadAgentToken() {
+	cands := []string{"agent_token.txt"}
+	if exe, err := os.Executable(); err == nil {
+		cands = append([]string{filepath.Join(filepath.Dir(exe), "agent_token.txt")}, cands...)
+	}
+	for _, p := range cands {
+		if b, err := os.ReadFile(p); err == nil {
+			if t := strings.TrimSpace(string(b)); t != "" {
+				s.agentToken = t
+				return
+			}
+		}
+	}
+	var b [24]byte
+	_, _ = rand.Read(b[:])
+	s.agentToken = hex.EncodeToString(b[:])
+	save := cands[0]
+	if err := os.WriteFile(save, []byte(s.agentToken+"\n"), 0600); err != nil {
+		log.Printf("[auth] cannot persist agent token, using ephemeral")
+	} else {
+		log.Printf("[auth] generated new agent registration token (%s)", save)
+	}
+}
+
+// checkAuth vets one hello: wrong token is always rejected; empty token is
+// accepted as untrusted unless enforcement is on. Rejections are logged at
+// most every 10 minutes per id so rogue re-announces can't spam the log.
+func (s *Server) checkAuth(msg protocol.Message, id string) (allow, untrusted bool) {
+	if msg.Auth != "" && msg.Auth != s.agentToken {
+		s.authLogMu.Lock()
+		last, seen := s.authLog[id]
+		if !seen || time.Since(last) > 10*time.Minute {
+			s.authLog[id] = time.Now()
+			s.authLogMu.Unlock()
+			log.Printf("[auth] rejected %s (id=%s): wrong registration token", msg.Hostname, id)
+		} else {
+			s.authLogMu.Unlock()
+		}
+		return false, false
+	}
+	if s.enforceAuth.Load() && msg.Auth == "" {
+		s.authLogMu.Lock()
+		last, seen := s.authLog[id]
+		if !seen || time.Since(last) > 10*time.Minute {
+			s.authLog[id] = time.Now()
+			s.authLogMu.Unlock()
+			log.Printf("[auth] rejected %s (id=%s): no token while enforcement is on", msg.Hostname, id)
+		} else {
+			s.authLogMu.Unlock()
+		}
+		return false, false
+	}
+	return true, msg.Auth == ""
+}
 func (s *Server) pushAgentUpdate(ac *AgentConn, bin string) bool {
 	data, err := os.ReadFile(bin)
 	if err != nil {
@@ -651,7 +846,7 @@ func (s *Server) pushAgentUpdate(ac *AgentConn, bin string) bool {
 	// Hold back a version the agent already crash-rolled-back: re-pushing
 	// it would crash-loop the remote again.
 	s.agentsMu.RLock()
-	rb := ac.rollbackBad
+	rb := s.heldBad(ac.hostname, ac.rollbackBad)
 	s.agentsMu.RUnlock()
 	if rb != "" && rb == version.DesktopAgentVersion {
 		log.Printf("[update] %s held back: v%s crash-rolled-back on %s, not re-pushing", ac.id, rb, ac.hostname)
@@ -659,48 +854,71 @@ func (s *Server) pushAgentUpdate(ac *AgentConn, bin string) bool {
 		s.updateProg(ac, 0, 0, "heldback")
 		return false
 	}
-	sum := sha256.Sum256(data)
-	sha := hex.EncodeToString(sum[:])
+	payload := s.gzipPayload(version.DesktopAgentVersion, data)
 	chunkRaw := 512 * 1024
 	pacing := time.Duration(0)
+	haveTimeout := 4 * time.Second
 	slowWarn := ""
 	switch ac.transport() {
 	case "mqtt":
 		chunkRaw = 64 * 1024
 		pacing = 100 * time.Millisecond
+		haveTimeout = 10 * time.Second
 	case "ntfy":
 		chunkRaw = 4 * 1024
 		pacing = 500 * time.Millisecond
-		slowWarn = " (ntfy is slow: ~25min for a full binary — direct/MQTT preferred)"
+		haveTimeout = 30 * time.Second
+		slowWarn = " (ntfy is slow even gzipped — direct/MQTT preferred)"
 	}
-	total := (len(data) + chunkRaw - 1) / chunkRaw
-	log.Printf("[update] pushing agent binary (%d bytes, %d chunks) to %s%s", len(data), total, ac.id, slowWarn)
-	s.broadcastWS(map[string]interface{}{"type": "output", "id": ac.id, "data": fmt.Sprintf("pushing update (%d bytes, %d chunks)%s", len(data), total, slowWarn), "success": true})
+	total := (len(payload.data) + chunkRaw - 1) / chunkRaw
+	log.Printf("[update] pushing agent binary (gzipped %d bytes, %d chunks) to %s%s", len(payload.data), total, ac.id, slowWarn)
+	s.broadcastWS(map[string]interface{}{"type": "output", "id": ac.id, "data": fmt.Sprintf("pushing update (gzipped %d bytes, %d chunks)%s", len(payload.data), total, slowWarn), "success": true})
 	s.updateProg(ac, 0, total, "pushing")
-	begin := protocol.Message{Type: protocol.TypeUpdateBegin, UpdateVer: version.DesktopAgentVersion, UpdateSize: int64(len(data)), UpdateSHA: sha, UpdateTotal: total}
+	begin := protocol.Message{Type: protocol.TypeUpdateBegin, UpdateVer: version.DesktopAgentVersion, UpdateSize: int64(len(payload.data)), UpdateSHA: payload.sha, UpdateTotal: total, UpdateGzip: true}
+	beginAt := time.Now()
 	if err := s.sendWithRetry(ac, begin, "update begin"); err != nil {
 		log.Printf("[update] begin failed: %v", err)
 		s.updateProg(ac, 0, total, "failed")
 		return false
 	}
+	// Resume: the agent reports chunks cached from an interrupted push.
+	have := s.awaitHave(ac.id, beginAt, haveTimeout)
+	var missing []int
 	for i := 0; i < total; i++ {
+		if !have[i] {
+			missing = append(missing, i)
+		}
+	}
+	if len(have) > 0 {
+		log.Printf("[update] %s: resuming (%d/%d cached, sending %d)", ac.id, len(have), total, len(missing))
+		s.broadcastWS(map[string]interface{}{"type": "output", "id": ac.id, "data": fmt.Sprintf("resuming update: agent kept %d/%d chunks, sending %d", len(have), total, len(missing)), "success": true})
+		s.updateProg(ac, len(have), total, "pushing")
+	}
+	if len(missing) == 0 {
+		log.Printf("[update] %s: agent already holds all chunks, waiting for verify+restart", ac.id)
+		s.updateProg(ac, total, total, "sent")
+		return true
+	}
+	sent := len(have)
+	for _, i := range missing {
 		end := (i + 1) * chunkRaw
-		if end > len(data) {
-			end = len(data)
+		if end > len(payload.data) {
+			end = len(payload.data)
 		}
 		chunk := protocol.Message{
 			Type:      protocol.TypeUpdateChunk,
 			UpdateSeq: i,
-			Data:      base64.StdEncoding.EncodeToString(data[i*chunkRaw : end]),
+			Data:      base64.StdEncoding.EncodeToString(payload.data[i*chunkRaw : end]),
 		}
 		if err := s.sendWithRetry(ac, chunk, fmt.Sprintf("chunk %d", i)); err != nil {
 			log.Printf("[update] %v", err)
-			s.updateProg(ac, i, total, "failed")
+			s.updateProg(ac, sent, total, "failed")
 			return false
 		}
-		if (i+1)%20 == 0 || i+1 == total {
-			log.Printf("[update] %s: %d/%d chunks", ac.id, i+1, total)
-			s.updateProg(ac, i+1, total, "pushing")
+		sent++
+		if sent%20 == 0 || sent == total {
+			log.Printf("[update] %s: %d/%d chunks", ac.id, sent, total)
+			s.updateProg(ac, sent, total, "pushing")
 		}
 		if pacing > 0 {
 			time.Sleep(pacing)
@@ -733,7 +951,7 @@ func (s *Server) pushAgentUpdateAll(bin string) (pushed, skipped, offline, heldb
 			skipped++
 			continue
 		}
-		if a.rollbackBad != "" && a.rollbackBad == version.DesktopAgentVersion {
+		if hb := s.heldBad(a.hostname, a.rollbackBad); hb != "" && hb == version.DesktopAgentVersion {
 			heldback++
 			continue
 		}
@@ -775,9 +993,93 @@ func (s *Server) noteHello(id, hostname, ver, bad, to string) {
 	} else {
 		s.agentsMu.Unlock()
 	}
+	// Disk-persisted holdback (Track D): survives controller restarts.
+	// A hello without a report clears the entry once the agent moved past
+	// the bad version (fresh installs report the current version).
+	if bad != "" {
+		s.setHeldRollback(hostname, bad, to)
+	} else if ver != "" {
+		s.clearHeldRollback(hostname, ver)
+	}
 	if bad == "" {
 		s.maybeAutoUpdate(id)
 	}
+}
+
+// heldRollback is a crash-rollback record persisted to disk so a controller
+// restart never forgets which versions are held back, keyed by hostname.
+type heldRollback struct {
+	Bad string `json:"bad"`
+	To  string `json:"to"`
+	At  string `json:"at"`
+}
+
+// rollbackHoldFile lives next to the controller exe (else CWD).
+func rollbackHoldFile() string {
+	if exe, err := os.Executable(); err == nil {
+		return filepath.Join(filepath.Dir(exe), "rollback_held.json")
+	}
+	return "rollback_held.json"
+}
+
+// loadHeldRollbacks restores holdbacks saved by a previous controller run.
+func (s *Server) loadHeldRollbacks() {
+	s.holdMu.Lock()
+	defer s.holdMu.Unlock()
+	s.heldBack = map[string]heldRollback{}
+	b, err := os.ReadFile(rollbackHoldFile())
+	if err != nil {
+		return
+	}
+	_ = json.Unmarshal(b, &s.heldBack)
+	if s.heldBack == nil {
+		s.heldBack = map[string]heldRollback{}
+	}
+}
+
+// saveHeldRollbacksLocked persists the holdback map (caller holds holdMu).
+func (s *Server) saveHeldRollbacksLocked() {
+	b, _ := json.MarshalIndent(s.heldBack, "", " ")
+	_ = os.WriteFile(rollbackHoldFile(), b, 0600)
+}
+
+func (s *Server) setHeldRollback(hostname, bad, to string) {
+	if hostname == "" || bad == "" {
+		return
+	}
+	s.holdMu.Lock()
+	defer s.holdMu.Unlock()
+	if cur, ok := s.heldBack[hostname]; ok && cur.Bad == bad {
+		return
+	}
+	s.heldBack[hostname] = heldRollback{Bad: bad, To: to, At: time.Now().UTC().Format(time.RFC3339)}
+	s.saveHeldRollbacksLocked()
+}
+
+func (s *Server) clearHeldRollback(hostname, ver string) {
+	if hostname == "" {
+		return
+	}
+	s.holdMu.Lock()
+	defer s.holdMu.Unlock()
+	if cur, ok := s.heldBack[hostname]; ok && ver != cur.Bad {
+		delete(s.heldBack, hostname)
+		s.saveHeldRollbacksLocked()
+	}
+}
+
+// heldBad returns the bad version held back for an agent: live hello report
+// first, disk-persisted record second.
+func (s *Server) heldBad(hostname, memBad string) string {
+	if memBad != "" {
+		return memBad
+	}
+	s.holdMu.Lock()
+	defer s.holdMu.Unlock()
+	if cur, ok := s.heldBack[hostname]; ok {
+		return cur.Bad
+	}
+	return ""
 }
 
 // handleRollback alarms loudly (log + UI event + refreshed list) when an
@@ -868,6 +1170,69 @@ func (s *Server) Wait() {
 	s.wg.Wait()
 }
 
+// inventoryEntry is one persisted fleet record (see saveInventory).
+type inventoryEntry struct {
+	ID       string `json:"id"`
+	Hostname string `json:"hostname"`
+	User     string `json:"user"`
+	Version  string `json:"version"`
+	Seen     int64  `json:"seen"`
+}
+
+// inventoryFile lives next to the controller exe (else CWD).
+func inventoryFile() string {
+	if exe, err := os.Executable(); err == nil {
+		return filepath.Join(filepath.Dir(exe), "agents.json")
+	}
+	return "agents.json"
+}
+
+// loadInventory restores known agents from the previous run as offline
+// entries (conn == nil) so the list survives controller restarts. Live
+// hellos overwrite them in place.
+func (s *Server) loadInventory() {
+	b, err := os.ReadFile(inventoryFile())
+	if err != nil {
+		return
+	}
+	var entries []inventoryEntry
+	if json.Unmarshal(b, &entries) != nil {
+		return
+	}
+	s.agentsMu.Lock()
+	defer s.agentsMu.Unlock()
+	for _, e := range entries {
+		if e.ID == "" || e.Hostname == "" {
+			continue
+		}
+		if _, ok := s.agents[e.ID]; ok {
+			continue
+		}
+		ac := &AgentConn{id: e.ID, hostname: e.Hostname, user: e.User, version: e.Version}
+		ac.lastSeen = time.Unix(e.Seen, 0)
+		s.agents[e.ID] = ac
+	}
+	log.Printf("[*] Loaded %d agent(s) from inventory", len(entries))
+}
+
+// saveInventory snapshots the fleet (including offline tombstones) to disk.
+func (s *Server) saveInventory() {
+	s.agentsMu.RLock()
+	entries := make([]inventoryEntry, 0, len(s.agents))
+	for _, a := range s.agents {
+		if strings.HasPrefix(a.id, "manual-") || strings.HasPrefix(a.id, "conn-") {
+			continue // UI-local placeholders, not real agents
+		}
+		entries = append(entries, inventoryEntry{
+			ID: a.id, Hostname: a.hostname, User: a.user,
+			Version: a.version, Seen: a.seen().Unix(),
+		})
+	}
+	s.agentsMu.RUnlock()
+	b, _ := json.MarshalIndent(entries, "", " ")
+	_ = os.WriteFile(inventoryFile(), b, 0600)
+}
+
 // Agents returns a snapshot for UI/API.
 func (s *Server) Agents() []map[string]interface{} {
 	s.agentsMu.RLock()
@@ -879,19 +1244,33 @@ func (s *Server) Agents() []map[string]interface{} {
 		s.latencyMu.RUnlock()
 		// Relay agents unseen for a while are reported offline (with
 		// last-seen) rather than dropped, so the UI can gray them instead
-		// of silently losing them. Direct agents vanish on TCP close.
+		// of silently losing them. Restored inventory entries (direct ids
+		// with no live conn) report offline the same way.
 		online := true
 		var seenAgo int64
 		if strings.HasPrefix(a.id, "agent-ntfy-") || strings.HasPrefix(a.id, "agent-mqtt-") {
 			ago := time.Since(a.seen())
 			seenAgo = int64(ago.Seconds())
 			online = ago <= ntfyStaleAfter
+		} else if a.conn == nil {
+			ago := time.Since(a.seen())
+			seenAgo = int64(ago.Seconds())
+			online = false
 		}
 		outdated := a.version != "" && a.version != version.Version
+		rb, rt := a.rollbackBad, a.rollbackTo
+		if rb == "" {
+			s.holdMu.Lock()
+			if cur, ok := s.heldBack[a.hostname]; ok {
+				rb, rt = cur.Bad, cur.To
+			}
+			s.holdMu.Unlock()
+		}
 		out = append(out, map[string]interface{}{
 			"id": a.id, "hostname": a.hostname, "user": a.user,
 			"version": a.version, "outdated": outdated,
-			"rollbackBad": a.rollbackBad, "rollbackTo": a.rollbackTo,
+			"rollbackBad": rb, "rollbackTo": rt,
+			"untrusted": a.untrusted,
 			"connected": online, "seenAgoSec": seenAgo,
 			"latency": lat, "remote": a.remote(), "e2e": s.e2eHas(a.hostname),
 		})
@@ -1059,6 +1438,7 @@ func (s *Server) removeAgent(id string) {
 		}
 	}
 	s.agentsMu.Unlock()
+	s.saveInventory()
 	s.broadcastAgents()
 }
 
@@ -1206,14 +1586,18 @@ func (s *Server) handleAgent(conn net.Conn, id string) {
 		log.Printf("[%s] expected connect, got %s", id, first.Type)
 		return
 	}
-	ac := &AgentConn{conn: conn, enc: enc, hostname: first.Hostname, user: first.User, id: id, version: first.Version}
+	allow, untrusted := s.checkAuth(first, id)
+	if !allow {
+		return
+	}
+	ac := &AgentConn{conn: conn, enc: enc, hostname: first.Hostname, user: first.User, id: id, version: first.Version, untrusted: untrusted}
 	s.setAgent(ac)
 	if first.Version != "" && first.Version != version.Version {
 		log.Printf("[update] %s is outdated (%s vs %s) — push update available", first.Hostname, first.Version, version.Version)
 	}
 	s.noteHello(id, first.Hostname, first.Version, first.RollbackBad, first.RollbackTo)
 	fmt.Printf("\n[+] Agent connected: id=%s hostname=%s user=%s version=%s remote=%s\n", id, first.Hostname, first.User, first.Version, conn.RemoteAddr())
-	_ = ac.send(protocol.Message{Type: protocol.TypeConnected, ID: id})
+	_ = ac.send(protocol.Message{Type: protocol.TypeConnected, ID: id, RollbackAck: first.RollbackBad != ""})
 	s.broadcastWS(map[string]interface{}{"type": "output", "data": fmt.Sprintf("Agent %s (%s) connected", first.Hostname, id), "success": true})
 
 	for scanner.Scan() {
@@ -1239,6 +1623,7 @@ func (s *Server) handleAgent(conn net.Conn, id string) {
 			s.broadcastWS(map[string]interface{}{"type": "mouse", "id": id, "x": msg.X, "y": msg.Y, "buttons": msg.Buttons})
 		case protocol.TypeOutput:
 			s.ackCmd(msg.CmdID)
+			s.noteUpdateHave(id, msg.Result)
 			s.broadcastWS(map[string]interface{}{"type": "output", "id": id, "data": msg.Result, "error": msg.Error, "success": msg.Error == ""})
 			if msg.Error == "" {
 				s.broadcastAudiolistIfJSON(msg.Result, id)
@@ -1408,11 +1793,15 @@ func (s *Server) ntfyLoop() {
 			if inst == "" {
 				inst = name // old agents without instance ids
 			}
-			id := "agent-ntfy-" + inst
-			s.agentsMu.RLock()
-			ac, exists := s.agents[id]
-			s.agentsMu.RUnlock()
-			// Stash version from hello ("" = old agent).
+		id := "agent-ntfy-" + inst
+		allow, untrusted := s.checkAuth(msg, id)
+		if !allow {
+			continue
+		}
+		s.agentsMu.RLock()
+		ac, exists := s.agents[id]
+		s.agentsMu.RUnlock()
+		// Stash version from hello ("" = old agent).
 			if msg.Version != "" {
 				s.agentsMu.Lock()
 				if ex, ok := s.agents[id]; ok {
@@ -1421,10 +1810,10 @@ func (s *Server) ntfyLoop() {
 				s.agentsMu.Unlock()
 			}
 		if !exists && msg.Type == protocol.TypeConnect {
-			ac = &AgentConn{hostname: hostname, user: msg.User, id: id, version: msg.Version}
+			ac = &AgentConn{hostname: hostname, user: msg.User, id: id, version: msg.Version, untrusted: untrusted}
 			s.setAgent(ac)
 			fmt.Printf("\n[+] Ntfy agent connected: %s (%s) v%s\n", hostname, id, msg.Version)
-			_ = relay.PublishTo("controller", name, protocol.Message{Type: protocol.TypeConnected, ID: id, E2E: true})
+			_ = relay.PublishTo("controller", name, protocol.Message{Type: protocol.TypeConnected, ID: id, E2E: true, RollbackAck: msg.RollbackBad != ""})
 			s.broadcastWS(map[string]interface{}{"type": "output", "data": fmt.Sprintf("Ntfy agent %s connected", hostname), "success": true})
 			s.noteHello(id, hostname, msg.Version, msg.RollbackBad, msg.RollbackTo)
 			continue
@@ -1438,10 +1827,12 @@ func (s *Server) ntfyLoop() {
 			if msg.Version != "" {
 				ac.version = msg.Version
 			}
+			ac.untrusted = untrusted
 			s.noteHello(id, hostname, msg.Version, msg.RollbackBad, msg.RollbackTo)
-			_ = relay.PublishTo("controller", name, protocol.Message{Type: protocol.TypeConnected, ID: id, E2E: true})
+			_ = relay.PublishTo("controller", name, protocol.Message{Type: protocol.TypeConnected, ID: id, E2E: true, RollbackAck: msg.RollbackBad != ""})
 			case protocol.TypeOutput:
 					s.ackCmd(msg.CmdID)
+					s.noteUpdateHave(id, msg.Result)
 					s.broadcastWS(map[string]interface{}{"type": "output", "id": id, "data": msg.Result, "error": msg.Error, "success": msg.Error == ""})
 					if msg.Error == "" {
 						s.broadcastAudiolistIfJSON(msg.Result, id)
@@ -1508,11 +1899,19 @@ func (s *Server) tcpRelayLoop() {
 func (s *Server) sweepLoop() {
 	t := time.NewTicker(sweepInterval)
 	defer t.Stop()
+	ticks := 0
 	for {
 		select {
 		case <-s.closeCh:
 			return
 		case <-t.C:
+		}
+		ticks++
+		// Persist the fleet inventory every ~30s so a controller restart
+		// keeps known agents visible (as offline, with last-seen) instead
+		// of an empty list.
+		if ticks%2 == 0 {
+			s.saveInventory()
 		}
 		// No auto-eviction: quiet relay agents stay visible as offline
 		// tombstones (with last-seen) forever — the UI prunes them only on
@@ -1765,6 +2164,10 @@ func (s *Server) handleMQTTMsg(topic string, env relay.Envelope) {
 			inst = host // old agents without instance ids
 		}
 		id := "agent-mqtt-" + inst
+		allow, untrusted := s.checkAuth(msg, id)
+		if !allow {
+			return
+		}
 		s.agentsMu.RLock()
 		_, exists := s.agents[id]
 		s.agentsMu.RUnlock()
@@ -1775,7 +2178,7 @@ func (s *Server) handleMQTTMsg(topic string, env relay.Envelope) {
 		}
 		s.agentsMu.Unlock()
 		if !exists {
-			ac := &AgentConn{hostname: host, user: msg.User, id: id, version: msg.Version}
+			ac := &AgentConn{hostname: host, user: msg.User, id: id, version: msg.Version, untrusted: untrusted}
 			s.setAgent(ac)
 			fmt.Printf("\n[+] MQTT agent connected: %s (%s) v%s\n", host, id, msg.Version)
 			s.broadcastWS(map[string]interface{}{"type": "output", "data": fmt.Sprintf("MQTT agent %s connected", host), "success": true})
@@ -1787,7 +2190,7 @@ func (s *Server) handleMQTTMsg(topic string, env relay.Envelope) {
 		s.mqttMu.Lock()
 		bus, bus2 := s.mqttBus, s.mqttBus2
 		s.mqttMu.Unlock()
-		ack := relay.Envelope{From: "controller", To: host, Payload: mustJSON(protocol.Message{Type: protocol.TypeConnected, ID: id, E2E: true}), Time: time.Now().UnixMilli()}
+		ack := relay.Envelope{From: "controller", To: host, Payload: mustJSON(protocol.Message{Type: protocol.TypeConnected, ID: id, E2E: true, RollbackAck: msg.RollbackBad != ""}), Time: time.Now().UnixMilli()}
 		if bus2 != nil {
 			go bus2.PublishCmd(host, ack)
 		}
@@ -1801,6 +2204,7 @@ func (s *Server) handleMQTTMsg(topic string, env relay.Envelope) {
 			if msg.Version != "" {
 				ac.version = msg.Version
 			}
+			ac.untrusted = untrusted
 		}
 		s.noteHello(id, host, msg.Version, msg.RollbackBad, msg.RollbackTo)
 		s.broadcastAgents()
@@ -1832,6 +2236,7 @@ func (s *Server) handleMQTTMsg(topic string, env relay.Envelope) {
 	switch msg.Type {
 			case protocol.TypeOutput:
 				s.ackCmd(msg.CmdID)
+				s.noteUpdateHave(id, msg.Result)
 				s.broadcastWS(map[string]interface{}{"type": "output", "id": id, "data": msg.Result, "error": msg.Error, "success": msg.Error == ""})
 				if msg.Error == "" {
 					s.broadcastAudiolistIfJSON(msg.Result, id)

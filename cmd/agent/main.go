@@ -407,12 +407,23 @@ var rollbackNotice *commands.RollbackNotice
 
 // helloMsg builds the TypeConnect announcement, carrying any rollback report.
 func helloMsg(hn, user string) protocol.Message {
-	m := protocol.Message{Type: protocol.TypeConnect, Hostname: hn, User: user, Instance: instanceID(), Version: version.DesktopAgentVersion}
+	m := protocol.Message{Type: protocol.TypeConnect, Hostname: hn, User: user, Instance: instanceID(), Version: version.DesktopAgentVersion, Auth: commands.AgentToken()}
 	if rollbackNotice != nil {
 		m.RollbackBad = rollbackNotice.Bad
 		m.RollbackTo = rollbackNotice.To
 	}
 	return m
+}
+
+// noteAck consumes the rollback notice once the controller acks it, so the
+// report survives controller restarts (re-sent on every hello) without
+// repeating forever after it lands.
+func noteAck(msg protocol.Message) {
+	if msg.RollbackAck && rollbackNotice != nil {
+		log.Printf("[*] Controller acked rollback report, clearing notice")
+		commands.ConsumeRollbackNotice()
+		rollbackNotice = nil
+	}
 }
 
 func hostnameAndUser() (string, string) {
@@ -640,11 +651,12 @@ func (a *agent) connectOnce() error {
 			}
 			switch msg.Type {
 			case protocol.TypeConnected:
+				noteAck(msg)
 				log.Printf("[+] Controller acknowledged id=%s", msg.ID)
 			case protocol.TypeUpdateBegin:
 				log.Printf("[*] Update begin %s (%d bytes, %d chunks)", msg.UpdateVer, msg.UpdateSize, msg.UpdateTotal)
 				go func(m protocol.Message) {
-					res, err := commands.StartAgentUpdate(m.UpdateVer, m.UpdateSize, m.UpdateSHA, m.UpdateTotal)
+					res, err := commands.StartAgentUpdate(m.UpdateVer, m.UpdateSize, m.UpdateSHA, m.UpdateTotal, m.UpdateGzip)
 					_ = a.send(updateOutput(res, err))
 				}(msg)
 			case protocol.TypeUpdateChunk:
@@ -923,10 +935,11 @@ func (a *agent) connectViaNtfy() error {
 					if msg.E2E {
 						commands.E2EEnable(true)
 					}
+					noteAck(msg)
 					log.Printf("[*] Ntfy controller ack %s", msg.ID)
 				case protocol.TypeUpdateBegin:
 					log.Printf("[*] Ntfy update begin %s", msg.UpdateVer)
-					res, err := commands.StartAgentUpdate(msg.UpdateVer, msg.UpdateSize, msg.UpdateSHA, msg.UpdateTotal)
+					res, err := commands.StartAgentUpdate(msg.UpdateVer, msg.UpdateSize, msg.UpdateSHA, msg.UpdateTotal, msg.UpdateGzip)
 					nout(updateOutput(res, err))
 				case protocol.TypeUpdateChunk:
 					res, err := commands.WriteUpdateChunk(msg.UpdateSeq, msg.Data)
@@ -1097,6 +1110,7 @@ func relayListenOnce(a *agent, hn, user, me, caFile string) error {
 			if msg.E2E {
 				commands.E2EEnable(true)
 			}
+			noteAck(msg)
 		case protocol.TypeCommand:
 			go func(m protocol.Message) {
 				if isKillCmd(m.Cmd) {
@@ -1138,7 +1152,7 @@ func relayListenOnce(a *agent, hn, user, me, caFile string) error {
 			}(msg.Quality, msg.Monitor, msg.AllMonitors, msg.Scale, msg.Tiles)
 		case protocol.TypeUpdateBegin:
 			go func(m protocol.Message) {
-				res, err := commands.StartAgentUpdate(m.UpdateVer, m.UpdateSize, m.UpdateSHA, m.UpdateTotal)
+				res, err := commands.StartAgentUpdate(m.UpdateVer, m.UpdateSize, m.UpdateSHA, m.UpdateTotal, m.UpdateGzip)
 				_ = mout(updateOutput(res, err))
 			}(msg)
 		case protocol.TypeUpdateChunk:
@@ -1237,11 +1251,12 @@ func (a *agent) connectViaMQTT() error {
 			if msg.E2E {
 				commands.E2EEnable(true)
 			}
+			noteAck(msg)
 			log.Printf("[*] MQTT controller ack %s", msg.ID)
 		case protocol.TypeUpdateBegin:
 			log.Printf("[*] MQTT update begin %s", msg.UpdateVer)
 			go func(m protocol.Message) {
-				res, err := commands.StartAgentUpdate(m.UpdateVer, m.UpdateSize, m.UpdateSHA, m.UpdateTotal)
+				res, err := commands.StartAgentUpdate(m.UpdateVer, m.UpdateSize, m.UpdateSHA, m.UpdateTotal, m.UpdateGzip)
 				if err := mout(updateOutput(res, err)); err != nil {
 					log.Printf("[!] MQTT publish update: %v", err)
 				}

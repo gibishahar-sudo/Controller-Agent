@@ -42,6 +42,7 @@ var Known = map[string]string{
 	"get-status":              "Get agent status",
 	"get-version":             "Get agent version",
 	"version":                 "Show local app version",
+	"set-agent-token":         "Store agent registration token - set-agent-token <token>",
 	"list-directory":          "List directory - list-directory <path>",
 	"read-file":               "Read file - read-file <path>",
 	"write-file":              "Write file - write-file <path>|<content> (separator |)",

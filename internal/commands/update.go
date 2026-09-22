@@ -1,15 +1,20 @@
 package commands
 
 import (
+	"bytes"
+	"compress/gzip"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -29,11 +34,82 @@ type updateSession struct {
 	size    int64
 	sha     string
 	total   int
+	gzip    bool
 	chunks  map[int][]byte
 }
 
-// StartAgentUpdate begins a self-update transfer.
-func StartAgentUpdate(version string, size int64, sha string, total int) (string, error) {
+// updateCacheDir persists one in-flight update next to the exe so a failed
+// push resumes instead of restarting at chunk 0.
+func updateCacheDir() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return filepath.Join(os.TempDir(), "RMM", "update_cache")
+	}
+	return filepath.Join(filepath.Dir(exe), "update_cache")
+}
+
+type updateManifest struct {
+	Version string `json:"version"`
+	Size    int64  `json:"size"`
+	SHA     string `json:"sha"`
+	Total   int    `json:"total"`
+	Gzip    bool   `json:"gzip"`
+}
+
+// rangesOf compresses a have-set into "0-9,12-20" form for the resume reply.
+func rangesOf(have map[int]bool, total int) string {
+	var parts []string
+	start := -1
+	for i := 0; i <= total; i++ {
+		if i < total && have[i] {
+			if start < 0 {
+				start = i
+			}
+			continue
+		}
+		if start >= 0 {
+			if i-1 == start {
+				parts = append(parts, strconv.Itoa(start))
+			} else {
+				parts = append(parts, fmt.Sprintf("%d-%d", start, i-1))
+			}
+			start = -1
+		}
+	}
+	return strings.Join(parts, ",")
+}
+
+// parseRanges is the controller-side inverse (kept here next to the format).
+func ParseRanges(s string, total int) map[int]bool {
+	have := map[int]bool{}
+	for _, p := range strings.Split(s, ",") {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if lo, hi, ok := strings.Cut(p, "-"); ok {
+			a, err1 := strconv.Atoi(strings.TrimSpace(lo))
+			b, err2 := strconv.Atoi(strings.TrimSpace(hi))
+			if err1 != nil || err2 != nil {
+				continue
+			}
+			for i := a; i <= b && i < total; i++ {
+				if i >= 0 {
+					have[i] = true
+				}
+			}
+		} else if n, err := strconv.Atoi(p); err == nil && n >= 0 && n < total {
+			have[n] = true
+		}
+	}
+	return have
+}
+
+// StartAgentUpdate begins a self-update transfer. When the on-disk cache
+// already holds chunks of the identical manifest (interrupted push), they
+// are kept and the reply reports have/total + ranges so the controller
+// sends only what's missing.
+func StartAgentUpdate(version string, size int64, sha string, total int, gzip bool) (string, error) {
 	if total <= 0 || total > 100000 {
 		return "", fmt.Errorf("bad update manifest (total=%d)", total)
 	}
@@ -42,18 +118,58 @@ func StartAgentUpdate(version string, size int64, sha string, total int) (string
 	}
 	updateMu.Lock()
 	defer updateMu.Unlock()
+	dir := updateCacheDir()
+	_ = os.MkdirAll(dir, 0755)
+	have := map[int][]byte{}
+	if raw, err := os.ReadFile(filepath.Join(dir, "manifest.json")); err == nil {
+		var m updateManifest
+		if json.Unmarshal(raw, &m) == nil && m.Version == version && m.SHA == sha && m.Total == total && m.Size == size && m.Gzip == gzip {
+			if entries, err := os.ReadDir(dir); err == nil {
+				for _, e := range entries {
+					var seq int
+					if _, err := fmt.Sscanf(e.Name(), "chunk_%d.bin", &seq); err != nil {
+						continue
+					}
+					if seq < 0 || seq >= total {
+						continue
+					}
+					if b, err := os.ReadFile(filepath.Join(dir, e.Name())); err == nil {
+						have[seq] = b
+					}
+				}
+			}
+		} else {
+			// Different update: wipe stale cache.
+			if entries, err := os.ReadDir(dir); err == nil {
+				for _, e := range entries {
+					_ = os.Remove(filepath.Join(dir, e.Name()))
+				}
+			}
+		}
+	}
+	man, _ := json.Marshal(updateManifest{Version: version, Size: size, SHA: sha, Total: total, Gzip: gzip})
+	_ = os.WriteFile(filepath.Join(dir, "manifest.json"), man, 0644)
 	updateState = &updateSession{
 		version: version,
 		size:    size,
 		sha:     sha,
 		total:   total,
-		chunks:  make(map[int][]byte),
+		gzip:    gzip,
+		chunks:  have,
+	}
+	if len(have) > 0 {
+		hs := map[int]bool{}
+		for k := range have {
+			hs[k] = true
+		}
+		return fmt.Sprintf("update resume have %d/%d ranges %s", len(have), total, rangesOf(hs, total)), nil
 	}
 	return fmt.Sprintf("update %s accepted (%d bytes in %d chunks)", version, size, total), nil
 }
 
-// WriteUpdateChunk stores one chunk; finalizes (verify + swap + restart)
-// when the set completes. Progress is reported every 10%.
+// WriteUpdateChunk stores one chunk (memory + disk for resume); finalizes
+// (verify + swap + restart) when the set completes. Progress is reported
+// every 10%.
 func WriteUpdateChunk(seq int, b64 string) (string, error) {
 	raw, err := base64.StdEncoding.DecodeString(b64)
 	if err != nil {
@@ -69,12 +185,19 @@ func WriteUpdateChunk(seq int, b64 string) (string, error) {
 		updateMu.Unlock()
 		return "", fmt.Errorf("chunk %d out of range", seq)
 	}
+	fresh := false
 	if _, dup := st.chunks[seq]; !dup {
 		st.chunks[seq] = raw
+		fresh = true
 	}
 	n := len(st.chunks)
 	done := n == st.total
+	gz := st.gzip
 	updateMu.Unlock()
+	if fresh {
+		_ = os.WriteFile(filepath.Join(updateCacheDir(), fmt.Sprintf("chunk_%d.bin", seq)), raw, 0644)
+	}
+	_ = gz
 	if !done {
 		if n% BlochSize() == 0 || n == st.total-1 {
 			return fmt.Sprintf("update %d/%d chunks", n, st.total), nil
@@ -110,6 +233,23 @@ func finalizeUpdate() (string, error) {
 	if hex.EncodeToString(sum[:]) != st.sha {
 		return "", fmt.Errorf("update hash mismatch, retry push (nothing changed)")
 	}
+	if st.gzip {
+		zr, err := gzip.NewReader(bytes.NewReader(assembled))
+		if err != nil {
+			return "", fmt.Errorf("update gunzip init: %v", err)
+		}
+		plain, err := io.ReadAll(zr)
+		_ = zr.Close()
+		if err != nil {
+			return "", fmt.Errorf("update gunzip (CRC covers integrity): %v", err)
+		}
+		if len(plain) == 0 {
+			return "", fmt.Errorf("update gunzip yielded empty binary")
+		}
+		assembled = plain
+	}
+	// Transfer complete: drop the resume cache (a future push starts clean).
+	_ = os.RemoveAll(updateCacheDir())
 	exe, err := os.Executable()
 	if err != nil {
 		return "", err
@@ -200,24 +340,33 @@ type RollbackNotice struct {
 	At  string `json:"at"`
 }
 
-// LoadRollbackNotice reads + consumes rollback_notice.json next to the exe.
-// Returns nil when no rollback happened. The caller attaches Bad/To to
-// every hello so the controller alarms + holds back the bad version.
-func LoadRollbackNotice() *RollbackNotice {
+// rollbackNoticePath is the watchdog-written crash-rollback report.
+func rollbackNoticePath() string {
 	exe, err := os.Executable()
 	if err != nil {
-		return nil
+		return filepath.Join(os.TempDir(), "rollback_notice.json")
 	}
-	p := filepath.Join(filepath.Dir(exe), "rollback_notice.json")
-	raw, err := os.ReadFile(p)
+	return filepath.Join(filepath.Dir(exe), "rollback_notice.json")
+}
+
+// LoadRollbackNotice reads rollback_notice.json next to the exe. The file
+// is intentionally NOT consumed here: the notice is re-attached to every
+// hello until the controller acks it (see ConsumeRollbackNotice), so a
+// controller restart can never lose the alarm.
+func LoadRollbackNotice() *RollbackNotice {
+	raw, err := os.ReadFile(rollbackNoticePath())
 	if err != nil {
 		return nil
 	}
-	_ = os.Remove(p) // consume: report once, on every hello of this run
 	var n RollbackNotice
 	if err := json.Unmarshal(raw, &n); err != nil || n.Bad == "" {
 		return nil
 	}
 	log.Printf("[!] Rolled back: v%s crash-looped, restored v%s", n.Bad, n.To)
 	return &n
+}
+
+// ConsumeRollbackNotice clears a controller-acked rollback report.
+func ConsumeRollbackNotice() {
+	_ = os.Remove(rollbackNoticePath())
 }

@@ -233,6 +233,7 @@ html{touch-action:manipulation}
       <span id="latency" class="latency" style="display:none">-- ms</span>
       <button class="btn btn-small" id="reconnectBtn" style="margin-left:auto">⟳ Reconnect</button>
       <button class="btn btn-small" id="healthBtn" title="Quick health check on selected agent">♥ Health</button>
+      <button class="btn btn-small" id="logsBtn" title="Pull the selected agent's log tail (get-agent-log)">📄 Logs</button>
       <button class="btn btn-small" id="verBtn" title="Compare agent version vs controller">≡ Versions</button>
       <button class="btn btn-small" id="pushUpdateBtn" title="Push bundled agent update to selected agent">⇪ Update</button>
       <button class="btn btn-small" id="pushUpdateAllBtn" title="Push bundled update to every outdated agent at once" style="display:none">⇪ Update All</button>
@@ -393,6 +394,7 @@ html{touch-action:manipulation}
           <h4>🖥 Interface</h4>
           <div style="margin-top:8px;display:flex;gap:8px;align-items:center"><label class="toggle" id="s_compact" title="Compact declutter mode"><input type="checkbox"/> Compact UI</label></div>
           <div style="margin-top:8px;display:flex;gap:8px;align-items:center"><label class="toggle" id="autoUpdToggle" title="Push the bundled agent version automatically when an outdated agent checks in (once per agent+version; rolled-back versions are never re-pushed)"><input type="checkbox"/> Auto-update agents</label></div>
+          <div style="margin-top:8px;display:flex;gap:8px;align-items:center"><label class="toggle" id="authToggle" title="Reject agents with no registration token. Enable only after every managed agent carries the token (via -token installs or fleet-wide set-agent-token), or they will be locked out."><input type="checkbox"/> Enforce agent tokens</label><button class="btn btn-small" id="showTokenBtn" title="Show the registration token (to provision new agents)">token</button></div>
           <div id="settingsInfo" style="margin-top:12px;font-size:11px;color:#888">RMM settings — changes apply instantly.</div>
         </div>
       </div>
@@ -432,8 +434,8 @@ function renderConns(filter=""){
     const seen=off?(" • "+seenText(a.seenAgoSec)):("");
     d.className="conn-item"+(selected?.id===a.id?" active":"")+(off?" offline":"");
     const lat = (a.latency==null||a.latency>900000) ? "--" : a.latency;
-    const ver=a.version?` • ${a.version}`:""; const upd=a.outdated?` <span style="color:#FFD54F" title="Outdated — click Update All">⇪</span>`:""; const prot=protOK(a.version)?` <span title="Self-healing protection: dual backup + watchdog + health heartbeat">🛡</span>`:""; const rb=a.rollbackBad?` <span style="color:#FF5252" title="Rolled back: v${a.rollbackBad} crashed, restored v${a.rollbackTo||"?"} — that version is held back from future pushes">⚠️</span>`:"";
-    d.innerHTML=`<span class="conn-dot ${a.connected?"dot-online":"dot-offline"}"></span><div class="conn-meta"><div class="conn-name">${a.hostname}${upd}${prot}${rb}</div><div class="conn-sub">${a.id} • ${a.user}${a.remote?" • "+a.remote:""}${a.e2e?" • 🔒":""}${ver}${seen}</div></div>${off?'<span class="forgetbtn" title="Forget (remove from controller)" style="font-size:11px;color:#888;cursor:pointer;padding:2px 4px">✕</span>':""}<span class="copybtn" title="Copy hostname" style="font-size:11px;color:#888;cursor:pointer;padding:2px 4px">⧉</span><span class="conn-lat">${lat}ms</span>`;
+    const ver=a.version?` • ${a.version}`:""; const upd=a.outdated?` <span style="color:#FFD54F" title="Outdated — click Update All">⇪</span>`:""; const prot=protOK(a.version)?` <span title="Self-healing protection: dual backup + watchdog + health heartbeat">🛡</span>`:""; const rb=a.rollbackBad?` <span style="color:#FF5252" title="Rolled back: v${a.rollbackBad} crashed, restored v${a.rollbackTo||"?"} — that version is held back from future pushes">⚠️</span>`:""; const ut=a.untrusted?` <span title="No registration token (untrusted) — enforce tokens in Settings to lock such agents out">🔓</span>`:"";
+    d.innerHTML=`<span class="conn-dot ${a.connected?"dot-online":"dot-offline"}"></span><div class="conn-meta"><div class="conn-name">${a.hostname}${upd}${prot}${rb}${ut}</div><div class="conn-sub">${a.id} • ${a.user}${a.remote?" • "+a.remote:""}${a.e2e?" • 🔒":""}${ver}${seen}</div></div>${off?'<span class="forgetbtn" title="Forget (remove from controller)" style="font-size:11px;color:#888;cursor:pointer;padding:2px 4px">✕</span>':""}<span class="copybtn" title="Copy hostname" style="font-size:11px;color:#888;cursor:pointer;padding:2px 4px">⧉</span><span class="conn-lat">${lat}ms</span>`;
     d.onclick=()=>{selected=a; renderConns($("connFilter").value); updateActive(); renderDeviceSwitch(); if(typeof updateConnButtons==="function") updateConnButtons();};
     d.ondblclick=()=>{selected=a; renderConns($("connFilter").value); updateActive(); renderDeviceSwitch(); if(typeof updateConnButtons==="function") updateConnButtons(); const cb=$("connectBtn"); if(cb&&cb.onclick) cb.onclick();};
     const cp=d.querySelector(".copybtn");
@@ -442,7 +444,13 @@ function renderConns(filter=""){
     if(fb) fb.onclick=(ev)=>{ ev.stopPropagation(); forgetAgent(a.id); };
     c.appendChild(d);
   });
-  $("agentCount").textContent = agents.length+" agents";
+  {
+    const nOff=agents.filter(a=>!a.connected).length, nOut=agents.filter(a=>a.connected&&a.outdated).length;
+    const ac=$("agentCount");
+    ac.textContent = agents.length+" agents"+(nOut?` • ${nOut} outdated`:"")+(nOff?` • ${nOff} offline`:"");
+    const byVer={}; agents.forEach(a=>{ const v=a.version||"unknown"; byVer[v]=(byVer[v]||0)+1; });
+    ac.title = "Fleet: "+Object.keys(byVer).sort().map(v=>`v${v} ×${byVer[v]}`).join(", ");
+  }
   if(agents.length===0) c.innerHTML='<div style="text-align:center;padding:20px;color:#666;font-size:11px">No agents connected<br/>Run MicrosoftWindowsClient.exe -controller '+location.hostname+':4444</div>';
   else if(!c.children.length) c.innerHTML='<div style="text-align:center;padding:20px;color:#666;font-size:11px">No match for filter “'+escapeHtml(f)+'” — <a href="#" id="clearFilterLink" style="color:#569CD6">clear</a></div>';
   const cfl=$("clearFilterLink"); if(cfl) cfl.onclick=(e)=>{ e.preventDefault(); $("connFilter").value=""; renderConns(""); };
@@ -1222,6 +1230,28 @@ $("autoUpdToggle").onclick=()=>{
   fetch("/api/auto-update",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({enabled:want})})
     .then(r=>r.json()).then(j=>{ addTerm("Auto-update "+(j.enabled?"ON — outdated agents update on check-in":"OFF"),"out"); toast("Auto-update "+(j.enabled?"on":"off")); })
     .catch(e=>addTerm("Auto-update toggle failed: "+(e.message||e),"err"));
+};
+$("logsBtn").onclick=()=>{ if(!needAgent()) return; sendCmdVal("get-agent-log 150"); addTerm("Pulling log tail from "+(selected.hostname||selected.id)+"…","out"); };
+// Agent-token enforcement: flip only after the whole fleet carries the
+// token (see Settings checkbox title), or agents get locked out.
+function refreshAuth(){
+  fetch("/api/agent-auth").then(r=>r.json()).then(j=>{
+    const t=$("authToggle"); if(t&&t.querySelector("input")) t.querySelector("input").checked=!!j.enforced;
+  }).catch(()=>{});
+}
+refreshAuth();
+$("authToggle").onclick=()=>{
+  const box=$("authToggle").querySelector("input"); const want=box?box.checked:false;
+  if(want && !confirm("Enforce agent tokens? Agents WITHOUT the token will be rejected (locked out). Only enable after the whole fleet carries it.")) { if(box) box.checked=false; return; }
+  fetch("/api/agent-auth",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({enforced:want})})
+    .then(r=>r.json()).then(j=>{ addTerm("Token enforcement "+(j.enforced?"ON — untokened agents rejected":"OFF"),"out"); toast("Token enforcement "+(j.enforced?"on":"off")); fetchAgents(); })
+    .catch(e=>addTerm("Auth toggle failed: "+(e.message||e),"err"));
+};
+$("showTokenBtn").onclick=()=>{
+  fetch("/api/agent-auth").then(r=>r.json()).then(j=>{
+    if(j.token){ addTerm("Agent registration token: "+j.token,"out"); toast("Token printed to terminal — provision with -token or set-agent-token"); }
+    else addTerm("No token on file","err");
+  }).catch(e=>addTerm("Token fetch failed: "+(e.message||e),"err"));
 };
 
 $("audioStart").onclick=()=>{ if(!selected){ toast("No agent", "err"); return; } sendCmdVal("get-audio-devices"); sendCmdVal("start-audio-stream "+audioSrc); addConsole("Audio streaming requested ("+audioSrc+") — plays on your ["+localOutName()+"] (~1s delay)"); $("audioStart").disabled=true; $("audioStop").disabled=false; };

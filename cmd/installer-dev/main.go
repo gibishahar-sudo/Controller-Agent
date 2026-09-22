@@ -1,7 +1,10 @@
 package main
 
 import (
+	"bytes"
+	"crypto/rand"
 	"embed"
+	"encoding/hex"
 	"fmt"
 	"io/fs"
 	"os"
@@ -227,6 +230,22 @@ func main() {
 	}
 	_ = os.WriteFile(filepath.Join(installDir, "version.txt"), []byte(version.Version+"\n"), 0644)
 	_ = os.WriteFile(filepath.Join(backupDir, "controller-version.txt"), []byte(version.Version+"\n"), 0644)
+
+	// Agent registration token: shared secret agents present in hello so
+	// rogue agents can't blend into the fleet. Kept across reinstalls.
+	tokenPath := filepath.Join(installDir, "agent_token.txt")
+	if b, err := os.ReadFile(tokenPath); err != nil || len(bytes.TrimSpace(b)) == 0 {
+		var rb [24]byte
+		_, _ = rand.Read(rb[:])
+		tok := hex.EncodeToString(rb[:])
+		_ = os.WriteFile(tokenPath, []byte(tok+"\n"), 0600)
+		fmt.Println("[*] Generated agent registration token.")
+		fmt.Println("    Distribute it: reinstall agents with Agent-Setup.exe -token <token>,")
+		fmt.Println("    or send it fleet-wide with: set-agent-token <token> (send-to-all),")
+		fmt.Println("    then enable enforcement in Settings. Token file: " + tokenPath)
+	} else {
+		fmt.Println("[*] Kept existing agent registration token.")
+	}
 
 	// Add/Remove Programs entry
 	fmt.Println("[*] Registering uninstall...")

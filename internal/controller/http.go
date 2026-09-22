@@ -348,6 +348,28 @@ func (s *Server) startHTTP(addr, dir string) {
 		s.autoUpdate.Store(*req.Enabled)
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{"enabled": s.autoUpdate.Load()})
 	})
+	mux.HandleFunc("/api/agent-auth", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodGet {
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"enforced": s.enforceAuth.Load(), "hasToken": s.agentToken != "", "token": s.agentToken,
+			})
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, "GET or POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			Enforced *bool `json:"enforced"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&req); err != nil || req.Enforced == nil {
+			http.Error(w, "bad json: need {\"enforced\":true|false}", http.StatusBadRequest)
+			return
+		}
+		s.enforceAuth.Store(*req.Enforced)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"enforced": s.enforceAuth.Load()})
+	})
 	mux.HandleFunc("/api/forget-agent", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "POST only", http.StatusMethodNotAllowed)

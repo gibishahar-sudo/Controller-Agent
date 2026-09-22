@@ -151,6 +151,8 @@ func Execute(cmd, args string) (string, error) {
 		return fmt.Sprintf("hostname=%s os=%s arch=%s go=%s version=%s", hn, runtime.GOOS, runtime.GOARCH, runtime.Version(), version.Version), nil
 	case "get-version", "version":
 		return version.Agent(), nil
+	case "set-agent-token":
+		return SetAgentToken(args)
 	case "get-hostname":
 		hn, _ := os.Hostname()
 		return hn, nil

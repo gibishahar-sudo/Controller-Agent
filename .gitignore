@@ -1,3 +1,11 @@
 certs/server.key
 screenshots/
 *.exe
+# Release helper scripts embed the GitHub token - never commit them.
+ship*_tmp.ps1
+upload*_tmp.ps1
+release*_id.txt
+# Dev-run controller artifacts (secrets + runtime state) - never commit.
+agent_token.txt
+agents.json
+rollback_held.json
