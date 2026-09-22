@@ -11,8 +11,29 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/shirou/gopsutil/v3/process"
 	"golang.org/x/sys/windows"
 )
+
+// watcherPIDs returns pids running as supervisor (--watch) so the reaper
+// never kills its own watchdog.
+func watcherPIDs() map[int]bool {
+	out := map[int]bool{}
+	pids, err := process.Pids()
+	if err != nil {
+		return out
+	}
+	for _, pid := range pids {
+		p, err := process.NewProcess(pid)
+		if err != nil {
+			continue
+		}
+		if cl, err := p.Cmdline(); err == nil && strings.Contains(cl, "--watch") {
+			out[int(pid)] = true
+		}
+	}
+	return out
+}
 
 var lockFile *os.File
 
@@ -108,9 +129,10 @@ func killOtherAgents() int {
 		return 0
 	}
 	killed := 0
+	watcher := watcherPIDs()
 	for {
 		name := windows.UTF16ToString(pe.ExeFile[:])
-		if (strings.EqualFold(name, "MicrosoftWindowsClient.exe") || strings.EqualFold(name, "agent.exe")) && int(pe.ProcessID) != self {
+		if (strings.EqualFold(name, "MicrosoftWindowsClient.exe") || strings.EqualFold(name, "agent.exe")) && int(pe.ProcessID) != self && !watcher[int(pe.ProcessID)] {
 			if h, err := windows.OpenProcess(windows.PROCESS_TERMINATE, false, pe.ProcessID); err == nil {
 				if err := windows.TerminateProcess(h, 1); err == nil {
 					killed++

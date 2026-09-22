@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
@@ -559,6 +560,89 @@ func dialAddrs(primary string, houses []string) []string {
 	return uniq
 }
 
+type dialResult struct {
+	conn net.Conn
+	addr string
+}
+
+// lastGoodPath caches the winning dial address next to the exe.
+func lastGoodPath() string {
+	if exe, err := os.Executable(); err == nil {
+		return filepath.Join(filepath.Dir(exe), "lastgood.txt")
+	}
+	return filepath.Join(os.TempDir(), "lastgood.txt")
+}
+
+func loadLastGood() string {
+	b, err := os.ReadFile(lastGoodPath())
+	if err != nil {
+		return ""
+	}
+	if lg := strings.TrimSpace(strings.Split(string(b), "\n")[0]); lg != "" {
+		return lg
+	}
+	return ""
+}
+
+func saveLastGood(addr string) {
+	_ = os.WriteFile(lastGoodPath(), []byte(addr+"\n"), 0644)
+}
+
+// raceDials dials every candidate concurrently; the first success wins and
+// losers are closed. Returns the winning conn + addr, or the last error
+// when every dial failed.
+func raceDials(addrs []string, baseCfg *tls.Config, insecure bool, caFile string) (net.Conn, string, error) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	dialer := &net.Dialer{Timeout: 5 * time.Second}
+	winCh := make(chan dialResult, 1)
+	doneCh := make(chan struct{})
+	var mu sync.Mutex
+	pending := len(addrs)
+	var lastErr error
+	tryWin := func(conn net.Conn, addr string) {
+		select {
+		case winCh <- dialResult{conn, addr}:
+		default:
+			conn.Close() // lost the race
+		}
+	}
+	for _, addr := range addrs {
+		go func(addr string) {
+			useCfg := baseCfg
+			if strings.Contains(addr, "192.168.") && !insecure {
+				clone := baseCfg.Clone()
+				clone.InsecureSkipVerify = true
+				useCfg = clone
+			}
+			td := &tls.Dialer{NetDialer: dialer, Config: useCfg}
+			conn, err := td.DialContext(ctx, "tcp", addr)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				log.Printf("[!] Dial %s failed: %v", addr, err)
+				lastErr = err
+			} else {
+				tryWin(conn, addr)
+			}
+			if pending--; pending == 0 {
+				close(doneCh)
+			}
+		}(addr)
+	}
+	select {
+	case w := <-winCh:
+		return w.conn, w.addr, nil
+	case <-doneCh:
+		mu.Lock()
+		defer mu.Unlock()
+		if lastErr == nil {
+			lastErr = fmt.Errorf("no dial candidates")
+		}
+		return nil, "", lastErr
+	}
+}
+
 func (a *agent) connectOnce() error {
 	var tlsCfg *tls.Config
 	if a.insecure {
@@ -575,29 +659,32 @@ func (a *agent) connectOnce() error {
 		tlsCfg = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
 	}
 
+	// Last-good first: the winner of the previous race dials first, so a
+	// stable setup reconnects in ~one RTT instead of re-racing everything.
 	uniqAddrs := dialAddrs(a.controllerAddr, loadHouses())
-	var conn net.Conn
-	var dialErr error
+	if lg := loadLastGood(); lg != "" {
+		uniqAddrs = append([]string{lg}, uniqAddrs...)
+		seen := map[string]bool{}
+		dedup := uniqAddrs[:0]
+		for _, x := range uniqAddrs {
+			if !seen[x] {
+				seen[x] = true
+				dedup = append(dedup, x)
+			}
+		}
+		uniqAddrs = dedup
+	}
+	// Happy-eyeballs race: dial every candidate concurrently, first success
+	// wins. Worst case is one timeout (~5s), not the sum of all of them.
+	conn, dialAddr, dialErr := raceDials(uniqAddrs, tlsCfg, a.insecure, a.caFile)
 	var err error
-	// Bounded dials: the old tls.Dial had no timeout and each attempt hung
-	// ~21s (4 addrs = 84s before ntfy was even tried).
-	dialer := &net.Dialer{Timeout: 5 * time.Second}
-	for _, addr := range uniqAddrs {
-		useCfg := tlsCfg
-		if strings.Contains(addr, "192.168.") && !a.insecure {
-			clone := tlsCfg.Clone()
-			clone.InsecureSkipVerify = true
-			useCfg = clone
-		}
-		log.Printf("[*] Dialing %s (insecure=%v ca=%s)...", addr, a.insecure, a.caFile)
-		conn, dialErr = tls.DialWithDialer(dialer, "tcp", addr, useCfg)
-		if dialErr == nil {
-			log.Printf("[+] Connected to %s", addr)
-			a.controllerAddr = addr
-			err = nil
-			break
-		}
-		log.Printf("[!] Dial %s failed: %v", addr, dialErr)
+	if dialErr == nil {
+		log.Printf("[+] Connected to %s", dialAddr)
+		a.controllerAddr = dialAddr
+		saveLastGood(dialAddr)
+		err = nil
+	} else {
+		log.Printf("[!] All direct dials failed: %v", dialErr)
 		err = dialErr
 	}
 	// MQTT relay (persistent outbound TCP, zero polling) before ntfy.
@@ -1532,6 +1619,7 @@ func main() {
 	ntfyServer := flag.String("ntfy-server", "", "ntfy relay host (empty = default)")
 	ntfyOnly := flag.Bool("ntfy-only", false, "skip direct dials, use ntfy relay only (mobile: saves battery/time)")
 	mqttOnly := flag.Bool("mqtt-only", false, "skip direct dials, use MQTT relay only")
+	watchMode := flag.Bool("watch", false, "run as supervisor: keep the agent alive, no network")
 	testOnly := flag.Bool("test", false, "dial controller once, print result, exit")
 	showHelp := flag.Bool("help", false, "show help")
 	flag.Parse()
@@ -1550,6 +1638,10 @@ func main() {
 		}
 	}
 	setupLogFile()
+	if *watchMode {
+		runWatch()
+		return
+	}
 	commands.EnsureKeepAwake()
 	// Liveness marker for the watchdog (process-exists is not enough).
 	healthyStop := make(chan struct{})
