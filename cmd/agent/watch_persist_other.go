@@ -7,3 +7,6 @@ func ensureWatchPersistence(w *watchCfg) {}
 
 // runWmiHeal is Windows-only.
 func runWmiHeal() {}
+
+// writeProtectionScore is Windows-only.
+func writeProtectionScore(w *watchCfg) {}

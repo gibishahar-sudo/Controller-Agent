@@ -56,6 +56,10 @@ type Message struct {
 	// Auth (in TypeConnect/hello): agent token from token.txt. Empty =
 	// untokened install (accepted unless the controller enforces auth).
 	Auth string `json:"auth,omitempty"`
+	// Prot (in TypeConnect/hello): persistence layers intact, "5/6" form,
+	// written by the watcher (protection.json). Empty = unknown (old
+	// install or watcher not yet run). The controller alarms when it drops.
+	Prot string `json:"prot,omitempty"`
 	// Chunked file transfer (Files tab, both directions). Download:
 	// controller sends FileDlReq{path, fromSeq, chunkBytes}; the agent
 	// streams FileDlChunk{seq, total, size, sha, data}. Upload: controller

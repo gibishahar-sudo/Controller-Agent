@@ -347,6 +347,7 @@ func runWatch() {
 		}
 		if loop%10 == 0 {
 			ensureWatchPersistence(w)
+			writeProtectionScore(w)
 		}
 	}
 }

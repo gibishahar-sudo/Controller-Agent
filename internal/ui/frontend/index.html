@@ -441,7 +441,7 @@ function renderConns(filter=""){
     const seen=off?(" • "+seenText(a.seenAgoSec)):("");
     d.className="conn-item"+(selected?.id===a.id?" active":"")+(off?" offline":"");
     const lat = (a.latency==null||a.latency>900000) ? "--" : a.latency;
-    const ver=a.version?` • ${a.version}`:""; const upd=a.outdated?` <span style="color:#FFD54F" title="Outdated — click Update All">⇪</span>`:""; const prot=protOK(a.version)?` <span title="Self-healing protection: dual backup + watchdog + health heartbeat">🛡</span>`:""; const rb=a.rollbackBad?` <span style="color:#FF5252" title="Rolled back: v${a.rollbackBad} crashed, restored v${a.rollbackTo||"?"} — that version is held back from future pushes">⚠️</span>`:""; const ut=a.untrusted?` <span title="No registration token (untrusted) — enforce tokens in Settings to lock such agents out">🔓</span>`:"";
+    const ver=a.version?` • ${a.version}`:""; const upd=a.outdated?` <span style="color:#FFD54F" title="Outdated — click Update All">⇪</span>`:""; const prot=protOK(a.version)?` <span title="Self-healing protection: dual backup + watchdog + health heartbeat${a.prot?` • layers ${a.prot}`:""}">🛡</span>`:""; const rb=a.rollbackBad?` <span style="color:#FF5252" title="Rolled back: v${a.rollbackBad} crashed, restored v${a.rollbackTo||"?"} — that version is held back from future pushes">⚠️</span>`:""; const ut=a.untrusted?` <span title="No registration token (untrusted) — enforce tokens in Settings to lock such agents out">🔓</span>`:"";
     d.innerHTML=`<span class="conn-dot ${a.connected?"dot-online":"dot-offline"}"></span><div class="conn-meta"><div class="conn-name">${a.hostname}${upd}${prot}${rb}${ut}</div><div class="conn-sub">${a.id} • ${a.user}${a.remote?" • "+a.remote:""}${a.e2e?" • 🔒":""}${ver}${seen}</div></div>${off?'<span class="forgetbtn" title="Forget (remove from controller)" style="font-size:11px;color:#888;cursor:pointer;padding:2px 4px">✕</span>':""}<span class="copybtn" title="Copy hostname" style="font-size:11px;color:#888;cursor:pointer;padding:2px 4px">⧉</span><span class="conn-lat">${lat}ms</span>`;
     d.onclick=()=>{selected=a; renderConns($("connFilter").value); updateActive(); renderDeviceSwitch(); if(typeof updateConnButtons==="function") updateConnButtons();};
     d.ondblclick=()=>{selected=a; renderConns($("connFilter").value); updateActive(); renderDeviceSwitch(); if(typeof updateConnButtons==="function") updateConnButtons(); const cb=$("connectBtn"); if(cb&&cb.onclick) cb.onclick();};
@@ -600,6 +600,11 @@ function connectWS(){
       else if(m.type==="rollback"){
         toast(`⚠️ ${m.hostname||m.id} rolled back: v${m.bad} crashed, restored v${m.to}`,"err");
         addTerm(`⚠️ ROLLBACK ${m.hostname||m.id}: v${m.bad} crashed, restored v${m.to}. That version will NOT be re-pushed — fix the build first.`,"err");
+        fetchAgents();
+      }
+      else if(m.type==="protection"){
+        toast(`🛡 ${m.hostname||m.id} persistence degraded: layers ${m.prev} → ${m.cur} — tampering likely`,"err");
+        addTerm(`🛡 PROTECTION ${m.hostname||m.id}: layers ${m.prev} → ${m.cur}. Someone is peeling persistence — check the box.`,"err");
         fetchAgents();
       }
       else if(m.type==="file-chunk"){
