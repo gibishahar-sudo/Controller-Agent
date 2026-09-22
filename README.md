@@ -29,6 +29,24 @@ Phone controller/agent live alongside at `1.0.0`.
 `-controller HOST:4444 -token <agent-token>`). The agent starts hidden and
 dials home; it appears in the controller's Connections list.
 
+### If Windows blocks the download (friend PCs)
+
+Since v1.40.15 every binary is Authenticode-signed by our `CN=RMM` cert, and
+both setups automatically:
+
+1. trust the publisher cert (TrustedPublisher store — no more "unknown
+   publisher" SmartScreen block), and
+2. add Defender path/process exclusions for the install dir.
+
+If Windows still stops it, in order:
+
+- **SmartScreen "Unknown publisher"** on old builds: click *More info →
+  Run anyway*. v1.40.15+ signed builds don't show this after install.
+- **"Virus detected / download blocked"** in the browser: … → *Keep* (it's
+  the heuristic on admin tools, same class as PsExec).
+- **Defender quarantine**: *Windows Security → Protection history* → allow
+  the file, then re-run the setup (it adds exclusions going forward).
+
 ## Highlights (v1.40.13)
 
 - **Self-healing agent** — dual hidden backups, native `--watch` supervisor

