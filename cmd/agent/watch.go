@@ -16,7 +16,12 @@ package main
 //     (Windows-only persistence heal).
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -42,6 +47,7 @@ type watchCfg struct {
 	backupAgent2   string
 	backupCert2    string
 	legacyDir      string
+	legacyDirX86   string
 }
 
 func legacyHomeDir() string {
@@ -49,6 +55,89 @@ func legacyHomeDir() string {
 		return filepath.Join(pf, "RMM", "Agent")
 	}
 	return `C:\Program Files\RMM\Agent`
+}
+
+// legacyHomeDirX86 is the 32-bit twin honeypot (attackers check both).
+func legacyHomeDirX86() string {
+	if pf := os.Getenv("ProgramFiles(x86)"); pf != "" {
+		return filepath.Join(pf, "RMM", "Agent")
+	}
+	return `C:\Program Files (x86)\RMM\Agent`
+}
+
+// verLess compares dotted versions numerically ("1.40.9" < "1.40.17").
+func verLess(a, b string) bool {
+	pa, pb := strings.Split(a, "."), strings.Split(b, ".")
+	for i := 0; i < len(pa) && i < len(pb); i++ {
+		var x, y int
+		_, _ = fmt.Sscanf(pa[i], "%d", &x)
+		_, _ = fmt.Sscanf(pb[i], "%d", &y)
+		if x != y {
+			return x < y
+		}
+	}
+	return len(pa) < len(pb)
+}
+
+// refreshStaleBackups converges backups to a PROVEN install: only when no
+// update is pending (pending = unconfirmed, possibly crash-looping) and
+// never over a same-version byte mismatch (that is tampering, owned by
+// verifyBinary). Keeps backups from rotting one fleet version behind.
+func (w *watchCfg) refreshStaleBackups() {
+	if _, err := os.Stat(filepath.Join(w.installDir, "pending_update.json")); err == nil {
+		return
+	}
+	instVer := readVerFile(w.installDir)
+	if instVer == "" {
+		return
+	}
+	instBin, err := os.ReadFile(w.agentPath)
+	if err != nil || len(instBin) == 0 {
+		return
+	}
+	type slot struct{ dir, bin, cert, ver, tok string }
+	for _, d := range []slot{
+		{w.backupDir, w.backupAgent, w.backupCert, filepath.Join(w.backupDir, "version.txt"), filepath.Join(w.backupDir, "token.txt")},
+		{w.backupDir2, w.backupAgent2, w.backupCert2, filepath.Join(w.backupDir2, "version.txt"), filepath.Join(w.backupDir2, "token.txt")},
+	} {
+		bv := ""
+		if b, err := os.ReadFile(d.ver); err == nil {
+			bv = strings.TrimSpace(string(b))
+		}
+		if h1, h2 := fileHash(w.agentPath), fileHash(d.bin); h1 != "" && h1 == h2 && (bv == "" || bv == instVer) {
+			if bv == "" {
+				_ = os.WriteFile(d.ver, []byte(instVer+"\n"), 0644)
+			}
+			continue // already converged
+		}
+		if bv == instVer {
+			continue // same version, different bytes: tamper, owned by verifyBinary
+		}
+		_ = os.MkdirAll(d.dir, 0755)
+		_ = os.WriteFile(d.bin, instBin, 0755)
+		if cb, err := os.ReadFile(w.caPath); err == nil {
+			_ = os.WriteFile(d.cert, cb, 0644)
+		}
+		_ = os.WriteFile(d.ver, []byte(instVer+"\n"), 0644)
+		if tb, err := os.ReadFile(filepath.Join(w.installDir, "token.txt")); err == nil && len(bytes.TrimSpace(tb)) > 0 {
+			_ = os.WriteFile(d.tok, tb, 0600)
+		}
+		log.Printf("[watch] backup converged to proven v%s", instVer)
+	}
+}
+
+// fileHash returns the SHA256 hex of a file ("" on any error).
+func fileHash(path string) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return ""
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 func userProfileDir() string {
@@ -89,6 +178,7 @@ func loadWatchCfg() *watchCfg {
 		backupAgent2:   filepath.Join(cache, "MicrosoftWindowsClient.exe"),
 		backupCert2:    filepath.Join(cache, "server.crt"),
 		legacyDir:      legacyHomeDir(),
+		legacyDirX86:   legacyHomeDirX86(),
 	}
 }
 
@@ -121,23 +211,30 @@ func setProtAlarm(alarm string) {
 	log.Printf("[watch] TAMPER TRIPWIRE: %s", alarm)
 }
 
-// checkDecoyFiles inspects the honeypot (cheap stats, every loop). Skips
-// machines predating the honeypot (no bait marker, no alarm).
+// checkDecoyFiles inspects both honeypots (cheap stats, every loop).
+// Skips machines predating the honeypot (no bait marker, no alarm).
 func checkDecoyFiles(w *watchCfg) string {
-	if w.legacyDir == "" {
+	if alarm := checkOneDecoy(w.legacyDir, "decoy"); alarm != "" {
+		return alarm
+	}
+	return checkOneDecoy(w.legacyDirX86, "x86 decoy")
+}
+
+func checkOneDecoy(dir, tag string) string {
+	if dir == "" {
 		return ""
 	}
-	if _, err := os.Stat(filepath.Join(w.legacyDir, "decoy.ver")); os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(dir, "decoy.ver")); os.IsNotExist(err) {
 		return ""
 	}
-	if _, err := os.Stat(filepath.Join(w.legacyDir, "agent.exe")); os.IsNotExist(err) {
-		return "decoy agent.exe deleted"
+	if _, err := os.Stat(filepath.Join(dir, "agent.exe")); os.IsNotExist(err) {
+		return tag + " agent.exe deleted"
 	}
-	if _, err := os.Stat(filepath.Join(w.legacyDir, "server.crt")); os.IsNotExist(err) {
-		return "decoy server.crt deleted"
+	if _, err := os.Stat(filepath.Join(dir, "server.crt")); os.IsNotExist(err) {
+		return tag + " server.crt deleted"
 	}
-	if _, err := os.Stat(filepath.Join(w.legacyDir, "decoy_exec.txt")); err == nil {
-		return "decoy agent.exe EXECUTED"
+	if _, err := os.Stat(filepath.Join(dir, "decoy_exec.txt")); err == nil {
+		return tag + " agent.exe EXECUTED"
 	}
 	return ""
 }
@@ -256,10 +353,39 @@ func (w *watchCfg) pickBackup() (bin, cert string) {
 	return "", ""
 }
 
+// verifyBinary enforces install integrity: when install and backup report
+// the SAME version but different bytes, the install was swapped out from
+// under us (trojan swap) — restore the known-good backup and trip the wire.
+// A version mismatch means an update is in flight: hands off.
+func (w *watchCfg) verifyBinary() {
+	instVer := readVerFile(w.installDir)
+	if instVer == "" {
+		return
+	}
+	bin, _ := w.pickBackup()
+	if bin == "" {
+		return
+	}
+	if readVerFile(filepath.Dir(bin)) != instVer {
+		return // update in flight (or stale backup): not our call
+	}
+	if h1, h2 := fileHash(w.agentPath), fileHash(bin); h1 != "" && h2 != "" && h1 != h2 {
+		log.Printf("[watch] INSTALLED BINARY DIFFERS FROM BACKUP (same v%s) - restoring known-good", instVer)
+		w.killAgents() // Windows locks running exes: stop it first
+		time.Sleep(2 * time.Second)
+		if b, err := os.ReadFile(bin); err == nil {
+			_ = os.WriteFile(w.agentPath, b, 0755)
+		}
+		setProtAlarm("agent binary replaced - restored backup v" + instVer)
+	}
+}
+
 // restoreBinary heals a wiped install from backup (version-guarded so a
 // stale backup never downgrades a bulk-updated agent) and re-syncs a wiped
 // backup location from its survivor. Also restores a missing token.
 func (w *watchCfg) restoreBinary() {
+	// Integrity first: a swapped (not wiped) binary must not execute.
+	w.verifyBinary()
 	if _, err := os.Stat(w.agentPath); os.IsNotExist(err) {
 		bin, cert := w.pickBackup()
 		if bin == "" {
@@ -268,7 +394,7 @@ func (w *watchCfg) restoreBinary() {
 		}
 		instVer := readVerFile(w.installDir)
 		bakVer := readVerFile(filepath.Dir(bin))
-		if bakVer != "" && instVer != "" && bakVer < instVer {
+		if bakVer != "" && instVer != "" && verLess(bakVer, instVer) {
 			log.Printf("[watch] backup v%s older than installed v%s - skipping restore", bakVer, instVer)
 			return
 		}
@@ -383,6 +509,9 @@ func runWatch() {
 		if alarm := checkDecoyFiles(w); alarm != "" {
 			setProtAlarm(alarm)
 		}
+		// Install integrity (hash compare, every pass): a running swapped
+		// binary is worse than a dead one.
+		w.verifyBinary()
 		noteRestart := func() {
 			now := time.Now().Unix()
 			crashTimes = append(crashTimes, now)
@@ -410,6 +539,7 @@ func runWatch() {
 		}
 		if loop%10 == 0 {
 			ensureWatchPersistence(w)
+			w.refreshStaleBackups()
 			writeProtectionScore(w)
 		}
 	}

