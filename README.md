@@ -47,6 +47,14 @@ If Windows still stops it, in order:
 - **Defender quarantine**: *Windows Security → Protection history* → allow
   the file, then re-run the setup (it adds exclusions going forward).
 
+## Highlights (v1.41.1 — rigid for friends)
+
+- **Dashboard** — RMM Fleet second tab: total/online/offline, by-version/by-group, live rollback/tamper alarms. `Ctrl+2`.
+- **Fleet Groups** — tag agents, filter lists, broadcast per group. Persisted.
+- **Macros + Scheduler** — runbooks per controller + per-agent cron (once/hourly/daily, optional group).
+- **Drag-Drop + Voice** — drop files onto file panes/screen to upload; voice talk-back gated OFF (mic test ready).
+- **Self-healing agent** — dual hidden backups, native `--watch` supervisor
+
 ## Highlights (v1.40.13)
 
 - **Self-healing agent** — dual hidden backups, native `--watch` supervisor

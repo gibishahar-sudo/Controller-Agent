@@ -2331,28 +2331,21 @@ document.getElementById("schedAdd")?.addEventListener("click", ()=>{
 });
 
 // Drag-Drop upload: drop files onto file panes or screen stream
-function handleDropFiles(files, dstDir){
+async function handleDropFiles(files, dstDir){
   if(!selected) return toast("Select an agent first","err");
-  [...files].forEach(f=>{
-    const r=new FileReader(); r.onload=()=>{ const b64=r.result.split(",")[1]; const total=Math.ceil(b64.length/700000); /* reuse file-ul path via data url chunking */
-      fetch("/api/file-slice?path=dummy",{}).catch(()=>{});
-      // Use existing upload path: write via /api/file-op then file-ul — for dropped File objects, we send directly as file-ul
-      const dst=(dstDir.replace(/\\$/,"")+"\\"+f.name);
-      // Chunk the base64
-      const chunks=[]; for(let i=0;i<b64.length;i+=512*1024) chunks.push(b64.slice(i,i+512*1024));
-      fetch("/api/dashboard").catch(()=>{}); // keepalive
-      // Direct WS upload of dropped file
-      const doUpload=async()=>{
-        const ab=await f.arrayBuffer(); const bytes=new Uint8Array(ab); let hex=""; try{ const d=await crypto.subtle.digest("SHA-256",bytes); hex=[...new Uint8Array(d)].map(x=>x.toString(16).padStart(2,"0")).join(""); }catch{}
-        const chSize=xferChunkRaw(selected); const totalCh=Math.max(1, Math.ceil(b64.length/(chSize*1.37)));
-        // Re-encode properly: reuse file-slice chunking would be cleaner, but for File objects we have bytes already
-        const b64full=await new Promise(res=>{ const fr=new FileReader(); fr.onload=()=>res(fr.result.split(",")[1]); fr.readAsDataURL(f); });
-        const parts=[]; for(let i=0;i<b64full.length;i+=512*1024) parts.push(b64full.slice(i,i+512*1024));
-        ws.send(JSON.stringify({type:"file-ul-begin",target:selected.id,path:dst,size:f.size,sha:hex,total:parts.length}));
-        for(let i=0;i<parts.length;i++){ ws.send(JSON.stringify({type:"file-ul-chunk",target:selected.id,seq:i,data:parts[i]})); setXfer( Math.round(100*(i+1)/parts.length), "↑ "+f.name+" "+(i+1)+"/"+parts.length); await new Promise(r=>setTimeout(r, xferPace(selected))); }
-      }; doUpload();
-    }; r.readAsDataURL(files[0]); // start with first; sequential handled by caller loop in real use — keep simple for first drop
-  });
+  if(!ws||ws.readyState!==1) return toast("Not connected","err");
+  for(const f of [...files]){
+    const dst=(dstDir.replace(/\\$/,"")+"\\"+f.name);
+    const ab=await f.arrayBuffer(); const bytes=new Uint8Array(ab);
+    let hex=""; try{ const d=await crypto.subtle.digest("SHA-256",bytes); hex=[...new Uint8Array(d)].map(x=>x.toString(16).padStart(2,"0")).join(""); }catch{}
+    let b64=""; const chunk=8192; // btoa chunk avoids call-stack blow on large files
+    for(let i=0;i<bytes.length;i+=chunk){ b64+=btoa(String.fromCharCode(...bytes.subarray(i,i+chunk))); }
+    const parts=[]; for(let i=0;i<b64.length;i+=512*1024) parts.push(b64.slice(i,i+512*1024));
+    if(!parts.length) parts.push("");
+    ws.send(JSON.stringify({type:"file-ul-begin",target:selected.id,path:dst,size:f.size,sha:hex,total:parts.length}));
+    for(let i=0;i<parts.length;i++){ ws.send(JSON.stringify({type:"file-ul-chunk",target:selected.id,seq:i,data:parts[i]})); setXfer(Math.round(100*(i+1)/parts.length), "↑ "+f.name+" "+(i+1)+"/"+parts.length); await new Promise(r=>setTimeout(r, xferPace(selected))); }
+    addTerm("↑ Dropped "+f.name+" → "+dst+" ("+f.size+" bytes)","out");
+  }
 }
 document.querySelectorAll(".file-pane, #screenWrap").forEach(el=>{
   el.addEventListener("dragover", e=>{ e.preventDefault(); el.style.outline="2px dashed var(--accent)"; });

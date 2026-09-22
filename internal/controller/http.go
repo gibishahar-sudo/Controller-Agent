@@ -660,6 +660,9 @@ func (s *Server) startHTTP(addr, dir string) {
 		if r.Method == http.MethodGet {
 			s.jobsMu.Lock()
 			cp := append([]schedJob(nil), s.jobs...)
+			if cp == nil {
+				cp = []schedJob{}
+			}
 			s.jobsMu.Unlock()
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(cp)
