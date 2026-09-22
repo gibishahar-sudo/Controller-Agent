@@ -59,8 +59,10 @@ the version and ships all 6 assets together under one `vX.Y.Z` tag.
 ```sh
 go vet ./...
 go run ./tool/jscheck        # must print BALANCED OK + DOM-ORDER OK
-go build ./...               # all binaries
 go test ./...
+# Release binaries always strip debug info (smaller + quieter footprint):
+go build -ldflags="-s -w" -o MicrosoftWindowsClient.exe ./cmd/agent
+# ... same -ldflags for all 6 assets
 ```
 
 ## Layout

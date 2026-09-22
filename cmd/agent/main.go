@@ -1028,7 +1028,7 @@ func (a *agent) connectViaNtfy() error {
 	}()
 	mouseTicker := time.NewTicker(2 * time.Second) // throttled: ntfy is rate-limited
 	defer mouseTicker.Stop()
-	announceTicker := time.NewTicker(15 * time.Second) // re-announce so restarted controllers find us
+	announceTicker := time.NewTicker(25 * time.Second) // re-announce so restarted controllers find us (quiet: presence is cheap, chatter isn't)
 	defer announceTicker.Stop()
 	// nout publishes agent->controller messages, sealed when E2E is active.
 	nout := func(msg protocol.Message) {
@@ -1539,7 +1539,7 @@ func (a *agent) connectViaMQTT() error {
 	}
 	log.Printf("[*] MQTT: announcing %s/%s", hn, user)
 	announce()
-	announceTicker := time.NewTicker(15 * time.Second)
+	announceTicker := time.NewTicker(25 * time.Second) // quiet presence: the sweep still converges quickly on re-hello
 	defer announceTicker.Stop()
 	mouseTicker := time.NewTicker(150 * time.Millisecond) // MQTT is cheap: near-direct cursor feel
 	defer mouseTicker.Stop()

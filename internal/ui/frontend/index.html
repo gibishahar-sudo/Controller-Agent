@@ -198,6 +198,7 @@ html{touch-action:manipulation}
 .toast{padding:10px 14px;border-radius:8px;font-size:12px;border:1px solid var(--border);background:var(--bg-light);color:var(--fg);box-shadow:0 4px 16px rgba(0,0,0,.5);animation:toastIn .2s ease-out}
 .toast.err{border-color:var(--error);background:rgba(255,107,107,.12)}
 .toast.ok{border-color:var(--success);background:rgba(139,195,74,.12)}
+.search-cur{background:rgba(255,213,79,.28)!important;outline:1px solid #FFD54F}
 @keyframes toastIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
 </style>
 </head>
@@ -271,6 +272,10 @@ html{touch-action:manipulation}
         <span style="font-size:11px;color:#888">FPS:</span><select id="fpsSel" class="select" title="Stream frame rate"><option value="0">On-demand</option><option value="1" selected>1</option><option value="2">2</option><option value="5">5</option><option value="10">10</option><option value="15">15</option><option value="20">20</option><option value="30">30</option><option value="60">60</option></select>
         <span style="font-size:11px;color:#888">Pipe:</span><select id="pipeSel" class="select" title="Frames allowed in flight: overlaps round trips for higher fps"><option value="1">1</option><option value="2">2</option><option value="3" selected>3</option><option value="4">4</option><option value="5">5</option><option value="6">6</option></select>
         <span style="font-size:11px;color:#888">Detail:</span><select id="detailSel" class="select" title="Capture detail: Auto uses full-res on direct links, half-res on relay links"><option value="auto" selected>Auto</option><option value="full">Full</option><option value="half">Half</option></select>
+        <div class="sep"></div>
+        <span style="font-size:11px;color:#888">Preset:</span><select id="presetSel" class="select" title="One-click display presets (sets Quality+FPS+Detail+Pipe)"><option value="custom">Custom</option><option value="fast">Fast</option><option value="balanced" selected>Balanced</option><option value="crisp">Crisp</option></select>
+        <button class="btn btn-small" id="clipPullBtn" title="Copy remote clipboard text to this PC">⧉ Get Clip</button>
+        <button class="btn btn-small" id="clipPushBtn" title="Send text to the remote clipboard">⧉ Set Clip</button>
       </div>
       <div class="toolbar">
         <span style="font-size:11px;color:#888">Cmd:</span><input id="screenCmd" placeholder="Type a command… (Enter to send, Tab to complete)" style="flex:1;background:var(--bg-input);border:1px solid var(--border);color:var(--fg);padding:5px 8px;border-radius:6px;font-family:inherit;font-size:11px;outline:none"/><button class="btn btn-small" id="screenSend">Send</button>
@@ -329,7 +334,7 @@ html{touch-action:manipulation}
       <div id="cmdFavs" class="cmd-favs"><span style="font-size:11px;color:#888">Favorites:</span>
         <span class="chip" data-cmd="version">version</span><span class="chip" data-cmd="get-system-info">get-system-info</span><span class="chip" data-cmd="list-directory C:\">list-directory</span><span class="chip" data-cmd="get-processes">get-processes</span><span class="chip" data-cmd="get-ip-address">get-ip-address</span><button class="btn btn-small" id="addCmdFav">＋ Add</button>
       </div>
-      <div class="searchbar" id="searchBar" style="display:none"><input id="searchInput" placeholder="Search output..."/><button class="btn btn-small" id="searchPrev">↑</button><button class="btn btn-small" id="searchNext">↓</button><button class="btn btn-small" id="searchClose">✕</button></div>
+      <div class="searchbar" id="searchBar" style="display:none"><input id="searchInput" placeholder="Search output... (Enter=next, Shift+Enter=prev, Esc=close)"/><span id="searchCount" style="font-size:11px;color:#888;min-width:44px;text-align:right"></span><button class="btn btn-small" id="searchPrev">↑</button><button class="btn btn-small" id="searchNext">↓</button><button class="btn btn-small" id="searchClose">✕</button></div>
       <div id="terminal" class="terminal"><div class="line" style="color:#569CD6">[System] Connected — type <span style="color:#CE9178">help</span> for commands, <span style="color:#CE9178">Tab</span> for autocomplete</div></div>
       <div id="suggest" class="suggest"></div>
       <div class="inputbar">
@@ -550,6 +555,13 @@ function connectWS(){
             }
           }
           if(t==="out" && /^upload complete:/.test(m.data||"")){ toast("Upload complete"); if(typeof refreshFiles==="function") refreshFiles(true); }
+          if(pendingClipPull && m.id===pendingClipPull){
+            pendingClipPull=null;
+            const txt=m.data||"";
+            if(!txt){ toast("Remote clipboard is empty"); }
+            else if(navigator.clipboard&&navigator.clipboard.writeText) navigator.clipboard.writeText(txt).then(()=>toast(`Remote clipboard copied locally (${txt.length} chars)`)).catch(()=>toast("Local clipboard write blocked by browser","err"));
+            else toast("Clipboard API unavailable here","err");
+          }
           let line=`[${m.id||selected?.id||"agent"}] ${m.data||m.error||""}`;
           if(lastCmdAt && Date.now()-lastCmdAt<30000) line+=` • ${Date.now()-lastCmdAt}ms`;
           addTerm(line, t); addScreenLog(line);
@@ -652,6 +664,7 @@ function mergeAgents(incoming){
   if(selected && !agents.find(a=>a.id===selected.id)) selected=agents[0]||null;
   if(!selected && agents[0]) selected=agents[0];
   renderConns($("connFilter").value); renderDeviceSwitch(); updateActive();
+  if(typeof refreshSendAllBtn==="function") refreshSendAllBtn();
   const wsel=$("wsState"); if(wsel) wsel.textContent=`WS live • ${agents.length} agent(s) • ${new Date().toLocaleTimeString()}`;
 }
 let agentsFetchOk=true;
@@ -950,11 +963,13 @@ function maybeWizard(text){
   openWizard(first, w.desc, w.fields, w.build);
   return true;
 }
+function sendAllCount(){ return agents.filter(a=>!a.id.startsWith("manual-")&&!a.id.startsWith("conn-")&&a.connected).length; }
+function refreshSendAllBtn(){ const b=$("sendAllBtn"); if(b&&sendAllOn) b.textContent=`All: ON (${sendAllCount()})`; }
 $("sendAllBtn").onclick=e=>{
   sendAllOn=!sendAllOn;
-  e.currentTarget.textContent=sendAllOn?"All: ON":"All: OFF";
+  e.currentTarget.textContent=sendAllOn?`All: ON (${sendAllCount()})`:"All: OFF";
   e.currentTarget.classList.toggle("btn-primary", sendAllOn);
-  addTerm(sendAllOn?"Send-to-all ON — commands go to every agent":"Send-to-all OFF", "out");
+  addTerm(sendAllOn?`Send-to-all ON — commands go to every connected agent (${sendAllCount()})`:"Send-to-all OFF", "out");
 };
 $("exportLog").onclick=()=>{
   const txt=[...term.querySelectorAll(".line")].map(l=>l.textContent).join("\n");
@@ -964,19 +979,39 @@ $("exportLog").onclick=()=>{
   setTimeout(()=>URL.revokeObjectURL(a.href), 5000);
 };
 $("clearTerm").onclick=()=>{ term.innerHTML=""; };
-// Search in terminal
-$("searchInput")?.addEventListener("input", e=>{
-  const q=e.target.value.toLowerCase();
-  [...term.querySelectorAll(".line")].forEach(l=>{
-    l.style.display = !q || l.textContent.toLowerCase().includes(q) ? "" : "none";
-  });
+// Search in terminal: live filter + match navigation with current-hit
+// highlight and a count readout.
+let searchHits=[], searchIdx=-1;
+function updateSearchCount(){ const el=$("searchCount"); if(el) el.textContent=searchHits.length?`${searchIdx+1}/${searchHits.length}`:""; }
+function markSearchCur(){
+  [...term.querySelectorAll(".search-cur")].forEach(l=>l.classList.remove("search-cur"));
+  if(searchIdx>=0&&searchHits[searchIdx]){ searchHits[searchIdx].classList.add("search-cur"); searchHits[searchIdx].scrollIntoView({block:"nearest"}); }
+  updateSearchCount();
+}
+function runSearch(){
+  const q=$("searchInput").value.toLowerCase();
+  searchHits=[...term.querySelectorAll(".line")].filter(l=>!q||l.textContent.toLowerCase().includes(q));
+  [...term.querySelectorAll(".line")].forEach(l=>{ l.style.display = !q||searchHits.includes(l)?"":"none"; });
+  searchIdx=searchHits.length?0:-1;
+  markSearchCur();
+}
+function searchStep(dir){
+  if(!searchHits.length) return;
+  searchIdx=(searchIdx+dir+searchHits.length)%searchHits.length;
+  markSearchCur();
+}
+$("searchInput")?.addEventListener("input", runSearch);
+$("searchInput")?.addEventListener("keydown", e=>{
+  if(e.key==="Enter"){ e.preventDefault(); searchStep(e.shiftKey?-1:1); }
+  else if(e.key==="Escape"){ $("searchClose").click(); }
 });
-$("searchPrev")?.addEventListener("click", ()=>{ addTerm("Search prev — use browser Ctrl+F for now", "out"); });
-$("searchNext")?.addEventListener("click", ()=>{ addTerm("Search next — use browser Ctrl+F", "out"); });
+$("searchPrev")?.addEventListener("click", ()=>searchStep(-1));
+$("searchNext")?.addEventListener("click", ()=>searchStep(1));
 $("searchClose")?.addEventListener("click", ()=>{
   $("searchBar").style.display="none";
   $("searchInput").value="";
-  [...term.querySelectorAll(".line")].forEach(l=>l.style.display="");
+  searchHits=[]; searchIdx=-1; updateSearchCount();
+  [...term.querySelectorAll(".line")].forEach(l=>{ l.style.display=""; l.classList.remove("search-cur"); });
 });
 document.addEventListener("keydown", e=>{
   if(e.ctrlKey && e.key==="f"){ e.preventDefault(); $("searchBar").style.display="flex"; $("searchInput").focus(); }
@@ -1116,8 +1151,8 @@ function stopStream(silent){
 }
 $("screenStop").onclick=()=>stopStream(false);
 $("followSel").onchange=()=>{ followSelMode=$("followSel").value||"auto"; const r=followRateEff(); addConsole("Follow "+followSelMode+(followSelMode==="auto"?` (auto: ${r}Hz on this link)`:(r>0?` (${r}Hz)`:" (off)"))); };
-$("pipeSel").onchange=()=>{ pipeDepth=parseInt($("pipeSel").value)||3; addConsole("Pipeline depth "+pipeDepth); if(streaming) topUpShots(); };
-$("detailSel").onchange=()=>{ const d=$("detailSel").value||"auto"; addConsole("Detail "+d+(d==="auto"?" (auto: "+(streamScale()===1?"full-res on this link":"half-res on this link")+")":"")); if(streaming) topUpShots(); };
+$("pipeSel").onchange=()=>{ pipeDepth=parseInt($("pipeSel").value)||3; markPresetCustom(); addConsole("Pipeline depth "+pipeDepth); if(streaming) topUpShots(); };
+$("detailSel").onchange=()=>{ const d=$("detailSel").value||"auto"; markPresetCustom(); addConsole("Detail "+d+(d==="auto"?" (auto: "+(streamScale()===1?"full-res on this link":"half-res on this link")+")":"")); if(streaming) topUpShots(); };
 function applyZoom(){ const img=$("screenImg"); if(img) img.style.transform=screenZoom>1?`scale(${screenZoom})`:""; }
 $("zoomIn").onclick=()=>{ screenZoom=Math.min(4,Math.round((screenZoom+0.25)*100)/100); applyZoom(); };
 $("zoomOut").onclick=()=>{ screenZoom=Math.max(1,Math.round((screenZoom-0.25)*100)/100); applyZoom(); };
@@ -1232,12 +1267,43 @@ $("monitorSel").onchange=()=>{
   $("screenRes").textContent = v==="-1"?"All": v==="0"?"Primary":"Monitor "+v;
   if(streaming) topUpShots();
 };
+function markPresetCustom(){ const p=$("presetSel"); if(p) p.value="custom"; }
 $("fpsSel").onchange=()=>{
   const fps=parseInt($("fpsSel").value);
   addConsole(fps>0 ? "FPS "+fps : "FPS on-demand (single shots)");
+  markPresetCustom();
   if(streaming) topUpShots();
 };
-$("qualitySel").onchange=()=>{ qualityTouched=true; addConsole("Quality manual: "+$("qualitySel").value); if(streaming) topUpShots(); };
+$("qualitySel").onchange=()=>{ qualityTouched=true; markPresetCustom(); addConsole("Quality manual: "+$("qualitySel").value); if(streaming) topUpShots(); };
+// One-click display presets (Quality + FPS + Detail + Pipe together).
+function applyPreset(p){
+  const q=$("qualitySel"), f=$("fpsSel"), d=$("detailSel"), pipe=$("pipeSel");
+  if(p==="fast"){ q.value="50"; f.value="5"; d.value="half"; pipe.value="5"; }
+  else if(p==="balanced"){ q.value="70"; f.value="2"; d.value="auto"; pipe.value="3"; }
+  else if(p==="crisp"){ q.value="0"; f.value="1"; d.value="full"; pipe.value="2"; }
+  else return;
+  qualityTouched=true; pipeDepth=parseInt(pipe.value)||3;
+  addConsole("Preset "+p+" (q="+q.value+" fps="+f.value+" detail="+d.value+" pipe="+pipe.value+")");
+  if(streaming) topUpShots();
+}
+$("presetSel").onchange=e=>{ if(e.target.value!=="custom") applyPreset(e.target.value); };
+// Clipboard sync with the remote PC.
+let pendingClipPull=null;
+$("clipPullBtn").onclick=()=>{
+  if(!needAgent()) return;
+  pendingClipPull=selected.id;
+  sendCmdVal("clipboard-get");
+  addTerm("Reading remote clipboard…","out");
+};
+$("clipPushBtn").onclick=async ()=>{
+  if(!needAgent()) return;
+  let t="";
+  try{ t=await navigator.clipboard.readText(); }catch{}
+  if(!t){ t=prompt("Text to set on the remote clipboard:",""); if(!t) return; }
+  if(t.length>100000){ toast("Too long for clipboard sync (>100KB)","err"); return; }
+  sendCmdVal("clipboard-set "+t);
+  addTerm(`Sent ${t.length} chars to remote clipboard`,"out");
+};
 // Auto-update agents: push the bundled version on outdated check-in.
 function refreshAutoUpd(){
   fetch("/api/auto-update").then(r=>r.json()).then(j=>{
