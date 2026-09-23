@@ -1115,11 +1115,12 @@ func launchApp(p string) (string, error) {
 	}
 	if runtime.GOOS == "windows" {
 		// Direct exec handles spaced paths; fall back to the shell
-		// association handler for documents/URLs.
-		if err := exec.Command(p).Start(); err == nil {
+		// association handler for documents/URLs. Launchers themselves
+		// never get a console (the launched GUI app shows its own UI).
+		if err := hideWindow(exec.Command(p)).Start(); err == nil {
 			return "", nil
 		}
-		return "", exec.Command("rundll32", "url.dll,FileProtocolHandler", p).Start()
+		return "", hideWindow(exec.Command("rundll32", "url.dll,FileProtocolHandler", p)).Start()
 	}
 	return "", exec.Command("sh", "-c", p+" &").Start()
 }
@@ -1129,7 +1130,7 @@ func openURL(u string) (string, error) {
 		return "", fmt.Errorf("url required")
 	}
 	if runtime.GOOS == "windows" {
-		return "", exec.Command("rundll32", "url.dll,FileProtocolHandler", u).Start()
+		return "", hideWindow(exec.Command("rundll32", "url.dll,FileProtocolHandler", u)).Start()
 	}
 	return "", exec.Command("xdg-open", u).Start()
 }
@@ -1249,7 +1250,7 @@ func lockScreen() (string, error) {
 		return "", fmt.Errorf("not supported on %s", runtime.GOOS)
 	}
 	// Start (not CombinedOutput): it returns immediately.
-	return "", exec.Command("rundll32.exe", "user32.dll,LockWorkStation").Start()
+	return "", hideWindow(exec.Command("rundll32.exe", "user32.dll,LockWorkStation")).Start()
 }
 
 func minimizeAll() (string, error) {

@@ -1770,6 +1770,13 @@ func main() {
 		}
 	}
 	setupLogFile()
+	// Hide our own console in every non-interactive mode: however this
+	// binary gets launched (Run key, task, WMI, service child,
+	// double-click), no window stays visible. -test/-help keep theirs so
+	// the operator can read the output.
+	if !*testOnly && !*showHelp {
+		hideOwnConsole()
+	}
 	if *svcHeal {
 		if err := runSvcHealing(); err != nil {
 			log.Fatalf("service: %v", err)
