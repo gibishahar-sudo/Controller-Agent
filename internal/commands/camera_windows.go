@@ -51,7 +51,7 @@ func capSend(hwnd, msg, w, l uintptr) uintptr {
 }
 
 // captureCameraJPEG grabs one frame at roughly maxW wide, JPEG quality q.
-func captureCameraJPEG(maxW, q int) ([]byte, error) {
+func captureCameraJPEG(dev, maxW, q int) ([]byte, error) {
 	name, _ := syscall.BytePtrFromString("RMM")
 	hwnd, _, _ := procCapCreate.Call(
 		uintptr(unsafe.Pointer(name)), wsPopup, 0, 0, 320, 240, 0, 0)
@@ -59,8 +59,8 @@ func captureCameraJPEG(maxW, q int) ([]byte, error) {
 		return nil, fmt.Errorf("no camera (capture window failed)")
 	}
 	defer procDestroyW.Call(hwnd)
-	if capSend(hwnd, wmCapDriverConnect, 0, 0) == 0 {
-		return nil, fmt.Errorf("no camera (driver connect failed — in use or absent)")
+	if capSend(hwnd, wmCapDriverConnect, uintptr(dev), 0) == 0 {
+		return nil, fmt.Errorf("no camera (driver %d connect failed — in use or absent)", dev)
 	}
 	defer capSend(hwnd, wmCapDriverDisconnect, 0, 0)
 	capSend(hwnd, wmCapGrabFrame, 0, 0)
@@ -179,16 +179,28 @@ func dibToImage(raw []byte) (image.Image, error) {
 
 func colorRGBA(r, g, b byte) color.RGBA { return color.RGBA{r, g, b, 0xff} }
 
-// cameraShot implements: camera-shot [quality 1-100, default 60].
-// Returns a data-URL JPEG (UI sniffs the prefix into the camera modal).
+// cameraShot implements: camera-shot [device 0-3] [quality 1-100].
+// Returns a data-URL JPEG (UI sniffs the prefix into the camera tab/modal).
 func cameraShot(args string) (string, error) {
-	q := 60
-	if a := strings.TrimSpace(args); a != "" {
-		if v, err := strconv.Atoi(a); err == nil && v >= 1 && v <= 100 {
+	dev, q := 0, 60
+	fields := strings.Fields(strings.TrimSpace(args))
+	if len(fields) >= 1 {
+		if v, err := strconv.Atoi(fields[0]); err == nil && v >= 0 && v <= 3 {
+			dev = v
+		} else if len(fields) == 1 {
+			// single arg is quality for backwards compat
+			if v, err := strconv.Atoi(fields[0]); err == nil && v >= 1 && v <= 100 {
+				q = v
+				dev = 0
+			}
+		}
+	}
+	if len(fields) >= 2 {
+		if v, err := strconv.Atoi(fields[1]); err == nil && v >= 1 && v <= 100 {
 			q = v
 		}
 	}
-	jpg, err := captureCameraJPEG(640, q)
+	jpg, err := captureCameraJPEG(dev, 640, q)
 	if err != nil {
 		return "", err
 	}
