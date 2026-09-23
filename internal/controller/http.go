@@ -890,20 +890,35 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 			_ = s.sendToAgent(ac, protocol.Message{Type: protocol.TypeScreenshotRequest, Quality: quality, Monitor: monitor, AllMonitors: allMonitors, Scale: scale, Tiles: tiles})
 		case "file-dl", "file-dl-more":
 			path, _ := msg["path"].(string)
+			via, _ := msg["via"].(string)
 			ac := s.getAgentByID(target)
 			if ac == nil || path == "" {
+				continue
+			}
+			rac, err := s.fileRoute(ac, via)
+			if err != nil {
+				_ = c.writeJSON(map[string]interface{}{"type": "output", "id": ac.id, "data": "file transfer: " + err.Error(), "success": false})
 				continue
 			}
 			from := 0
 			if f, ok := msg["fromSeq"].(float64); ok && f > 0 {
 				from = int(f)
 			}
-			_ = s.sendToAgent(ac, protocol.Message{Type: protocol.TypeFileDlReq, FilePath: path, FileFrom: from, FileChunk: fileChunkRaw(ac)})
+			if t == "file-dl" {
+				s.broadcastWS(map[string]interface{}{"type": "output", "id": ac.id, "data": fmt.Sprintf("files via %s → %s", rac.transport(), ac.hostname), "success": true})
+			}
+			_ = s.sendToAgent(rac, protocol.Message{Type: protocol.TypeFileDlReq, FilePath: path, FileFrom: from, FileChunk: fileChunkRaw(rac)})
 		case "file-ul-begin":
 			path, _ := msg["path"].(string)
 			sha, _ := msg["sha"].(string)
+			via, _ := msg["via"].(string)
 			ac := s.getAgentByID(target)
 			if ac == nil || path == "" {
+				continue
+			}
+			rac, err := s.fileRoute(ac, via)
+			if err != nil {
+				_ = c.writeJSON(map[string]interface{}{"type": "output", "id": ac.id, "data": "file transfer: " + err.Error(), "success": false})
 				continue
 			}
 			var size int64
@@ -914,26 +929,39 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 			if f, ok := msg["total"].(float64); ok {
 				total = int(f)
 			}
-			_ = s.sendToAgent(ac, protocol.Message{Type: protocol.TypeFileUlBegin, FilePath: path, FileSize: size, FileSHA: sha, FileTotal: total, FileChunk: fileChunkRaw(ac)})
+			s.broadcastWS(map[string]interface{}{"type": "output", "id": ac.id, "data": fmt.Sprintf("files via %s → %s", rac.transport(), ac.hostname), "success": true})
+			_ = s.sendToAgent(rac, protocol.Message{Type: protocol.TypeFileUlBegin, FilePath: path, FileSize: size, FileSHA: sha, FileTotal: total, FileChunk: fileChunkRaw(rac)})
 		case "file-ul-chunk":
 			data, _ := msg["data"].(string)
+			via, _ := msg["via"].(string)
 			ac := s.getAgentByID(target)
 			if ac == nil || data == "" {
+				continue
+			}
+			rac, err := s.fileRoute(ac, via)
+			if err != nil {
 				continue
 			}
 			seq := 0
 			if f, ok := msg["seq"].(float64); ok {
 				seq = int(f)
 			}
-			_ = s.sendToAgent(ac, protocol.Message{Type: protocol.TypeFileUlChunk, FileSeq: seq, Data: data, FileChunk: fileChunkRaw(ac)})
+			_ = s.sendToAgent(rac, protocol.Message{Type: protocol.TypeFileUlChunk, FileSeq: seq, Data: data, FileChunk: fileChunkRaw(rac)})
 		case "file-dl-to":
 			remote, _ := msg["remotePath"].(string)
 			local, _ := msg["localPath"].(string)
+			via, _ := msg["via"].(string)
 			ac := s.getAgentByID(target)
 			if ac == nil || remote == "" || local == "" {
 				continue
 			}
-			s.startDlTo(ac, remote, local)
+			rac, err := s.fileRoute(ac, via)
+			if err != nil {
+				_ = c.writeJSON(map[string]interface{}{"type": "output", "id": ac.id, "data": "file transfer: " + err.Error(), "success": false})
+				continue
+			}
+			s.broadcastWS(map[string]interface{}{"type": "output", "id": ac.id, "data": fmt.Sprintf("files via %s → %s", rac.transport(), ac.hostname), "success": true})
+			s.startDlTo(rac, remote, local)
 		case "ping":
 			ac := s.getAgentByID(target)
 			if ac != nil {

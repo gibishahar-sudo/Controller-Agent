@@ -701,6 +701,45 @@ func fileChunkRaw(ac *AgentConn) int {
 	}
 }
 
+// fileAgentFor picks the transport for bulk file transfer. MQTT is
+// preferred: no 4KB cap like ntfy and no dependence on a possibly-flaky
+// direct TCP link. Falls back to the selected agent. Chunk replies may
+// arrive under the sibling's id — both UI and dlTo sessions match by
+// hostname+path, so this is transparent.
+func (s *Server) fileAgentFor(ac *AgentConn) *AgentConn {
+	if ac == nil {
+		return nil
+	}
+	if ac.transport() == "mqtt" {
+		return ac
+	}
+	if sib := s.siblingRelay(ac); sib != nil && sib.transport() == "mqtt" {
+		return sib
+	}
+	return ac
+}
+
+// fileRoute resolves an explicit UI override ("mqtt"/"direct"/"" auto).
+func (s *Server) fileRoute(ac *AgentConn, via string) (*AgentConn, error) {
+	if ac == nil {
+		return nil, fmt.Errorf("no agent")
+	}
+	switch via {
+	case "mqtt":
+		if r := s.fileAgentFor(ac); r.transport() == "mqtt" {
+			return r, nil
+		}
+		return nil, fmt.Errorf("no MQTT link for %s", ac.hostname)
+	case "direct":
+		if ac.conn != nil {
+			return ac, nil
+		}
+		return nil, fmt.Errorf("no direct link for %s", ac.hostname)
+	default:
+		return s.fileAgentFor(ac), nil
+	}
+}
+
 // dlToSession is a server-side download: agent chunks land straight in a
 // controller-local .part file (for "save to a path on this PC"), renamed
 // into place on completion. Keyed by agent id + remote path.
@@ -715,7 +754,18 @@ type dlToSession struct {
 	started   time.Time
 }
 
-func (s *Server) dlToKey(id, remote string) string { return id + "\x00" + remote }
+func (s *Server) dlToKey(host, remote string) string { return host + "\x00" + remote }
+
+// senderHostname resolves a chunk sender to its hostname (sibling
+// transports share it, so dlTo sessions keyed by hostname survive routing).
+func (s *Server) senderHostname(id string) string {
+	s.agentsMu.RLock()
+	defer s.agentsMu.RUnlock()
+	if ac, ok := s.agents[id]; ok {
+		return ac.hostname
+	}
+	return ""
+}
 
 // startDlTo begins a server-side save (replaces any prior one for the same
 // file) and kicks the agent streaming.
@@ -726,7 +776,7 @@ func (s *Server) startDlTo(ac *AgentConn, remote, local string) {
 	if s.dlTo == nil {
 		s.dlTo = map[string]*dlToSession{}
 	}
-	s.dlTo[s.dlToKey(ac.id, remote)] = &dlToSession{
+	s.dlTo[s.dlToKey(ac.hostname, remote)] = &dlToSession{
 		localPath: local, part: local + ".part",
 		chunkRaw: chunkRaw, have: map[int]bool{}, started: time.Now(),
 	}
@@ -738,9 +788,12 @@ func (s *Server) startDlTo(ac *AgentConn, remote, local string) {
 // handleFileDlChunk fans one agent chunk out to the browser AND feeds any
 // active server-side save session for the same file.
 func (s *Server) handleFileDlChunk(id string, msg protocol.Message) {
-	s.dlToMu.Lock()
-	sess := s.dlTo[s.dlToKey(id, msg.FilePath)]
-	s.dlToMu.Unlock()
+	var sess *dlToSession
+	if host := s.senderHostname(id); host != "" {
+		s.dlToMu.Lock()
+		sess = s.dlTo[s.dlToKey(host, msg.FilePath)]
+		s.dlToMu.Unlock()
+	}
 	if sess != nil {
 		s.feedDlTo(id, sess, msg)
 	}
@@ -748,9 +801,11 @@ func (s *Server) handleFileDlChunk(id string, msg protocol.Message) {
 }
 
 func (s *Server) dlToFail(id string, sess *dlToSession, remote, why string) {
-	s.dlToMu.Lock()
-	delete(s.dlTo, s.dlToKey(id, remote))
-	s.dlToMu.Unlock()
+	if host := s.senderHostname(id); host != "" {
+		s.dlToMu.Lock()
+		delete(s.dlTo, s.dlToKey(host, remote))
+		s.dlToMu.Unlock()
+	}
 	_ = os.Remove(sess.part)
 	s.broadcastWS(map[string]interface{}{"type": "file-progress", "id": id, "path": remote, "local": sess.localPath, "status": "failed", "error": why})
 }
@@ -824,9 +879,11 @@ func (s *Server) feedDlTo(id string, sess *dlToSession, msg protocol.Message) {
 			s.dlToFail(id, sess, msg.FilePath, err.Error())
 			return
 		}
-		s.dlToMu.Lock()
-		delete(s.dlTo, s.dlToKey(id, msg.FilePath))
-		s.dlToMu.Unlock()
+		if host := s.senderHostname(id); host != "" {
+			s.dlToMu.Lock()
+			delete(s.dlTo, s.dlToKey(host, msg.FilePath))
+			s.dlToMu.Unlock()
+		}
 		log.Printf("[file] saved %s -> %s (%d bytes)", msg.FilePath, sess.localPath, sess.size)
 		s.broadcastWS(map[string]interface{}{"type": "file-progress", "id": id, "path": msg.FilePath, "local": sess.localPath, "sent": sess.total, "total": sess.total, "size": sess.size, "status": "done"})
 		s.broadcastWS(map[string]interface{}{"type": "output", "id": id, "data": fmt.Sprintf("Saved %s -> %s (%d bytes, sha ok)", msg.FilePath, sess.localPath, sess.size), "success": true})

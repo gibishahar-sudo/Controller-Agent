@@ -317,6 +317,7 @@ html{touch-action:manipulation}
           <button class="btn btn-primary" id="toRemote" title="Copy to remote">→</button>
           <button class="btn" id="toLocal" title="Download to browser">←</button>
           <button class="btn btn-small" id="dlToBtn" title="Download to a path on this controller PC">⤓…</button>
+          <select id="fileViaSel" class="select" title="Transfer transport: Auto prefers MQTT, or force one"><option value="">Auto</option><option value="mqtt">MQTT</option><option value="direct">Direct</option></select>
           <div class="progress" style="width:80px"><div id="transferBar" class="progress-bar"></div></div>
           <span id="transferLabel" style="font-size:10px;color:#888"></span>
           <button class="btn btn-small" id="xferCancelBtn" title="Cancel running/queued transfers">✕</button>
@@ -632,7 +633,9 @@ function connectWS(){
         fetchAgents();
       }
       else if(m.type==="file-chunk"){
-        if(!dlSession||m.id!==dlSession.id||m.path!==dlSession.path){ /* stale transfer */ }
+        // Match by path: chunks may arrive on a sibling transport (MQTT
+        // preferred) under a different agent id than requested.
+        if(!dlSession||m.path!==dlSession.path){ /* stale transfer */ }
         else if(m.error){ toast("Download failed: "+m.error,"err"); addTerm(`Download ${m.path}: ${m.error}`,"err"); if(dlSession.timer) clearTimeout(dlSession.timer); dlSession=null; setXfer(0,""); pumpDlQueue(); }
         else{
           dlSession.total=m.total||dlSession.total; dlSession.size=m.size||0; dlSession.sha=m.sha||"";
@@ -1594,7 +1597,7 @@ function previewFile(isRemote, name, size){
   if(!ws||ws.readyState!==1){ toast("Not connected", "err"); $("previewClose").onclick(); return; }
   if(dlSession){ toast("A transfer is already running","err"); $("previewClose").onclick(); return; }
   dlSession={id:selected.id,path:full,total:0,size:0,sha:"",chunks:new Map(),retries:0,timer:null,mode:"preview",kind:kind};
-  ws.send(JSON.stringify({type:"file-dl",target:selected.id,path:full}));
+  ws.send(JSON.stringify({type:"file-dl",target:selected.id,path:full,via:fileVia()}));
 }
 $("previewBtn").onclick=()=>{
   const selR=[...$("remoteList").querySelectorAll(".selected")];
@@ -1619,6 +1622,7 @@ function setXfer(pct,label){ $("transferBar").style.width=pct+"%"; $("transferLa
 // Chunk sizes mirror the controller's fileChunkRaw table — keep in sync.
 function xferChunkRaw(a){ const r=(a&&a.remote)||""; if(r==="mqtt") return 128*1024; if(r==="ntfy") return 2*1024; return 512*1024; }
 function xferPace(a){ const r=(a&&a.remote)||""; if(r==="ntfy") return 150; if(r==="mqtt") return 5; return 0; }
+function fileVia(){ const el=$("fileViaSel"); return el?el.value:""; }
 let dlSession=null; // {id,path,saveName,total,size,sha,chunks:Map,retries,timer,mode,kind}
 let dlQueue=[]; // queued browser downloads {path,saveName}
 let ulActive=0; // uploads currently streaming (for the queue readout)
@@ -1642,7 +1646,7 @@ function armDlGap(){
     if(dlSession.retries>=3){ toast("Download stalled — missing chunks after retries","err"); addTerm(`Download ${dlSession.path}: stalled at chunk ${first}/${dlSession.total}`,"err"); dlSession=null; setXfer(0,""); pumpDlQueue(); return; }
     dlSession.retries++;
     addTerm(`Download gap at chunk ${first} — re-requesting…`,"out");
-    ws.send(JSON.stringify({type:"file-dl-more",target:dlSession.id,path:dlSession.path,fromSeq:first}));
+    ws.send(JSON.stringify({type:"file-dl-more",target:dlSession.id,path:dlSession.path,fromSeq:first,via:fileVia()}));
     armDlGap();
   },3000);
 }
@@ -1665,7 +1669,7 @@ async function finishDownload(){
 function startDl(item){
   dlSession={id:selected.id,path:item.path,saveName:item.saveName,total:0,size:0,sha:"",chunks:new Map(),retries:0,timer:null,mode:"save"};
   addTerm(`Downloading ${item.path}…`,"out"); setXfer(0,"↓ 0%");
-  ws.send(JSON.stringify({type:"file-dl",target:selected.id,path:item.path}));
+  ws.send(JSON.stringify({type:"file-dl",target:selected.id,path:item.path,via:fileVia()}));
 }
 function pumpDlQueue(){
   if(xferCancel||dlSession||!dlQueue.length) return;
@@ -1698,10 +1702,10 @@ async function uploadOne(src, dst, tag){
     if(!b64s.length) b64s.push("");
     const flat=new Uint8Array(size); let p=0; for(const b of raws){ flat.set(b,p); p+=b.length; }
     const sha=await sha256hex(flat.subarray(0,p));
-    ws.send(JSON.stringify({type:"file-ul-begin",target:selected.id,path:dst,size:size,sha:sha,total:b64s.length}));
+    ws.send(JSON.stringify({type:"file-ul-begin",target:selected.id,path:dst,size:size,sha:sha,total:b64s.length,via:fileVia()}));
     for(let i=0;i<b64s.length;i++){
       if(xferCancel) throw new Error("cancelled");
-      ws.send(JSON.stringify({type:"file-ul-chunk",target:selected.id,seq:i,data:b64s[i]}));
+      ws.send(JSON.stringify({type:"file-ul-chunk",target:selected.id,seq:i,data:b64s[i],via:fileVia()}));
       setXfer(40+Math.round(60*(i+1)/b64s.length),`${tag}↑ sending ${i+1}/${b64s.length}`);
       if(pace) await new Promise(r=>setTimeout(r,pace));
     }
@@ -1827,7 +1831,7 @@ $("dlToBtn").onclick=()=>{
   const dst=prompt("Save to (path on this controller PC):", $("localPath").value.replace(/\\$/,"")+"\\"+name);
   if(!dst) return;
   addTerm(`Saving ${src} → ${dst}…`,"out"); setXfer(0,"⤓ 0%");
-  ws.send(JSON.stringify({type:"file-dl-to",target:selected.id,remotePath:src,localPath:dst}));
+  ws.send(JSON.stringify({type:"file-dl-to",target:selected.id,remotePath:src,localPath:dst,via:fileVia()}));
 };
 $("queueBtn").onclick=()=>{
   const parts=[];
@@ -2345,8 +2349,8 @@ async function handleDropFiles(files, dstDir){
     for(let i=0;i<bytes.length;i+=chunk){ b64+=btoa(String.fromCharCode(...bytes.subarray(i,i+chunk))); }
     const parts=[]; for(let i=0;i<b64.length;i+=512*1024) parts.push(b64.slice(i,i+512*1024));
     if(!parts.length) parts.push("");
-    ws.send(JSON.stringify({type:"file-ul-begin",target:selected.id,path:dst,size:f.size,sha:hex,total:parts.length}));
-    for(let i=0;i<parts.length;i++){ ws.send(JSON.stringify({type:"file-ul-chunk",target:selected.id,seq:i,data:parts[i]})); setXfer(Math.round(100*(i+1)/parts.length), "↑ "+f.name+" "+(i+1)+"/"+parts.length); await new Promise(r=>setTimeout(r, xferPace(selected))); }
+    ws.send(JSON.stringify({type:"file-ul-begin",target:selected.id,path:dst,size:f.size,sha:hex,total:parts.length,via:fileVia()}));
+    for(let i=0;i<parts.length;i++){ ws.send(JSON.stringify({type:"file-ul-chunk",target:selected.id,seq:i,data:parts[i],via:fileVia()})); setXfer(Math.round(100*(i+1)/parts.length), "↑ "+f.name+" "+(i+1)+"/"+parts.length); await new Promise(r=>setTimeout(r, xferPace(selected))); }
     addTerm("↑ Dropped "+f.name+" → "+dst+" ("+f.size+" bytes)","out");
   }
 }
