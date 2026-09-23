@@ -534,7 +534,9 @@ func (s *Server) ackCmd(cmdID string) {
 // cmdRetryLoop resends relay commands that produced no output within 10s
 // (one retry, then forgotten after 2 minutes). At-most-once delivery was
 // the relay's quiet data-loss hole; dedupe keeps this at-most-once
-// execution with at-least-once delivery attempt.
+// execution with at-least-once delivery attempt. Critical mode commands
+// bypass dedup, so retries for them use a fresh CmdID to actually
+// re-execute (idempotent, safe) instead of being suppressed.
 func (s *Server) cmdRetryLoop() {
 	t := time.NewTicker(5 * time.Second)
 	defer t.Stop()
@@ -554,6 +556,23 @@ func (s *Server) cmdRetryLoop() {
 			}
 			if age > 10e9 && p.retries < 1 {
 				p.retries++
+				// For mode path, use a fresh CmdID so the retry isn't
+				// suppressed (idempotent, must land).
+				msg := p.msg
+				lc := strings.ToLower(strings.TrimSpace(msg.Cmd))
+				if lc == "set-mode" || lc == "get-mode" {
+					newID := fmt.Sprintf("retry-%d-%s", time.Now().UnixNano(), id)
+					msg.CmdID = newID
+					delete(s.pending, id)
+					s.pending[newID] = &pendingCmd{msg: msg, targetID: p.targetID, sentAt: now, retries: p.retries}
+					s.pendingMu.Unlock()
+					if ac := s.getAgentByID(p.targetID); ac != nil {
+						log.Printf("[retry] %s (mode) no output in 10s, retrying as %s via %s", id, newID, ac.id)
+						_ = s.sendToAgent(ac, msg)
+					}
+					s.pendingMu.Lock()
+					continue
+				}
 				s.pendingMu.Unlock()
 				if ac := s.getAgentByID(p.targetID); ac != nil {
 					log.Printf("[retry] %s no output in 10s, resending via %s", id, ac.id)

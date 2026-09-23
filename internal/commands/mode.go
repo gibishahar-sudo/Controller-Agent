@@ -66,8 +66,15 @@ func SetAgentMode(m string) (string, error) {
 	if !IsValidMode(m) {
 		return "", fmt.Errorf("unknown mode %q (valid: %s)", m, strings.Join(ValidModes, ", "))
 	}
-	if err := os.WriteFile(agentModePath(), []byte(m+"\n"), 0644); err != nil {
+	path := agentModePath()
+	if err := os.WriteFile(path, []byte(m+"\n"), 0644); err != nil {
 		return "", err
+	}
+	// Ensure the file hits disk before we exit (otherwise the restart
+	// could read the old mode if power is cut or the write is buffered).
+	if f, err := os.Open(path); err == nil {
+		_ = f.Sync()
+		f.Close()
 	}
 	return "mode set to " + m + " (restarting into it)", nil
 }

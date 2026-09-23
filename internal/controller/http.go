@@ -937,7 +937,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 				total = int(f)
 			}
 			s.broadcastWS(map[string]interface{}{"type": "output", "id": ac.id, "data": fmt.Sprintf("files via %s → %s", rac.transport(), ac.hostname), "success": true})
-			_ = s.sendToAgent(rac, protocol.Message{Type: protocol.TypeFileUlBegin, FilePath: path, FileSize: size, FileSHA: sha, FileTotal: total, FileChunk: fileChunkRaw(rac)})
+			_ = s.sendWithRetry(rac, protocol.Message{Type: protocol.TypeFileUlBegin, FilePath: path, FileSize: size, FileSHA: sha, FileTotal: total, FileChunk: fileChunkRaw(rac)}, "file-ul-begin")
 		case "file-ul-chunk":
 			data, _ := msg["data"].(string)
 			via, _ := msg["via"].(string)
@@ -953,7 +953,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 			if f, ok := msg["seq"].(float64); ok {
 				seq = int(f)
 			}
-			_ = s.sendToAgent(rac, protocol.Message{Type: protocol.TypeFileUlChunk, FileSeq: seq, Data: data, FileChunk: fileChunkRaw(rac)})
+			_ = s.sendWithRetry(rac, protocol.Message{Type: protocol.TypeFileUlChunk, FileSeq: seq, Data: data, FileChunk: fileChunkRaw(rac)}, fmt.Sprintf("file-chunk %d", seq))
 		case "file-dl-to":
 			remote, _ := msg["remotePath"].(string)
 			local, _ := msg["localPath"].(string)

@@ -92,7 +92,13 @@ var (
 // runs (old controllers). Suppressed calls return suppressed=true so the
 // caller sends nothing instead of a confusing duplicate.
 func ExecuteChecked(cmdID, cmd, args string) (result string, suppressed bool, err error) {
-	if cmdID != "" {
+	// Critical mode commands must never be suppressed: retries need to
+	// re-execute (idempotent) and mode changes must land even if the
+	// first output was lost. Dedupe would make retries vanish.
+	lowerCmd := strings.ToLower(strings.TrimSpace(cmd))
+	if lowerCmd == "set-mode" || lowerCmd == "get-mode" {
+		// bypass dedup entirely for mode path
+	} else if cmdID != "" {
 		now := time.Now().UnixNano()
 		seenCmdsMu.Lock()
 		if ts, ok := seenCmds[cmdID]; ok && now-ts < int64(time.Minute) {
