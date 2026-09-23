@@ -266,6 +266,14 @@ func finalizeUpdate() (string, error) {
 	_ = os.Remove(prevExe)
 	_ = os.WriteFile(prevVerFile, []byte(version.DesktopAgentVersion+"\n"), 0644)
 	if err := os.Rename(exe, prevExe); err != nil {
+		if os.IsPermission(err) {
+			// Standard-user agent in an admin-owned dir: it can create
+			// files (chunk cache works) but cannot rename the running
+			// exe. Stage the binary for an elevated context (watcher /
+			// WMI heal / service run as admin-SYSTEM and swap it on
+			// their next run) instead of failing outright.
+			return stageUpdate(exe, assembled, st)
+		}
 		return "", fmt.Errorf("swap failed (need admin?): %v", err)
 	}
 	if err := os.WriteFile(exe, assembled, 0755); err != nil {
@@ -308,9 +316,93 @@ func finalizeUpdate() (string, error) {
 
 // pendingUpdate is the on-disk claim left by finalizeUpdate.
 type pendingUpdate struct {
-	From string `json:"from"`
-	To   string `json:"to"`
-	At   string `json:"at"`
+	From   string `json:"from"`
+	To     string `json:"to"`
+	At     string `json:"at"`
+	Staged bool   `json:"staged,omitempty"`
+}
+
+// stageUpdate stores a verified binary as MicrosoftWindowsClient.new.exe
+// for an elevated context to swap in. The agent itself runs unelevated on
+// many boxes (Access denied on rename of the admin-owned exe); the
+// watcher, WMI heal, and SYSTEM service all run elevated and call
+// ApplyStagedUpdate on their next run. Returns a progress message (not an
+// error) so the controller reports "staged, waiting for elevated apply"
+// and keeps its desired queue until the new version's hello confirms.
+func stageUpdate(exe string, assembled []byte, st *updateSession) (string, error) {
+	dir := filepath.Dir(exe)
+	staged := filepath.Join(dir, "MicrosoftWindowsClient.new.exe")
+	if err := os.WriteFile(staged, assembled, 0755); err != nil {
+		return "", fmt.Errorf("stage failed (need admin?): %v", err)
+	}
+	pend, _ := json.Marshal(pendingUpdate{
+		From: version.DesktopAgentVersion, To: st.version,
+		At: time.Now().UTC().Format(time.RFC3339), Staged: true,
+	})
+	_ = os.WriteFile(filepath.Join(dir, "pending_update.json"), pend, 0644)
+	_ = os.RemoveAll(updateCacheDir())
+	log.Printf("[*] Update %s staged (no swap rights) — elevated watcher/service applies it next run", st.version)
+	return fmt.Sprintf("update %s staged (%d bytes) — waiting for elevated apply (watcher/service swaps on next run)", st.version, len(assembled)), nil
+}
+
+// stagedPaths reports the staged binary + claim next to the exe.
+func stagedPaths() (newExe, pendFile, dir string) {
+	exe, err := os.Executable()
+	if err != nil {
+		return "", "", ""
+	}
+	dir = filepath.Dir(exe)
+	return filepath.Join(dir, "MicrosoftWindowsClient.new.exe"),
+		filepath.Join(dir, "pending_update.json"), dir
+}
+
+// ApplyStagedUpdate swaps a staged .new.exe into place. Called at startup
+// of elevated contexts (watcher, WMI heal, SYSTEM service): those can
+// rename the admin-owned exe while a standard-user agent cannot. The
+// running old process is untouched until restart (Windows allows renaming
+// a running exe). Returns true when it applied something.
+func ApplyStagedUpdate() bool {
+	newExe, pendFile, dir := stagedPaths()
+	if newExe == "" {
+		return false
+	}
+	if _, err := os.Stat(newExe); err != nil {
+		return false
+	}
+	raw, err := os.ReadFile(pendFile)
+	if err != nil {
+		return false
+	}
+	var pend pendingUpdate
+	if err := json.Unmarshal(raw, &pend); err != nil || !pend.Staged || pend.To == "" {
+		return false
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return false
+	}
+	prevExe := filepath.Join(dir, "MicrosoftWindowsClient.prev.exe")
+	_ = os.Remove(prevExe)
+	_ = os.WriteFile(filepath.Join(dir, "version.prev.txt"), []byte(version.DesktopAgentVersion+"\n"), 0644)
+	if err := os.Rename(exe, prevExe); err != nil {
+		log.Printf("[!] staged apply: rename running exe failed: %v", err)
+		return false
+	}
+	if b, err := os.ReadFile(newExe); err != nil {
+		_ = os.Rename(prevExe, exe)
+		return false
+	} else if err := os.WriteFile(exe, b, 0755); err != nil {
+		_ = os.Rename(prevExe, exe)
+		log.Printf("[!] staged apply: write failed, rolled back: %v", err)
+		return false
+	}
+	_ = os.Remove(newExe)
+	_ = os.WriteFile(filepath.Join(dir, "version.txt"), []byte(pend.To+"\n"), 0644)
+	_ = os.WriteFile(filepath.Join(dir, "mode.json"), []byte(ModeNormal+"\n"), 0644)
+	claim, _ := json.Marshal(pendingUpdate{From: pend.From, To: pend.To, At: pend.At})
+	_ = os.WriteFile(pendFile, claim, 0644)
+	log.Printf("[*] Staged update to %s applied, restart picks it up", pend.To)
+	return true
 }
 
 // ConfirmUpdate runs in the NEW binary shortly after startup: if we survive

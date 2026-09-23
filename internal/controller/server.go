@@ -208,6 +208,8 @@ type Server struct {
 	updInflightMu sync.Mutex
 	updLastTry    map[string]time.Time // hostname → last push attempt (debounces hello-driven resume)
 	updLastMu     sync.Mutex
+	updStaged     map[string]time.Time // hostname → staged-for-elevated-apply report (pauses hello resume 15min)
+	updStagedMu   sync.Mutex
 	certDaysLeft  int
 	house         string
 	latency       map[string]int64
@@ -1016,6 +1018,48 @@ func parseHaveRanges(rs string, total int) map[int]bool {
 // ranges ...") and finalize notices ("updated to X, restarting") from any
 // transport's output path.
 func (s *Server) noteUpdateHave(id, result string) {
+	if strings.Contains(result, "staged") && strings.Contains(result, "elevated apply") {
+		s.agentsMu.RLock()
+		ac, ok := s.agents[id]
+		s.agentsMu.RUnlock()
+		hn := id
+		if ok && ac.hostname != "" {
+			hn = ac.hostname
+		}
+		log.Printf("[update] %s: staged for elevated apply (%s)", hn, strings.TrimSpace(result))
+		s.updStagedMu.Lock()
+		if s.updStaged == nil {
+			s.updStaged = map[string]time.Time{}
+		}
+		s.updStaged[hn] = time.Now()
+		s.updStagedMu.Unlock()
+		if ok {
+			s.updateProg(ac, 1, 1, "staged")
+			s.broadcastWS(map[string]interface{}{"type": "output", "id": id, "data": fmt.Sprintf("update to %s: staged, waiting for elevated apply (watcher/service swaps on next run, completes when v%s checks in)", hn, version.DesktopAgentVersion), "success": true})
+		}
+		return
+	}
+	if strings.Contains(result, "update ") && strings.Contains(result, " accepted (") {
+		// Fresh begin-ack (empty cache): record it so awaitHave stops
+		// waiting instead of timing out and firing a spurious second
+		// begin mid-push (that rewrite races in-flight chunks and
+		// halves throughput — the 6-push crawl in v1.43.4).
+		total := 0
+		if i := strings.Index(result, " in "); i >= 0 {
+			rest := strings.TrimSpace(result[i+len(" in "):])
+			fields := strings.Fields(rest)
+			if len(fields) > 0 {
+				total, _ = strconv.Atoi(fields[0])
+			}
+		}
+		if total > 0 {
+			s.haveMu.Lock()
+			s.updateHave[id] = haveReport{have: map[int]bool{}, total: total, at: time.Now()}
+			s.haveMu.Unlock()
+			log.Printf("[update] %s begin accepted (%d chunks, fresh)", id, total)
+		}
+		return
+	}
 	if strings.Contains(result, "updated to ") && strings.Contains(result, "restarting") {
 		s.agentsMu.RLock()
 		ac, ok := s.agents[id]
@@ -1212,13 +1256,13 @@ func (s *Server) pushAgentUpdate(ac *AgentConn, bin string) bool {
 	slowWarn := ""
 	switch rac.transport() {
 	case "mqtt":
-		// Big chunks + 4 parallel lanes: chunk reassembly is
-		// order-tolerant, so lanes multiply throughput instead of
-		// paying one broker RTT per chunk.
+		// 2 lanes: chunk reassembly is order-tolerant, but 4 lanes at
+		// 15ms burst ~11MB/s at a shared public broker and QoS0 drops
+		// most of it (v1.43.4 needed 6 manual pushes for 30 chunks).
 		chunkRaw = 128 * 1024
-		pacing = 15 * time.Millisecond
+		pacing = 40 * time.Millisecond
 		haveTimeout = 10 * time.Second
-		lanes = 4
+		lanes = 2
 	case "ntfy":
 		// 2KB raw: ntfy.sh hard-rejects messages over 4096 bytes
 		// (base64 + envelope must fit — do NOT raise this).
@@ -1241,107 +1285,113 @@ func (s *Server) pushAgentUpdate(ac *AgentConn, bin string) bool {
 	s.broadcastWS(map[string]interface{}{"type": "output", "id": ac.id, "data": fmt.Sprintf("pushing update v%s (gzipped %d bytes, %d chunks via %s)%s", version.DesktopAgentVersion, len(payload.data), total, rac.transport(), slowWarn), "success": true})
 	s.updateProg(ac, 0, total, "pushing")
 	begin := protocol.Message{Type: protocol.TypeUpdateBegin, UpdateVer: version.DesktopAgentVersion, UpdateSize: int64(len(payload.data)), UpdateSHA: payload.sha, UpdateTotal: total, UpdateGzip: true}
-	beginAt := time.Now()
-	if err := s.sendWithRetry(rac, begin, "update begin"); err != nil {
-		log.Printf("[update] begin failed: %v", err)
-		s.updateProg(ac, 0, total, "failed")
-		s.broadcastWS(map[string]interface{}{"type": "output", "id": ac.id, "data": fmt.Sprintf("update to %s FAILED at begin (%v) — kept queued, resumes on next hello", ac.hostname, err), "success": false})
-		return false
-	}
-	// Resume: the agent reports chunks cached from an interrupted push.
-	// Have reports may arrive under either transport id (sibling routing),
-	// so check both the selected and routed records.
-	have := s.awaitHave(rac.id, beginAt, haveTimeout)
-	if len(have) == 0 && rac.id != ac.id {
-		if h2 := s.awaitHave(ac.id, beginAt, time.Second); len(h2) > 0 {
-			have = h2
+	// Multi-round converge: QoS0 relays drop packets, so one pass rarely
+	// lands everything (v1.43.4 needed 6 manual pushes for 30 chunks).
+	// Each round re-begins (the agent replies have/resume from its on-disk
+	// cache — identical manifests never wipe it), sends only what's still
+	// missing, then re-checks. One click now converges on its own; the
+	// desired queue still covers whatever is left on the next hello.
+	const maxRounds = 8
+	haveCount := 0
+	for round := 1; round <= maxRounds; round++ {
+		timeout := haveTimeout
+		if round > 1 {
+			timeout = 6 * time.Second
 		}
-	}
-	if len(have) == 0 {
-		// Begin may have vanished on a relay (publish returns nil even when
-		// nobody is listening, e.g. ghost dark). Don't blast hundreds of
-		// chunks into the void: one quiet re-begin, then proceed — the
-		// desired queue guarantees a resume on the next hello anyway.
-		log.Printf("[update] %s: no resume report in %s, re-sending begin once", ac.hostname, haveTimeout.Round(time.Second))
-		_ = s.sendWithRetry(rac, begin, "update begin (retry)")
-		have = s.awaitHave(rac.id, time.Now(), 5*time.Second)
-	}
-	var missing []int
-	for i := 0; i < total; i++ {
-		if !have[i] {
-			missing = append(missing, i)
+		beginAt := time.Now()
+		if err := s.sendWithRetry(rac, begin, fmt.Sprintf("update begin (round %d)", round)); err != nil {
+			log.Printf("[update] begin failed: %v", err)
+			s.updateProg(ac, haveCount, total, "failed")
+			s.broadcastWS(map[string]interface{}{"type": "output", "id": ac.id, "data": fmt.Sprintf("update to %s FAILED at begin (%v) — kept queued, resumes on next hello", ac.hostname, err), "success": false})
+			return false
 		}
-	}
-	if len(have) > 0 {
-		log.Printf("[update] %s: resuming (%d/%d cached, sending %d)", ac.hostname, len(have), total, len(missing))
-		s.broadcastWS(map[string]interface{}{"type": "output", "id": ac.id, "data": fmt.Sprintf("resuming update: agent kept %d/%d chunks, sending %d", len(have), total, len(missing)), "success": true})
-		s.updateProg(ac, len(have), total, "pushing")
-	}
-	if len(missing) == 0 {
-		log.Printf("[update] %s: agent already holds all chunks, waiting for verify+restart", ac.hostname)
-		s.updateProg(ac, total, total, "waiting")
-		s.broadcastWS(map[string]interface{}{"type": "output", "id": ac.id, "data": fmt.Sprintf("update to %s: all chunks held, waiting for verify+restart (auto-completes on hello)", ac.hostname), "success": true})
-		return true
-	}
-	// Multi-lane send: chunks are independent (the agent reassembles by
-	// seq), so parallel lanes trade one-RTT-per-chunk serial latency for
-	// throughput. Serial transports keep lanes == 1.
-	var sent atomic.Int64
-	sent.Store(int64(len(have)))
-	jobs := make(chan int, len(missing))
-	for _, i := range missing {
-		jobs <- i
-	}
-	close(jobs)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	var wg sync.WaitGroup
-	var failOnce sync.Once
-	var failed error
-	for l := 0; l < lanes; l++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for i := range jobs {
-				select {
-				case <-ctx.Done():
-					return
-				default:
-				}
-				end := (i + 1) * chunkRaw
-				if end > len(payload.data) {
-					end = len(payload.data)
-				}
-				chunk := protocol.Message{
-					Type:      protocol.TypeUpdateChunk,
-					UpdateSeq: i,
-					Data:      base64.StdEncoding.EncodeToString(payload.data[i*chunkRaw : end]),
-				}
-				if err := s.sendWithRetry(rac, chunk, fmt.Sprintf("chunk %d", i)); err != nil {
-					log.Printf("[update] %v", err)
-					failOnce.Do(func() { failed = err; cancel() })
-					return
-				}
-				n := int(sent.Add(1))
-				if n%5 == 0 || n == total || total <= 10 {
-					log.Printf("[update] %s: %d/%d chunks", ac.hostname, n, total)
-					s.updateProg(ac, n, total, "pushing")
-				}
-				if pacing > 0 {
-					time.Sleep(pacing)
-				}
+		// Have reports may arrive under either transport id (sibling
+		// routing), so check both the selected and routed records.
+		have := s.awaitHave(rac.id, beginAt, timeout)
+		if len(have) == 0 && rac.id != ac.id {
+			if h2 := s.awaitHave(ac.id, beginAt, time.Second); len(h2) > 0 {
+				have = h2
 			}
-		}()
+		}
+		haveCount = len(have)
+		var missing []int
+		for i := 0; i < total; i++ {
+			if !have[i] {
+				missing = append(missing, i)
+			}
+		}
+		if len(missing) == 0 {
+			log.Printf("[update] %s: agent holds all %d chunks after %d round(s), waiting for verify+restart", ac.hostname, total, round)
+			s.updateProg(ac, total, total, "waiting")
+			s.broadcastWS(map[string]interface{}{"type": "output", "id": ac.id, "data": fmt.Sprintf("update to %s: all chunks held, waiting for verify+restart (auto-completes on hello)", ac.hostname), "success": true})
+			return true
+		}
+		if round > 1 || len(have) > 0 {
+			log.Printf("[update] %s round %d: have %d/%d, sending %d", ac.hostname, round, len(have), total, len(missing))
+			s.broadcastWS(map[string]interface{}{"type": "output", "id": ac.id, "data": fmt.Sprintf("update round %d: agent kept %d/%d chunks, sending %d", round, len(have), total, len(missing)), "success": true})
+			s.updateProg(ac, len(have), total, "pushing")
+		}
+		// Lane send: chunks are independent (the agent reassembles by
+		// seq), so parallel lanes trade one-RTT-per-chunk serial latency
+		// for throughput. Serial transports keep lanes == 1.
+		var sent atomic.Int64
+		sent.Store(int64(len(have)))
+		jobs := make(chan int, len(missing))
+		for _, i := range missing {
+			jobs <- i
+		}
+		close(jobs)
+		ctx, cancel := context.WithCancel(context.Background())
+		var wg sync.WaitGroup
+		var failOnce sync.Once
+		var failed error
+		for l := 0; l < lanes; l++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for i := range jobs {
+					select {
+					case <-ctx.Done():
+						return
+					default:
+					}
+					end := (i + 1) * chunkRaw
+					if end > len(payload.data) {
+						end = len(payload.data)
+					}
+					chunk := protocol.Message{
+						Type:      protocol.TypeUpdateChunk,
+						UpdateSeq: i,
+						Data:      base64.StdEncoding.EncodeToString(payload.data[i*chunkRaw : end]),
+					}
+					if err := s.sendWithRetry(rac, chunk, fmt.Sprintf("chunk %d", i)); err != nil {
+						log.Printf("[update] %v", err)
+						failOnce.Do(func() { failed = err; cancel() })
+						return
+					}
+					n := int(sent.Add(1))
+					if n%5 == 0 || n == total || total <= 10 {
+						log.Printf("[update] %s: %d/%d chunks", ac.hostname, n, total)
+						s.updateProg(ac, n, total, "pushing")
+					}
+					if pacing > 0 {
+						time.Sleep(pacing)
+					}
+				}
+			}()
+		}
+		wg.Wait()
+		cancel()
+		if failed != nil {
+			s.updateProg(ac, int(sent.Load()), total, "failed")
+			s.broadcastWS(map[string]interface{}{"type": "output", "id": ac.id, "data": fmt.Sprintf("update to %s FAILED in round %d at chunk %d/%d — kept queued, resumes on next hello (agent kept its cache)", ac.hostname, round, int(sent.Load()), total), "success": false})
+			return false
+		}
+		haveCount = int(sent.Load())
+		time.Sleep(500 * time.Millisecond) // let late arrivals land before re-checking
 	}
-	wg.Wait()
-	if failed != nil {
-		s.updateProg(ac, int(sent.Load()), total, "failed")
-		s.broadcastWS(map[string]interface{}{"type": "output", "id": ac.id, "data": fmt.Sprintf("update to %s FAILED at chunk %d/%d — kept queued, resumes on next hello (agent kept its cache)", ac.hostname, int(sent.Load()), total), "success": false})
-		return false
-	}
-	log.Printf("[update] %s: all chunks sent, waiting for agent verify+restart", ac.hostname)
-	s.updateProg(ac, total, total, "waiting")
-	s.broadcastWS(map[string]interface{}{"type": "output", "id": ac.id, "data": fmt.Sprintf("update to %s: all %d chunks sent — waiting for verify+restart (completes automatically when v%s checks in)", ac.hostname, total, version.DesktopAgentVersion), "success": true})
+	log.Printf("[update] %s: %d rounds done, agent holds ~%d/%d — kept queued, resumes on next hello", ac.hostname, maxRounds, haveCount, total)
+	s.broadcastWS(map[string]interface{}{"type": "output", "id": ac.id, "data": fmt.Sprintf("update to %s: sent %d/%d after %d rounds — kept queued, resumes automatically on next hello (no need to re-click)", ac.hostname, haveCount, total, maxRounds), "success": true})
 	// Desired queue stays until the hello confirms: even if verify fails or
 	// the agent disconnects mid-restart, the next hello re-pushes/resumes.
 	return true
@@ -1486,6 +1536,9 @@ func (s *Server) noteHello(id, hostname, ver, bad, to, prot, tamp, mode string) 
 		if want, ok := s.wantUpdate(hostname); ok {
 			if ver == want {
 				s.clearDesiredUpdate(hostname)
+				s.updStagedMu.Lock()
+				delete(s.updStaged, hostname)
+				s.updStagedMu.Unlock()
 				log.Printf("[update] %s reached v%s ✓", hostname, ver)
 				s.broadcastWS(map[string]interface{}{"type": "update-progress", "id": id, "hostname": hostname, "sent": 1, "total": 1, "status": "done"})
 				s.broadcastWS(map[string]interface{}{"type": "output", "id": id, "data": fmt.Sprintf("update to %s DONE ✓ now v%s", hostname, ver), "success": true})
@@ -1496,7 +1549,15 @@ func (s *Server) noteHello(id, hostname, ver, bad, to, prot, tamp, mode string) 
 				s.updLastMu.Lock()
 				last := s.updLastTry[hostname]
 				s.updLastMu.Unlock()
-				if !inflight && time.Since(last) > 60*time.Second {
+				s.updStagedMu.Lock()
+				stagedAt := s.updStaged[hostname]
+				s.updStagedMu.Unlock()
+				// A staged box needs no pushes: the watcher swaps + the
+				// supervisor restarts within ~a minute. Pause auto-resume
+				// 15min so we don't re-push (and re-stage) in a loop.
+				if !stagedAt.IsZero() && time.Since(stagedAt) < 15*time.Minute {
+					log.Printf("[update] %s staged %s ago, holding resume", hostname, time.Since(stagedAt).Round(time.Second))
+				} else if !inflight && time.Since(last) > 60*time.Second {
 					if ac2 := s.getAgentByID(id); ac2 != nil {
 						if bin := s.bundledAgentBin(); bin != "" {
 							log.Printf("[update] %s still v%s want v%s — resuming push", hostname, ver, want)

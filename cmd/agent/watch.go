@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"github.com/shirou/gopsutil/v3/process"
+	"rmm/internal/commands"
 )
 
 const watchInterval = 30 * time.Second
@@ -494,6 +495,15 @@ func runWatch() {
 		return // another watcher owns the box
 	}
 	w := loadWatchCfg()
+	// Elevated apply: a standard-user agent stages verified updates it
+	// cannot swap itself (Access denied on the admin-owned exe). The
+	// watcher runs elevated, so it swaps + restarts into the new binary.
+	if commands.ApplyStagedUpdate() {
+		log.Printf("[watch] staged update applied, restarting agent into it")
+		w.killAgents()
+		time.Sleep(2 * time.Second)
+		w.startAgent()
+	}
 	log.Printf("[watch] supervising %s", w.agentPath)
 	if !agentAlive() {
 		w.restoreBinary()

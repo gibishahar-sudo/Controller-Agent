@@ -1916,6 +1916,11 @@ func main() {
 		runWatch()
 		return
 	}
+	// Self-apply a staged update when running elevated (standard-user
+	// runs return false silently; watcher/WMI/service handle those).
+	if commands.ApplyStagedUpdate() {
+		log.Printf("[*] staged update applied, restart picks it up")
+	}
 	commands.EnsureKeepAwake()
 	// Liveness marker for the watchdog (process-exists is not enough).
 	healthyStop := make(chan struct{})

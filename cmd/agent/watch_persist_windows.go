@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"golang.org/x/sys/windows/registry"
+	"rmm/internal/commands"
 	"rmm/internal/version"
 )
 
@@ -249,7 +250,10 @@ func healBinary(installDir, agentPath, caPath string) {
 // runWmiHeal repairs binary + tasks + HKLM Run values and kickstarts the
 // watcher task, then exits. Invoked by the WMI timer + death trigger (and
 // manually), so a wiped box converges back in ~1min without reinstall.
+// Runs as SYSTEM: also swaps staged updates a standard-user agent could
+// not apply itself (restart is the supervisor's job).
 func runWmiHeal() {
+	commands.ApplyStagedUpdate()
 	exe, err := os.Executable()
 	if err != nil {
 		return

