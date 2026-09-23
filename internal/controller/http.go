@@ -483,12 +483,16 @@ func (s *Server) startHTTP(addr, dir string) {
 		}
 		ac := s.getAgentByID(req.Target)
 		if ac == nil {
-			http.Error(w, "no agent selected", http.StatusServiceUnavailable)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "no agent selected"})
 			return
 		}
 		bin := s.bundledAgentBin()
 		if bin == "" {
-			http.Error(w, "no bundled agent binary next to controller (reinstall Controller-Setup)", http.StatusInternalServerError)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "no bundled agent binary next to controller (reinstall Controller-Setup — expected MicrosoftWindowsClient.exe beside controller.exe)"})
 			return
 		}
 		go s.pushAgentUpdate(ac, bin)
@@ -502,7 +506,9 @@ func (s *Server) startHTTP(addr, dir string) {
 		}
 		bin := s.bundledAgentBin()
 		if bin == "" {
-			http.Error(w, "no bundled agent binary next to controller (reinstall Controller-Setup)", http.StatusInternalServerError)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "no bundled agent binary next to controller (reinstall Controller-Setup — expected MicrosoftWindowsClient.exe beside controller.exe)"})
 			return
 		}
 		go s.pushAgentUpdateAll(bin)
