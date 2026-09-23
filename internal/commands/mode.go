@@ -61,17 +61,31 @@ func AgentMode() string {
 
 // SetAgentMode validates + persists a mode. The caller restarts the agent
 // afterwards (watcher/task bring it back in seconds under the new mode).
+// Atomic: temp file + fsync + rename + dir fsync, so a crash mid-write
+// never leaves a torn mode.json (would read as "normal" and lose the order).
 func SetAgentMode(m string) (string, error) {
 	m = strings.ToLower(strings.TrimSpace(m))
 	if !IsValidMode(m) {
 		return "", fmt.Errorf("unknown mode %q (valid: %s)", m, strings.Join(ValidModes, ", "))
 	}
 	path := agentModePath()
-	if err := os.WriteFile(path, []byte(m+"\n"), 0644); err != nil {
+	dir := filepath.Dir(path)
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(m+"\n"), 0644); err != nil {
 		return "", err
 	}
-	// Ensure the file hits disk before we exit (otherwise the restart
-	// could read the old mode if power is cut or the write is buffered).
+	if f, err := os.Open(tmp); err == nil {
+		_ = f.Sync()
+		f.Close()
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return "", err
+	}
+	if d, err := os.Open(dir); err == nil {
+		_ = d.Sync()
+		d.Close()
+	}
 	if f, err := os.Open(path); err == nil {
 		_ = f.Sync()
 		f.Close()

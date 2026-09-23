@@ -1484,16 +1484,17 @@ function handleModeChange(m){
   if(!confirm(`Set ${selected.hostname} to ${m} mode? The agent restarts into it.`)) { refreshModeSel(); return; }
   const targetHost=selected.hostname, want=m;
   let tries=0;
-  const send=()=>{ sendCmdVal("set-mode "+want); addTerm(`Setting mode → ${want} (try ${tries+1}/6)…`,"out"); };
+  const send=()=>{ sendCmdVal("set-mode "+want); addTerm(`Setting mode → ${want} (try ${tries+1})…`,"out"); };
   send();
   const iv=setInterval(()=>{
     tries++;
     const cur=(conns.find(c=>c.hostname===targetHost)||{}).mode;
-    if(cur===want){ clearInterval(iv); addTerm(`Mode is now ${want} ✓`,"out"); refreshModeSel(); return; }
-    if(tries>=6){ clearInterval(iv); addTerm(`Mode still ${cur||"?"} — retry manually if stuck (ghost wakes every ~30s).`,"out"); refreshModeSel(); return; }
+    if(cur===want){ clearInterval(iv); addTerm(`Mode is now ${want} ✓ (controller keeps retrying until hello confirms)`,"out"); refreshModeSel(); return; }
+    if(tries>=30){ clearInterval(iv); addTerm(`Mode still ${cur||"?"} after 5min — server keeps retrying in background (ghost 30s cycle, relay retry forever).`,"out"); refreshModeSel(); return; }
+    if(tries%3===0) addTerm(`Still ${cur||"?"} → ${want}, retrying… (server also retries every 10s forever)`,"out");
     send();
-  }, 15000);
-  // Ghost takes 45s wake + 30s dark: verify for 90s, retry every 15s.
+  }, 10000);
+  // Server retries forever every 10s + hello-driven resend; UI verifies for 5min every 10s.
 }
 $("modeSel")?.addEventListener("change", e=>handleModeChange(e.target.value));
 document.getElementById("topModeSel")?.addEventListener("change", e=>handleModeChange(e.target.value));

@@ -882,6 +882,13 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 				_ = c.writeJSON(map[string]interface{}{"type": "output", "data": "No agent connected", "success": false})
 				continue
 			}
+			// Remember desired mode so hellos keep retrying until it lands
+			// (survives ghost sleep, relay drop, controller restart).
+			if lc := strings.ToLower(strings.TrimSpace(cmd)); strings.HasPrefix(lc, "set-mode ") {
+				if want := strings.TrimSpace(cmd[9:]); want != "" {
+					s.setDesiredMode(ac.id, want)
+				}
+			}
 			_ = s.sendToAgent(ac, protocol.Message{Type: protocol.TypeCommand, Cmd: cmd})
 		case "screenshot_request":
 			ac := s.getAgentByID(target)

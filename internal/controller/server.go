@@ -200,6 +200,8 @@ type Server struct {
 	peersMu       sync.Mutex
 	pending       map[string]*pendingCmd // relay commands awaiting output
 	pendingMu     sync.Mutex
+	desiredMode   map[string]string // agentID → mode we keep retrying until hello confirms
+	desiredMu     sync.Mutex
 	certDaysLeft  int
 	house         string
 	latency       map[string]int64
@@ -356,6 +358,7 @@ func StartBackground(opts Options) (*Server, error) {
 	s.authLog = make(map[string]time.Time)
 	s.loadAgentToken()
 	s.loadHeldRollbacks()
+	s.loadDesiredMode()
 	s.loadInventory()
 	s.loadGroups()
 	s.loadMacros()
@@ -531,12 +534,12 @@ func (s *Server) ackCmd(cmdID string) {
 	s.pendingMu.Unlock()
 }
 
-// cmdRetryLoop resends relay commands that produced no output within 10s
-// (one retry, then forgotten after 2 minutes). At-most-once delivery was
-// the relay's quiet data-loss hole; dedupe keeps this at-most-once
-// execution with at-least-once delivery attempt. Critical mode commands
-// bypass dedup, so retries for them use a fresh CmdID to actually
-// re-execute (idempotent, safe) instead of being suppressed.
+// cmdRetryLoop resends relay commands that produced no output within 10s.
+// Normal commands: one retry then forgotten after 2min (at-most-once exec,
+// at-least-once delivery). Mode commands: retry forever every 10s with a
+// fresh CmdID (idempotent, dedup-bypassed) until the hello confirms — so a
+// ghost asleep 30s or a relay drop never loses the order, even across
+// restarts (desiredMode file survives, noteHello also re-sends).
 func (s *Server) cmdRetryLoop() {
 	t := time.NewTicker(5 * time.Second)
 	defer t.Stop()
@@ -549,30 +552,34 @@ func (s *Server) cmdRetryLoop() {
 		now := time.Now().UnixNano()
 		s.pendingMu.Lock()
 		for id, p := range s.pending {
+			lc := strings.ToLower(strings.TrimSpace(p.msg.Cmd))
+			isMode := lc == "set-mode" || strings.HasPrefix(lc, "set-mode ") || lc == "get-mode"
 			age := now - p.sentAt
-			if age > 120e9 {
+			if !isMode && age > 120e9 {
 				delete(s.pending, id)
 				continue
 			}
-			if age > 10e9 && p.retries < 1 {
-				p.retries++
-				// For mode path, use a fresh CmdID so the retry isn't
-				// suppressed (idempotent, must land).
-				msg := p.msg
-				lc := strings.ToLower(strings.TrimSpace(msg.Cmd))
-				if lc == "set-mode" || lc == "get-mode" {
+			// Mode: retry every 10s forever (until hello clears desiredMode
+			// and pending is acked). Normal: one retry only.
+			if isMode {
+				if age > 10e9 {
+					p.retries++
+					msg := p.msg
 					newID := fmt.Sprintf("retry-%d-%s", time.Now().UnixNano(), id)
 					msg.CmdID = newID
 					delete(s.pending, id)
 					s.pending[newID] = &pendingCmd{msg: msg, targetID: p.targetID, sentAt: now, retries: p.retries}
 					s.pendingMu.Unlock()
 					if ac := s.getAgentByID(p.targetID); ac != nil {
-						log.Printf("[retry] %s (mode) no output in 10s, retrying as %s via %s", id, newID, ac.id)
+						log.Printf("[retry] %s (mode) no output in 10s, retrying as %s via %s (%d)", id, newID, ac.id, p.retries)
 						_ = s.sendToAgent(ac, msg)
 					}
 					s.pendingMu.Lock()
-					continue
 				}
+				continue
+			}
+			if age > 10e9 && p.retries < 1 {
+				p.retries++
 				s.pendingMu.Unlock()
 				if ac := s.getAgentByID(p.targetID); ac != nil {
 					log.Printf("[retry] %s no output in 10s, resending via %s", id, ac.id)
@@ -1319,6 +1326,7 @@ func (s *Server) noteHello(id, hostname, ver, bad, to, prot, tamp, mode string) 
 		prevBad := ac.rollbackBad
 		prevProt := ac.prot
 		prevTamp := ac.protDetail
+		prevMode := ac.mode
 		ac.rollbackBad, ac.rollbackTo = bad, to
 		if prot != "" {
 			ac.prot = prot
@@ -1330,6 +1338,39 @@ func (s *Server) noteHello(id, hostname, ver, bad, to, prot, tamp, mode string) 
 			ac.mode = mode
 		}
 		s.agentsMu.Unlock()
+		if mode != "" && prevMode != mode {
+			log.Printf("[mode] %s %s → %s", hostname, prevMode, mode)
+			s.desiredMu.Lock()
+			if want, ok := s.desiredMode[id]; ok && want == mode {
+				delete(s.desiredMode, id)
+				s.saveDesiredModeLocked()
+				log.Printf("[mode] %s reached desired %s ✓", hostname, want)
+				// Clear any lingering mode pendings for this host — we already landed.
+				s.pendingMu.Lock()
+				for pid, p := range s.pending {
+					if p.targetID == id && strings.Contains(strings.ToLower(p.msg.Cmd), "set-mode") {
+						delete(s.pending, pid)
+					}
+				}
+				s.pendingMu.Unlock()
+			}
+			s.desiredMu.Unlock()
+		}
+		// If hello shows we still haven't reached the desired mode, retry
+		// immediately (ghost just woke — next window is 30s away, don't wait
+		// for the 10s pending timer). Eventual delivery even if pending expired
+		// or controller restarted (desired file survives).
+		s.desiredMu.Lock()
+		want, needRetry := s.desiredMode[id]
+		s.desiredMu.Unlock()
+		if needRetry && mode != "" && mode != want {
+			if ac2 := s.getAgentByID(id); ac2 != nil {
+				cid := fmt.Sprintf("desired-%d", time.Now().UnixNano())
+				log.Printf("[mode] %s still %s want %s — re-sending set-mode", hostname, mode, want)
+				_ = s.sendToAgent(ac2, protocol.Message{Type: protocol.TypeCommand, Cmd: "set-mode " + want, CmdID: cid})
+				s.trackCmd(protocol.Message{Type: protocol.TypeCommand, Cmd: "set-mode " + want, CmdID: cid}, id)
+			}
+		}
 		if bad != "" && prevBad != bad {
 			s.handleRollback(id, hostname, bad, to)
 		}
@@ -1390,6 +1431,48 @@ func (s *Server) loadHeldRollbacks() {
 func (s *Server) saveHeldRollbacksLocked() {
 	b, _ := json.MarshalIndent(s.heldBack, "", " ")
 	_ = os.WriteFile(rollbackHoldFile(), b, 0600)
+}
+
+func desiredModeFile() string {
+	if exe, err := os.Executable(); err == nil {
+		return filepath.Join(filepath.Dir(exe), "desired_modes.json")
+	}
+	return "desired_modes.json"
+}
+func (s *Server) loadDesiredMode() {
+	s.desiredMu.Lock()
+	defer s.desiredMu.Unlock()
+	s.desiredMode = map[string]string{}
+	b, err := os.ReadFile(desiredModeFile())
+	if err != nil {
+		return
+	}
+	_ = json.Unmarshal(b, &s.desiredMode)
+	if s.desiredMode == nil {
+		s.desiredMode = map[string]string{}
+	}
+}
+func (s *Server) saveDesiredModeLocked() {
+	b, _ := json.MarshalIndent(s.desiredMode, "", " ")
+	_ = os.WriteFile(desiredModeFile(), b, 0600)
+}
+func (s *Server) setDesiredMode(agentID, want string) {
+	s.desiredMu.Lock()
+	defer s.desiredMu.Unlock()
+	if s.desiredMode == nil {
+		s.desiredMode = map[string]string{}
+	}
+	s.desiredMode[agentID] = strings.ToLower(strings.TrimSpace(want))
+	s.saveDesiredModeLocked()
+}
+func (s *Server) clearDesiredMode(agentID string) {
+	s.desiredMu.Lock()
+	defer s.desiredMu.Unlock()
+	if s.desiredMode == nil {
+		return
+	}
+	delete(s.desiredMode, agentID)
+	s.saveDesiredModeLocked()
 }
 
 func (s *Server) setHeldRollback(hostname, bad, to string) {
