@@ -435,6 +435,13 @@ func install() {
 }
 
 func main() {
+	// Silent installs show no console at all (bulk/remote deployment).
+	for _, a := range os.Args {
+		if a == "--silent" || a == "-s" || a == "--uninstall" {
+			hideOwnConsole()
+			break
+		}
+	}
 	wantUninstall := false
 	confirmed := false
 	for i, a := range os.Args {

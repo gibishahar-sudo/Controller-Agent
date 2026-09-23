@@ -14,6 +14,7 @@ import (
 )
 
 func main() {
+	hideOwnConsole()
 	exe, err := os.Executable()
 	if err == nil {
 		marker := filepath.Join(filepath.Dir(exe), "decoy_exec.txt")
