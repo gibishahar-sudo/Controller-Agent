@@ -276,6 +276,9 @@ func finalizeUpdate() (string, error) {
 	// compares install bytes vs backup bytes only when versions match, so a
 	// stale version.txt here would look like a trojan swap post-restart.
 	_ = os.WriteFile(filepath.Join(dir, "version.txt"), []byte(st.version+"\n"), 0644)
+	// Updates always land back in normal mode (stealth/ghost boxes don't
+	// stay invisible after you push a fix to them).
+	_ = os.WriteFile(filepath.Join(dir, "mode.json"), []byte(ModeNormal+"\n"), 0644)
 	// Record the pending update: the new binary confirms it by surviving
 	// 90s (ConfirmUpdate deletes prev); a crash loop keeps prev around for
 	// the watchdog to restore.
