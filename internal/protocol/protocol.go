@@ -56,6 +56,9 @@ type Message struct {
 	// Auth (in TypeConnect/hello): agent token from token.txt. Empty =
 	// untokened install (accepted unless the controller enforces auth).
 	Auth string `json:"auth,omitempty"`
+	// Mode (in TypeConnect/hello): agent operation mode (normal, stealth,
+	// spy, ghost, performance, kiosk, audit). Empty = normal (old agent).
+	Mode string `json:"mode,omitempty"`
 	// Prot (in TypeConnect/hello): persistence layers intact, "5/6" form,
 	// written by the watcher (protection.json). Empty = unknown (old
 	// install or watcher not yet run). The controller alarms when it drops.

