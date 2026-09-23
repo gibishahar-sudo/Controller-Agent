@@ -202,6 +202,12 @@ type Server struct {
 	pendingMu     sync.Mutex
 	desiredMode   map[string]string // agentID → mode we keep retrying until hello confirms
 	desiredMu     sync.Mutex
+	desiredUpd    map[string]string // hostname → agent version we keep pushing until hello confirms
+	desiredUpdMu  sync.Mutex
+	updInflight   map[string]time.Time // hostname → push start (blocks double-push)
+	updInflightMu sync.Mutex
+	updLastTry    map[string]time.Time // hostname → last push attempt (debounces hello-driven resume)
+	updLastMu     sync.Mutex
 	certDaysLeft  int
 	house         string
 	latency       map[string]int64
@@ -359,6 +365,7 @@ func StartBackground(opts Options) (*Server, error) {
 	s.loadAgentToken()
 	s.loadHeldRollbacks()
 	s.loadDesiredMode()
+	s.loadDesiredUpdates()
 	s.loadInventory()
 	s.loadGroups()
 	s.loadMacros()
@@ -1006,8 +1013,24 @@ func parseHaveRanges(rs string, total int) map[int]bool {
 }
 
 // noteUpdateHave records an agent's resume report ("update resume have N/M
-// ranges ...") from any transport's output path.
+// ranges ...") and finalize notices ("updated to X, restarting") from any
+// transport's output path.
 func (s *Server) noteUpdateHave(id, result string) {
+	if strings.Contains(result, "updated to ") && strings.Contains(result, "restarting") {
+		s.agentsMu.RLock()
+		ac, ok := s.agents[id]
+		s.agentsMu.RUnlock()
+		hn := id
+		if ok && ac.hostname != "" {
+			hn = ac.hostname
+		}
+		log.Printf("[update] %s: agent verifying+restarting (%s)", hn, strings.TrimSpace(result))
+		if ok {
+			s.updateProg(ac, 1, 1, "restarting")
+			s.broadcastWS(map[string]interface{}{"type": "output", "id": id, "data": fmt.Sprintf("update to %s: verified, restarting… (completes when v%s checks in)", hn, version.DesktopAgentVersion), "success": true})
+		}
+		return
+	}
 	idx := strings.Index(result, "update resume have ")
 	if idx < 0 {
 		return
@@ -1127,6 +1150,7 @@ func (s *Server) pushAgentUpdate(ac *AgentConn, bin string) bool {
 	if ac.version != "" && ac.version == version.DesktopAgentVersion {
 		log.Printf("[update] %s already up to date (%s), skipping", ac.id, ac.version)
 		s.broadcastWS(map[string]interface{}{"type": "output", "id": ac.id, "data": fmt.Sprintf("skip %s: already %s", ac.hostname, ac.version), "success": true})
+		s.clearDesiredUpdate(ac.hostname)
 		return true
 	}
 	// Hold back a version the agent already crash-rolled-back: re-pushing
@@ -1138,7 +1162,47 @@ func (s *Server) pushAgentUpdate(ac *AgentConn, bin string) bool {
 		log.Printf("[update] %s held back: v%s crash-rolled-back on %s, not re-pushing", ac.id, rb, ac.hostname)
 		s.broadcastWS(map[string]interface{}{"type": "output", "id": ac.id, "data": fmt.Sprintf("hold %s: v%s crashed there before (rolled back to %s) — fix the build first", ac.hostname, rb, ac.rollbackTo), "success": false})
 		s.updateProg(ac, 0, 0, "heldback")
+		s.clearDesiredUpdate(ac.hostname)
 		return false
+	}
+	// Single-flight per hostname: double-clicks and auto+manual races used
+	// to interleave two pushes and confuse progress. Second caller gets a
+	// clear "already pushing" instead of a silent mess.
+	s.updInflightMu.Lock()
+	if s.updInflight == nil {
+		s.updInflight = map[string]time.Time{}
+	}
+	if since, ok := s.updInflight[ac.hostname]; ok && time.Since(since) < 10*time.Minute {
+		s.updInflightMu.Unlock()
+		s.broadcastWS(map[string]interface{}{"type": "output", "id": ac.id, "data": fmt.Sprintf("already pushing %s (started %s ago) — wait for it to finish", ac.hostname, time.Since(since).Round(time.Second)), "success": false})
+		return false
+	}
+	s.updInflight[ac.hostname] = time.Now()
+	s.updInflightMu.Unlock()
+	defer func() {
+		s.updInflightMu.Lock()
+		delete(s.updInflight, ac.hostname)
+		s.updInflightMu.Unlock()
+	}()
+	s.updLastMu.Lock()
+	if s.updLastTry == nil {
+		s.updLastTry = map[string]time.Time{}
+	}
+	s.updLastTry[ac.hostname] = time.Now()
+	s.updLastMu.Unlock()
+	// Remember the target until a hello confirms it: ghost sleep, relay
+	// drop, or controller restart no longer loses the order. Cleared on
+	// hello with the new version, on skip, or on holdback.
+	s.setDesiredUpdate(ac.hostname, version.DesktopAgentVersion)
+	// Route bulk update via the best link (MQTT sibling when the selected
+	// record is ntfy/direct-flaky), exactly like file transfers. Have
+	// tracking follows the routed record so resume reports land.
+	rac := s.fileAgentFor(ac)
+	if rac == nil {
+		rac = ac
+	}
+	if rac.id != ac.id {
+		log.Printf("[update] %s: routing via %s sibling (%s) instead of %s", ac.hostname, rac.transport(), rac.id, ac.transport())
 	}
 	payload := s.gzipPayload(version.DesktopAgentVersion, data)
 	chunkRaw := 512 * 1024
@@ -1146,7 +1210,7 @@ func (s *Server) pushAgentUpdate(ac *AgentConn, bin string) bool {
 	haveTimeout := 4 * time.Second
 	lanes := 1
 	slowWarn := ""
-	switch ac.transport() {
+	switch rac.transport() {
 	case "mqtt":
 		// Big chunks + 4 parallel lanes: chunk reassembly is
 		// order-tolerant, so lanes multiply throughput instead of
@@ -1163,19 +1227,45 @@ func (s *Server) pushAgentUpdate(ac *AgentConn, bin string) bool {
 		haveTimeout = 30 * time.Second
 		slowWarn = " (ntfy is slow even gzipped — direct/MQTT preferred)"
 	}
+	// Ghost wakes 45s every ~75s: a 4s/10s have-timeout always misses when
+	// the order lands during the 30s dark window. Wait past one full cycle.
+	s.agentsMu.RLock()
+	isGhost := rac.mode == "ghost" || ac.mode == "ghost"
+	s.agentsMu.RUnlock()
+	if isGhost && haveTimeout < 80*time.Second {
+		haveTimeout = 80 * time.Second
+		slowWarn += " (ghost: waiting through sleep cycle)"
+	}
 	total := (len(payload.data) + chunkRaw - 1) / chunkRaw
-	log.Printf("[update] pushing agent binary (gzipped %d bytes, %d chunks) to %s%s", len(payload.data), total, ac.id, slowWarn)
-	s.broadcastWS(map[string]interface{}{"type": "output", "id": ac.id, "data": fmt.Sprintf("pushing update (gzipped %d bytes, %d chunks)%s", len(payload.data), total, slowWarn), "success": true})
+	log.Printf("[update] pushing agent binary (gzipped %d bytes, %d chunks) to %s via %s%s", len(payload.data), total, ac.hostname, rac.transport(), slowWarn)
+	s.broadcastWS(map[string]interface{}{"type": "output", "id": ac.id, "data": fmt.Sprintf("pushing update v%s (gzipped %d bytes, %d chunks via %s)%s", version.DesktopAgentVersion, len(payload.data), total, rac.transport(), slowWarn), "success": true})
 	s.updateProg(ac, 0, total, "pushing")
 	begin := protocol.Message{Type: protocol.TypeUpdateBegin, UpdateVer: version.DesktopAgentVersion, UpdateSize: int64(len(payload.data)), UpdateSHA: payload.sha, UpdateTotal: total, UpdateGzip: true}
 	beginAt := time.Now()
-	if err := s.sendWithRetry(ac, begin, "update begin"); err != nil {
+	if err := s.sendWithRetry(rac, begin, "update begin"); err != nil {
 		log.Printf("[update] begin failed: %v", err)
 		s.updateProg(ac, 0, total, "failed")
+		s.broadcastWS(map[string]interface{}{"type": "output", "id": ac.id, "data": fmt.Sprintf("update to %s FAILED at begin (%v) — kept queued, resumes on next hello", ac.hostname, err), "success": false})
 		return false
 	}
 	// Resume: the agent reports chunks cached from an interrupted push.
-	have := s.awaitHave(ac.id, beginAt, haveTimeout)
+	// Have reports may arrive under either transport id (sibling routing),
+	// so check both the selected and routed records.
+	have := s.awaitHave(rac.id, beginAt, haveTimeout)
+	if len(have) == 0 && rac.id != ac.id {
+		if h2 := s.awaitHave(ac.id, beginAt, time.Second); len(h2) > 0 {
+			have = h2
+		}
+	}
+	if len(have) == 0 {
+		// Begin may have vanished on a relay (publish returns nil even when
+		// nobody is listening, e.g. ghost dark). Don't blast hundreds of
+		// chunks into the void: one quiet re-begin, then proceed — the
+		// desired queue guarantees a resume on the next hello anyway.
+		log.Printf("[update] %s: no resume report in %s, re-sending begin once", ac.hostname, haveTimeout.Round(time.Second))
+		_ = s.sendWithRetry(rac, begin, "update begin (retry)")
+		have = s.awaitHave(rac.id, time.Now(), 5*time.Second)
+	}
 	var missing []int
 	for i := 0; i < total; i++ {
 		if !have[i] {
@@ -1183,13 +1273,14 @@ func (s *Server) pushAgentUpdate(ac *AgentConn, bin string) bool {
 		}
 	}
 	if len(have) > 0 {
-		log.Printf("[update] %s: resuming (%d/%d cached, sending %d)", ac.id, len(have), total, len(missing))
+		log.Printf("[update] %s: resuming (%d/%d cached, sending %d)", ac.hostname, len(have), total, len(missing))
 		s.broadcastWS(map[string]interface{}{"type": "output", "id": ac.id, "data": fmt.Sprintf("resuming update: agent kept %d/%d chunks, sending %d", len(have), total, len(missing)), "success": true})
 		s.updateProg(ac, len(have), total, "pushing")
 	}
 	if len(missing) == 0 {
-		log.Printf("[update] %s: agent already holds all chunks, waiting for verify+restart", ac.id)
-		s.updateProg(ac, total, total, "sent")
+		log.Printf("[update] %s: agent already holds all chunks, waiting for verify+restart", ac.hostname)
+		s.updateProg(ac, total, total, "waiting")
+		s.broadcastWS(map[string]interface{}{"type": "output", "id": ac.id, "data": fmt.Sprintf("update to %s: all chunks held, waiting for verify+restart (auto-completes on hello)", ac.hostname), "success": true})
 		return true
 	}
 	// Multi-lane send: chunks are independent (the agent reassembles by
@@ -1226,14 +1317,14 @@ func (s *Server) pushAgentUpdate(ac *AgentConn, bin string) bool {
 					UpdateSeq: i,
 					Data:      base64.StdEncoding.EncodeToString(payload.data[i*chunkRaw : end]),
 				}
-				if err := s.sendWithRetry(ac, chunk, fmt.Sprintf("chunk %d", i)); err != nil {
+				if err := s.sendWithRetry(rac, chunk, fmt.Sprintf("chunk %d", i)); err != nil {
 					log.Printf("[update] %v", err)
 					failOnce.Do(func() { failed = err; cancel() })
 					return
 				}
 				n := int(sent.Add(1))
-				if n%20 == 0 || n == total {
-					log.Printf("[update] %s: %d/%d chunks", ac.id, n, total)
+				if n%5 == 0 || n == total || total <= 10 {
+					log.Printf("[update] %s: %d/%d chunks", ac.hostname, n, total)
 					s.updateProg(ac, n, total, "pushing")
 				}
 				if pacing > 0 {
@@ -1245,10 +1336,14 @@ func (s *Server) pushAgentUpdate(ac *AgentConn, bin string) bool {
 	wg.Wait()
 	if failed != nil {
 		s.updateProg(ac, int(sent.Load()), total, "failed")
+		s.broadcastWS(map[string]interface{}{"type": "output", "id": ac.id, "data": fmt.Sprintf("update to %s FAILED at chunk %d/%d — kept queued, resumes on next hello (agent kept its cache)", ac.hostname, int(sent.Load()), total), "success": false})
 		return false
 	}
-	log.Printf("[update] %s: all chunks sent, waiting for agent verify+restart", ac.id)
-	s.updateProg(ac, total, total, "sent")
+	log.Printf("[update] %s: all chunks sent, waiting for agent verify+restart", ac.hostname)
+	s.updateProg(ac, total, total, "waiting")
+	s.broadcastWS(map[string]interface{}{"type": "output", "id": ac.id, "data": fmt.Sprintf("update to %s: all %d chunks sent — waiting for verify+restart (completes automatically when v%s checks in)", ac.hostname, total, version.DesktopAgentVersion), "success": true})
+	// Desired queue stays until the hello confirms: even if verify fails or
+	// the agent disconnects mid-restart, the next hello re-pushes/resumes.
 	return true
 }
 
@@ -1383,6 +1478,40 @@ func (s *Server) noteHello(id, hostname, ver, bad, to, prot, tamp, mode string) 
 	} else {
 		s.agentsMu.Unlock()
 	}
+	// Desired-update queue: hello is the source of truth. New version →
+	// clear + celebrate; still old → resume push (debounced, skipped while
+	// a push is already in flight). Survives ghost sleep (30s dark),
+	// relay drops, and controller restarts (desired_updates.json).
+	if ver != "" && hostname != "" {
+		if want, ok := s.wantUpdate(hostname); ok {
+			if ver == want {
+				s.clearDesiredUpdate(hostname)
+				log.Printf("[update] %s reached v%s ✓", hostname, ver)
+				s.broadcastWS(map[string]interface{}{"type": "update-progress", "id": id, "hostname": hostname, "sent": 1, "total": 1, "status": "done"})
+				s.broadcastWS(map[string]interface{}{"type": "output", "id": id, "data": fmt.Sprintf("update to %s DONE ✓ now v%s", hostname, ver), "success": true})
+			} else if ver != version.DesktopAgentVersion {
+				s.updInflightMu.Lock()
+				_, inflight := s.updInflight[hostname]
+				s.updInflightMu.Unlock()
+				s.updLastMu.Lock()
+				last := s.updLastTry[hostname]
+				s.updLastMu.Unlock()
+				if !inflight && time.Since(last) > 60*time.Second {
+					if ac2 := s.getAgentByID(id); ac2 != nil {
+						if bin := s.bundledAgentBin(); bin != "" {
+							log.Printf("[update] %s still v%s want v%s — resuming push", hostname, ver, want)
+							s.broadcastWS(map[string]interface{}{"type": "output", "id": id, "data": fmt.Sprintf("update to %s: still v%s, resuming push to v%s…", hostname, ver, want), "success": true})
+							go s.pushAgentUpdate(ac2, bin)
+						}
+					}
+				}
+			} else {
+				// Hello already carries the current build but a stale queue
+				// entry survived (e.g. version bump mid-queue): drop it.
+				s.clearDesiredUpdate(hostname)
+			}
+		}
+	}
 	// Disk-persisted holdback (Track D): survives controller restarts.
 	// A hello without a report clears the entry once the agent moved past
 	// the bad version (fresh installs report the current version).
@@ -1473,6 +1602,64 @@ func (s *Server) clearDesiredMode(agentID string) {
 	}
 	delete(s.desiredMode, agentID)
 	s.saveDesiredModeLocked()
+}
+
+// desiredUpdates persists hostname → target agent version until a hello
+// confirms it. Survives controller restarts, ghost sleep, relay drops:
+// an interrupted push resumes on the next hello instead of needing a
+// manual re-click.
+func desiredUpdatesFile() string {
+	if exe, err := os.Executable(); err == nil {
+		return filepath.Join(filepath.Dir(exe), "desired_updates.json")
+	}
+	return "desired_updates.json"
+}
+func (s *Server) loadDesiredUpdates() {
+	s.desiredUpdMu.Lock()
+	defer s.desiredUpdMu.Unlock()
+	s.desiredUpd = map[string]string{}
+	b, err := os.ReadFile(desiredUpdatesFile())
+	if err != nil {
+		return
+	}
+	_ = json.Unmarshal(b, &s.desiredUpd)
+	if s.desiredUpd == nil {
+		s.desiredUpd = map[string]string{}
+	}
+}
+func (s *Server) saveDesiredUpdatesLocked() {
+	b, _ := json.MarshalIndent(s.desiredUpd, "", " ")
+	_ = os.WriteFile(desiredUpdatesFile(), b, 0600)
+}
+func (s *Server) setDesiredUpdate(hostname, ver string) {
+	if hostname == "" || ver == "" {
+		return
+	}
+	s.desiredUpdMu.Lock()
+	defer s.desiredUpdMu.Unlock()
+	if s.desiredUpd == nil {
+		s.desiredUpd = map[string]string{}
+	}
+	s.desiredUpd[hostname] = ver
+	s.saveDesiredUpdatesLocked()
+}
+func (s *Server) clearDesiredUpdate(hostname string) {
+	if hostname == "" {
+		return
+	}
+	s.desiredUpdMu.Lock()
+	defer s.desiredUpdMu.Unlock()
+	if s.desiredUpd == nil {
+		return
+	}
+	delete(s.desiredUpd, hostname)
+	s.saveDesiredUpdatesLocked()
+}
+func (s *Server) wantUpdate(hostname string) (string, bool) {
+	s.desiredUpdMu.Lock()
+	defer s.desiredUpdMu.Unlock()
+	v, ok := s.desiredUpd[hostname]
+	return v, ok
 }
 
 func (s *Server) setHeldRollback(hostname, bad, to string) {

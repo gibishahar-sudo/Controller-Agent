@@ -12,3 +12,5 @@ rollback_held.json
 groups.json
 macros.json
 scheduler.json
+desired_modes.json
+desired_updates.json

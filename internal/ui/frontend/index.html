@@ -675,9 +675,11 @@ function connectWS(){
       }
       else if(m.type==="update-progress"){
         const el=$("updateProg");
-        if(m.status==="pushing"&&m.total>0){ if(el) el.textContent=`⇪ ${m.hostname||m.id||"agent"} ${m.sent}/${m.total}`; }
-        else if(m.status==="sent"){ if(el) el.textContent=""; addTerm(`Update pushed to ${m.hostname||m.id} (${m.total} chunks) — waiting for verify+restart`,"out"); toast(`Update sent to ${m.hostname||m.id} — restarting`); }
-        else if(m.status==="failed"){ if(el) el.textContent=""; addTerm(`Update to ${m.hostname||m.id} FAILED at chunk ${m.sent}/${m.total} (auto-retried once)`,"err"); toast(`Update to ${m.hostname||m.id} failed`,"err"); }
+        if(m.status==="pushing"&&m.total>0){ const pc=Math.round(100*(m.sent||0)/Math.max(1,m.total)); if(el) el.textContent=`⇪ ${m.hostname||m.id||"agent"} ${m.sent}/${m.total} (${pc}%)`; }
+        else if(m.status==="sent"||m.status==="waiting"){ if(el) el.textContent=`⇪ ${m.hostname||m.id} sent — waiting for verify+restart…`; addTerm(`Update pushed to ${m.hostname||m.id} (${m.total} chunks) — waiting for verify+restart (auto-completes, resumes on reconnect if needed)`,"out"); toast(`Update sent to ${m.hostname||m.id} — restarting`); fetchAgents(); }
+        else if(m.status==="restarting"){ if(el) el.textContent=`⇪ ${m.hostname||m.id} restarting…`; addTerm(`Update to ${m.hostname||m.id}: verified, restarting…`,"out"); }
+        else if(m.status==="done"){ if(el) el.textContent=""; addTerm(`Update to ${m.hostname||m.id} DONE ✓`,"out"); toast(`Update to ${m.hostname||m.id} done ✓`); fetchAgents(); }
+        else if(m.status==="failed"){ if(el) el.textContent=""; addTerm(`Update to ${m.hostname||m.id} FAILED at chunk ${m.sent}/${m.total} — kept queued, resumes automatically on next hello (no need to re-click)`,"err"); toast(`Update to ${m.hostname||m.id} interrupted — queued for resume`,"err"); }
         else if(m.status==="heldback"){ if(el) el.textContent=""; addTerm(`Update to ${m.hostname||m.id} HELD BACK (that version crash-rolled-back there before)`,"err"); }
       }
       else if(m.type==="rollback"){
@@ -935,14 +937,18 @@ input.addEventListener("keydown", e=>{
   else if(e.key==="ArrowDown"){ if(hIdx>0){ hIdx--; input.value=history[history.length-1-hIdx]; } else if(hIdx===0){ hIdx=-1; input.value=""; } }
   else if(e.key==="Escape"){ sugg.classList.remove("on"); }
 });
+let updatePushing=false;
 function pushAgentUpdate(){
   if(!selected){ toast("No agent selected", "err"); return; }
+  if(updatePushing){ toast("Update already pushing — wait for progress", "err"); return; }
   if(selected.version && selected.version===$("ctrlVersion").textContent.replace(/^v/,"").split(" ")[0]){ if(!confirm(`${selected.hostname} already ${selected.version} — push anyway?`)) return; }
   else if(!confirm(`Push bundled agent update to ${selected.hostname}? It will restart itself.`)) return;
-  addTerm("Pushing agent update to "+selected.hostname+"…", "out");
+  updatePushing=true;
+  addTerm("Pushing agent update to "+selected.hostname+"… (queued until hello confirms — resumes on reconnect automatically)", "out");
   fetch("/api/agent-update",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({target:selected.id})})
     .then(async r=>{ const t=await r.text(); let j={}; try{ j=JSON.parse(t); }catch{ j={error:t}; } if(!r.ok) throw new Error(j.error||t||("HTTP "+r.status)); return j; }).then(j=>addTerm("Update: "+(j.status||"sent"), "out"))
-    .catch(e=>addTerm("Update push failed: "+(e.message||e), "err"));
+    .catch(e=>addTerm("Update push failed: "+(e.message||e), "err"))
+    .finally(()=>{ setTimeout(()=>{ updatePushing=false; }, 5000); });
 }
 function pushAgentUpdateAll(){
   const outs=agents.filter(a=>a.connected&&a.outdated);
