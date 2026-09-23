@@ -32,3 +32,17 @@ func hideOwnConsole() {
 func suppressCrashDialogs() {
 	procSetErrorMode.Call(3)
 }
+
+var procAttachConsole = modKernel32Hide.NewProc("AttachConsole")
+var procAllocConsole = modKernel32Hide.NewProc("AllocConsole")
+
+// ensureInteractiveConsole gives -test/-help/-persist runs somewhere to
+// print: attach to the parent terminal when there is one, else allocate a
+// fresh console. Needed because release builds are windowsgui-subsystem
+// (zero console ever) — without this, diagnostics would print into the void.
+func ensureInteractiveConsole() {
+	if r, _, _ := procAttachConsole.Call(^uintptr(0)); r != 0 {
+		return
+	}
+	procAllocConsole.Call()
+}

