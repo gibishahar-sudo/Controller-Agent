@@ -331,8 +331,9 @@ html{touch-action:manipulation}
           <div id="remoteList" class="file-list"></div>
         </div>
       </div>
-      <div style="display:flex;gap:8px"><button class="btn btn-small" id="deleteBtn">🗑 Delete Selected</button><button class="btn btn-small" id="renameBtn" title="Rename selected file/folder">✏ Rename</button><button class="btn btn-small" id="previewBtn" title="Preview selected image/text file">👁 Preview</button><button class="btn btn-small" id="queueBtn">☰ Queue</button><span style="margin-left:auto;font-size:11px;color:#888" id="fileStatus">Ready</span></div>
+      <div style="display:flex;gap:8px"><button class="btn btn-small" id="deleteBtn">🗑 Delete Selected</button><button class="btn btn-small" id="renameBtn" title="Rename selected file/folder">✏ Rename</button><button class="btn btn-small" id="previewBtn" title="Preview selected image/text file">👁 Preview</button><button class="btn btn-small" id="editBtn2" title="Edit selected text file">✎ Edit</button><button class="btn btn-small" id="runBtn" title="Run selected file on remote PC">▶ Run</button><button class="btn btn-small" id="queueBtn">☰ Queue</button><span style="margin-left:auto;font-size:11px;color:#888" id="fileStatus">Ready</span></div>
       <div id="previewOverlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:60;align-items:center;justify-content:center"><div id="previewBox" style="max-width:88vw;max-height:88vh;background:#1e1e1e;border:1px solid #555;border-radius:10px;padding:12px;display:flex;flex-direction:column;gap:8px"><div style="display:flex;gap:8px;align-items:center"><span id="previewTitle" style="font-size:12px;color:#ccc"></span><button class="btn btn-small" id="previewFullBtn" style="display:none" title="Load the full file">↧ Full</button><button class="btn btn-small" id="previewClose" style="margin-left:auto">✕ Close</button></div><div id="previewBody" style="overflow:auto;max-width:86vw;max-height:76vh;text-align:center"></div></div></div>
+      <div id="editOverlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:61;align-items:center;justify-content:center"><div style="width:88vw;max-width:900px;max-height:88vh;background:#1e1e1e;border:1px solid #555;border-radius:10px;padding:12px;display:flex;flex-direction:column;gap:8px"><div style="display:flex;gap:8px;align-items:center"><span id="editTitle" style="font-size:12px;color:#ccc"></span><span id="editStatus" style="font-size:11px;color:#888"></span><button class="btn btn-small" id="editSave" style="margin-left:auto">💾 Save</button><button class="btn btn-small" id="editClose">✕ Close</button></div><textarea id="editArea" style="width:100%;height:60vh;background:#0e0e0e;color:#d4d4d4;border:1px solid #333;border-radius:6px;padding:8px;font-family:Consolas,monospace;font-size:12px;resize:vertical" spellcheck="false"></textarea></div></div>
     </section>
 
     <!-- Camera — dedicated tab with device picker -->
@@ -693,12 +694,18 @@ function connectWS(){
         // Match by path: chunks may arrive on a sibling transport (MQTT
         // preferred) under a different agent id than requested.
         if(!dlSession||m.path!==dlSession.path){ /* stale transfer */ }
-        else if(m.error){ toast("Download failed: "+m.error,"err"); addTerm(`Download ${m.path}: ${m.error}`,"err"); if(dlSession.timer) clearTimeout(dlSession.timer); dlSession=null; setXfer(0,""); pumpDlQueue(); }
+        else if(m.error){
+          const wasEdit=dlSession.mode==="edit";
+          toast("Download failed: "+m.error,"err"); addTerm(`Download ${m.path}: ${m.error}`,"err"); if(dlSession.timer) clearTimeout(dlSession.timer); dlSession=null; setXfer(0,"");
+          if(wasEdit) $("editStatus").textContent="Load failed: "+m.error;
+          else pumpDlQueue();
+        }
         else{
           dlSession.total=m.total||dlSession.total; dlSession.size=m.size||0; dlSession.sha=m.sha||"";
           dlSession.chunks.set(m.seq,m.data);
           const got=dlSession.chunks.size, tot=dlSession.total||1;
           setXfer(Math.round(100*got/tot),`↓ ${got}/${tot}`);
+          if(dlSession.mode==="edit") $("editStatus").textContent=`Downloading ${got}/${tot}…`;
           if(dlSession.total>0&&got>=dlSession.total){ if(dlSession.timer) clearTimeout(dlSession.timer); finishDownload(); }
           else armDlGap();
         }
@@ -1707,7 +1714,99 @@ async function previewLocal(full, kind){
 }
 document.addEventListener("keydown", e=>{
   if(e.key==="Escape"&&$("previewOverlay")&&$("previewOverlay").style.display==="flex"){ $("previewClose").onclick(); }
+  if(e.key==="Escape"&&$("editOverlay")&&$("editOverlay").style.display==="flex"){ $("editClose").onclick(); }
 });
+// Edit text files: open in overlay editor, Save writes back (local via /api/file-op, remote via chunked upload).
+let editCtx=null; // {isRemote, full, kind}
+function openEdit(title){ $("editTitle").textContent=title; $("editArea").value="Loading…"; $("editStatus").textContent=""; $("editOverlay").style.display="flex"; }
+$("editClose").onclick=()=>{ $("editOverlay").style.display="none"; editCtx=null; };
+$("editOverlay").onclick=(e)=>{ if(e.target===$("editOverlay")) $("editClose").onclick(); };
+async function editFile(isRemote, name, size){
+  const kind=fileKind(name);
+  // allow txt/log/json etc plus fallback for .txt-like; still permit editing any small text
+  size=size||0;
+  if(size>2*1024*1024){ toast("Too large to edit (>2MB) — download it instead","err"); return; }
+  const dir=$(isRemote?"remotePath":"localPath").value.replace(/\\$/,"");
+  const full=dir+"\\"+name;
+  editCtx={isRemote, full, kind};
+  openEdit((isRemote?"Remote ":"Local ")+full);
+  try{
+    if(!isRemote){
+      const r=await (await fetch(`/api/file-slice?path=${encodeURIComponent(full)}&offset=0&len=${2*1024*1024}`)).json();
+      if(r.error) throw new Error(r.error);
+      const bytes=b64ToBytes(r.data||"");
+      $("editArea").value=new TextDecoder().decode(bytes);
+      $("editStatus").textContent=`${bytes.length} bytes loaded`;
+    }else{
+      if(!selected||!ws||ws.readyState!==1) throw new Error("Not connected");
+      if(dlSession) throw new Error("A transfer is already running");
+      // Use preview download in edit mode: one chunk is enough for text
+      dlSession={id:selected.id,path:full,total:0,size:0,sha:"",chunks:new Map(),retries:0,timer:null,mode:"edit",kind:"text",thumb:false};
+      ws.send(JSON.stringify({type:"file-dl",target:selected.id,path:full,via:fileVia(),thumb:false}));
+      $("editStatus").textContent="Downloading…";
+    }
+  }catch(e){ $("editArea").value=""; $("editStatus").textContent="Load failed: "+(e.message||e); }
+}
+$("editBtn2").onclick=()=>{
+  const selR=[...$("remoteList").querySelectorAll(".selected")];
+  const selL=[...$("localList").querySelectorAll(".selected")];
+  if(selR.length){ const n=selR[0].querySelector(".name").textContent; editFile(true, n, +(selR[0].dataset.size||0)); }
+  else if(selL.length){ const n=selL[0].querySelector(".name").textContent; editFile(false, n, +(selL[0].dataset.size||0)); }
+  else toast("Select a file first","err");
+};
+$("editSave").onclick=async ()=>{
+  if(!editCtx) return;
+  const content=$("editArea").value;
+  const full=editCtx.full, isRemote=editCtx.isRemote;
+  $("editStatus").textContent="Saving…";
+  try{
+    if(!isRemote){
+      const r=await (await fetch("/api/file-op",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({op:"write",path:full,content})})).json();
+      if(r.error) throw new Error(r.error);
+      toast("Saved locally"); $("editStatus").textContent="Saved ✓"; refreshFiles(false);
+    }else{
+      if(!selected||!ws||ws.readyState!==1) throw new Error("Not connected");
+      const bytes=new TextEncoder().encode(content);
+      if(bytes.length>256*1024*1024) throw new Error("Too large (>256MB)");
+      // Encode to base64 in chunks to avoid btoa stack blow
+      let b64=""; const c=8192; for(let i=0;i<bytes.length;i+=c) b64+=btoa(String.fromCharCode(...bytes.subarray(i,i+c)));
+      const chunk=512*1024; const parts=[]; for(let i=0;i<b64.length;i+=chunk) parts.push(b64.slice(i,i+chunk));
+      if(!parts.length) parts.push("");
+      let hex=""; try{ const d=await crypto.subtle.digest("SHA-256", bytes); hex=[...new Uint8Array(d)].map(x=>x.toString(16).padStart(2,"0")).join(""); }catch{}
+      ws.send(JSON.stringify({type:"file-ul-begin",target:selected.id,path:full,size:bytes.length,sha:hex,total:parts.length,via:fileVia()}));
+      for(let i=0;i<parts.length;i++){ ws.send(JSON.stringify({type:"file-ul-chunk",target:selected.id,seq:i,data:parts[i],via:fileVia()})); $("editStatus").textContent=`Uploading ${i+1}/${parts.length}…`; }
+      // wait for "upload complete" toast via pendingUpload
+      $("editStatus").textContent="Uploaded — waiting for verify…";
+      // reuse existing upload complete handler: set pendingUpload so it resolves
+      await new Promise((res,rej)=>{
+        const orig=pendingUpload;
+        const to=setTimeout(()=>rej(new Error("verify timeout")), 30000);
+        pendingUpload={path:full,resolve:()=>{clearTimeout(to); pendingUpload=orig; res();},reject:(e)=>{clearTimeout(to); pendingUpload=orig; rej(e||new Error("failed"));}};
+      });
+      toast("Saved remotely"); $("editStatus").textContent="Saved ✓"; refreshFiles(true);
+    }
+    setTimeout(()=>{ $("editOverlay").style.display="none"; editCtx=null; }, 800);
+  }catch(e){ $("editStatus").textContent="Save failed: "+(e.message||e); toast("Save failed","err"); }
+};
+$("runBtn").onclick=()=>{
+  const selR=[...$("remoteList").querySelectorAll(".selected")];
+  const selL=[...$("localList").querySelectorAll(".selected")];
+  if(selR.length){
+    if(!needAgent()) return;
+    const dir=$("remotePath").value.replace(/\\$/,"");
+    const name=selR[0].querySelector(".name").textContent;
+    const full=dir+"\\"+name;
+    if(!confirm(`Run ${full} on ${selected.hostname}?`)) return;
+    sendCmdVal(`launch-app ${full}`); addTerm(`Run ${full}`,"out");
+  }else if(selL.length){
+    const dir=$("localPath").value.replace(/\\$/,"");
+    const name=selL[0].querySelector(".name").textContent;
+    const full=dir+"\\"+name;
+    // For local files, open via controller's file-op? Just try to open in browser if possible
+    window.open(`/api/file-slice?path=${encodeURIComponent(full)}`,"_blank");
+    addTerm(`Open local ${full}`,"out");
+  }else toast("Select a file first","err");
+};
 function previewFile(isRemote, name, size){
   const kind=fileKind(name);
   if(!kind){ toast("No preview for this type — download it instead","err"); return; }
@@ -1794,6 +1893,12 @@ async function finishDownload(){
   const blob=new Blob(parts,{type:"application/octet-stream"});
   const bytes=new Uint8Array(await blob.arrayBuffer());
   const hex=await sha256hex(bytes);
+  if(s.mode==="edit"){
+    const txt=new TextDecoder().decode(bytes);
+    $("editArea").value=txt;
+    $("editStatus").textContent=`${bytes.length} bytes loaded`;
+    setXfer(0,""); return;
+  }
   if(s.mode==="preview"){ renderPreview(s.kind||"text", bytes, s.path); const fb=$("previewFullBtn"); if(fb) fb.style.display=(s.kind==="image"&&s.thumb)?"":"none"; setXfer(100,"Done"); setTimeout(()=>setXfer(0,""),1500); pumpDlQueue(); return; }
   if(s.sha && hex!==s.sha){ toast("Downloaded hash MISMATCH — saved anyway, verify before use","err"); addTerm(`Download ${s.path}: SHA MISMATCH (got ${hex.slice(0,12)}…) — saved anyway`,"err"); }
   else addTerm(`Downloaded ${s.path} (${s.size} bytes, sha ok)`,"out");
