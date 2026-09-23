@@ -523,6 +523,16 @@ document.querySelectorAll(".tab").forEach(t=>t.onclick=()=>{
   document.querySelectorAll(".tab").forEach(x=>x.classList.remove("active"));
   document.querySelectorAll(".tab-content").forEach(x=>x.classList.remove("active"));
   t.classList.add("active"); document.getElementById("tab-"+t.dataset.tab).classList.add("active");
+  // Suspend the screen off-tab (bandwidth back to files), resume on return.
+  if(t.dataset.tab!=="screen"&&streaming&&!streamSuspended){
+    streamSuspended=true;
+    if(nextShotTimer){ clearTimeout(nextShotTimer); nextShotTimer=null; }
+    addScreenLog("Stream suspended (tab hidden) — resumes on return");
+  }else if(t.dataset.tab==="screen"&&streaming&&streamSuspended){
+    streamSuspended=false; inflight=0; lastFSeq=0;
+    addScreenLog("Stream resumed (lanes "+screenLanes()+"/"+LANES_TOTAL+")");
+    topUpShots();
+  }
 });
 
 // WebSocket
@@ -1073,8 +1083,23 @@ $("addCmdFav").onclick=()=>{
 // Screen — frame-driven streaming: each arriving frame schedules the next
 // one, so the stream self-paces to the real round-trip (no pile-ups, no
 // stalls). A 3s watchdog re-requests if a frame gets lost in transit.
-let streaming=false, lastFrameAt=0, streamWatch=null, nextShotTimer=null, streamPaused=false;
+let streaming=false, lastFrameAt=0, streamWatch=null, nextShotTimer=null, streamPaused=false, streamSuspended=false;
 let pipeDepth=3, inflight=0, lastFSeq=0;
+// Shared 10-lane budget: 5 screen / 5 files baseline; the idle side's lanes
+// go to whoever is active. ntfy always stays serial (rate limits).
+const LANES_TOTAL=10, LANES_SPLIT=5;
+function screenActive(){ return streaming && !streamSuspended; }
+function fileActive(){ try{ return (typeof ulActive!=="undefined"&&ulActive>0)||(typeof dlSession!=="undefined"&&dlSession!==null)||(typeof dlQueue!=="undefined"&&dlQueue.length>0); }catch{ return false; } }
+function screenLanes(){ return fileActive()?LANES_SPLIT:LANES_TOTAL; }
+function fileLanes(){ return screenActive()?LANES_SPLIT:LANES_TOTAL; }
+function fileLanes(){ return (!screenActive())?LANES_TOTAL:LANES_SPLIT; }
+// Effective screen pipe: sharing caps at min(user setting, 5); idle files
+// let it run to 10. Relay links cap at 6 (keyframes would flood them).
+function effPipe(){
+  let p=fileActive()?Math.min(pipeDepth,LANES_SPLIT):LANES_TOTAL;
+  if(selected&&typeof isRelay==="function"&&isRelay(selected)) p=Math.min(p,6);
+  return p;
+}
 let frameW=1920, frameH=1080, frameOX=0, frameOY=0, frameTimes=[], lastFrameBytes=0;
 // remoteXY maps a pointer event on the stream image to remote virtual-screen
 // coords: accounts for letterboxing (object-fit:contain) and the capture
@@ -1094,7 +1119,7 @@ function updateStreamStats(){
   const el=$("streamStats"); if(!el) return;
   let fps="—", ms="—";
   if(frameTimes.length){ const avg=frameTimes.reduce((a,b)=>a+b,0)/frameTimes.length; fps=(1000/Math.max(1,avg)).toFixed(1); ms=Math.round(avg)+""; }
-  el.textContent=`${fps}fps • ${ms}ms • ${(lastFrameBytes/1024).toFixed(0)}KB • ${frameW}×${frameH}`;
+  el.textContent=`${fps}fps • ${ms}ms • ${(lastFrameBytes/1024).toFixed(0)}KB • ${frameW}×${frameH} • lanes scr ${screenLanes()}/10 file ${fileLanes()}/10`;
 }
 function positionRemoteCursor(x,y){
   const dot=$("remoteCursor"), img=$("screenImg"); if(!dot||!img) return;
@@ -1140,8 +1165,8 @@ function streamScale(){
   return isRelay(selected)?0.5:1;
 }
 function requestShot(){
-  if(!streaming||streamPaused||!selected||!ws||ws.readyState!==1) return;
-  if(inflight>=pipeDepth) return; // pipeline full: wait for arrivals
+  if(!streaming||streamPaused||streamSuspended||!selected||!ws||ws.readyState!==1) return;
+  if(inflight>=effPipe()) return; // pipeline full: wait for arrivals
   inflight++;
   ws.send(JSON.stringify({type:"screenshot_request", target:selected.id, quality:screenQuality(), monitor:streamMonitor(), allMonitors:streamAllMonitors(), scale:streamScale(), tiles:true}));
 }
@@ -1150,12 +1175,12 @@ function requestShot(){
 // capping fps at 1/RTT). The interval timer below stays purely as a rate
 // cap so a fast link never exceeds the requested fps.
 function topUpShots(){
-  if(!streaming) return;
-  while(inflight<pipeDepth) { const before=inflight; requestShot(); if(inflight===before) break; }
+  if(!streaming||streamSuspended) return;
+  while(inflight<effPipe()) { const before=inflight; requestShot(); if(inflight===before) break; }
   scheduleNextShot();
 }
 function scheduleNextShot(){
-  if(!streaming) return;
+  if(!streaming||streamSuspended) return;
   if(nextShotTimer) clearTimeout(nextShotTimer);
   nextShotTimer=setTimeout(topUpShots, streamInterval());
 }
@@ -1165,7 +1190,7 @@ $("screenStart").onclick=()=>{
   streaming=true; lastFrameAt=Date.now(); inflight=0; lastFSeq=0;
   topUpShots();
   if(streamWatch) clearInterval(streamWatch);
-  streamWatch=setInterval(()=>{ if(streaming && Date.now()-lastFrameAt>3000){ if(autoFailoverStream()) return; inflight=0; topUpShots(); } },3000);
+  streamWatch=setInterval(()=>{ if(streaming && !streamSuspended && Date.now()-lastFrameAt>3000){ if(autoFailoverStream()) return; inflight=0; topUpShots(); } },3000);
   $("screenStart").disabled=true; $("screenStop").disabled=false;
   addConsole("Stream started (monitor "+$("monitorSel").value+(streamAllMonitors()?", all":"")+", q="+$("qualitySel").value+")");
 };
@@ -1187,7 +1212,7 @@ function autoFailoverStream(){
   return true;
 }
 function stopStream(silent){
-  streaming=false; streamPaused=false; inflight=0;
+  streaming=false; streamPaused=false; streamSuspended=false; inflight=0;
   if(nextShotTimer){ clearTimeout(nextShotTimer); nextShotTimer=null; }
   if(streamWatch){ clearInterval(streamWatch); streamWatch=null; }
   if(screenTimer){ clearInterval(screenTimer); screenTimer=null; }
@@ -1702,9 +1727,10 @@ function pumpDlQueue(){
 }
 let pendingUpload=null; // {path,resolve} — completed by the output branch
 async function pushChunks(target, dst, b64s, pace, tag){
-  // 4 parallel lanes (agent writes by offset, order-free); ntfy stays
-  // serial to respect rate limits.
-  const lanes=(selected&&selected.remote==="ntfy")?1:4;
+  // Shared 10-lane budget: 5 files while the screen runs, 10 when it
+  // doesn't (or is suspended off-tab). ntfy stays serial (rate limits).
+  // Agent writes by offset, so lane order is free.
+  const lanes=(selected&&selected.remote==="ntfy")?1:fileLanes();
   let next=0, done=0;
   async function lane(){
     while(true){
