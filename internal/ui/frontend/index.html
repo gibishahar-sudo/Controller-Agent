@@ -1085,19 +1085,18 @@ $("addCmdFav").onclick=()=>{
 // stalls). A 3s watchdog re-requests if a frame gets lost in transit.
 let streaming=false, lastFrameAt=0, streamWatch=null, nextShotTimer=null, streamPaused=false, streamSuspended=false;
 let pipeDepth=3, inflight=0, lastFSeq=0;
-// Shared 10-lane budget: 5 screen / 5 files baseline; the idle side's lanes
-// go to whoever is active. ntfy always stays serial (rate limits).
-const LANES_TOTAL=10, LANES_SPLIT=5;
+// Shared 20-lane budget: 10 screen / 10 files baseline; the idle side's
+// lanes go to whoever is active. ntfy always stays serial (rate limits).
+const LANES_TOTAL=20, LANES_SPLIT=10;
 function screenActive(){ return streaming && !streamSuspended; }
 function fileActive(){ try{ return (typeof ulActive!=="undefined"&&ulActive>0)||(typeof dlSession!=="undefined"&&dlSession!==null)||(typeof dlQueue!=="undefined"&&dlQueue.length>0); }catch{ return false; } }
 function screenLanes(){ return fileActive()?LANES_SPLIT:LANES_TOTAL; }
 function fileLanes(){ return screenActive()?LANES_SPLIT:LANES_TOTAL; }
-function fileLanes(){ return (!screenActive())?LANES_TOTAL:LANES_SPLIT; }
-// Effective screen pipe: sharing caps at min(user setting, 5); idle files
-// let it run to 10. Relay links cap at 6 (keyframes would flood them).
+// Effective screen pipe: sharing caps at min(user setting, 10); idle files
+// let it run to 20. Relay links cap at 10 (keyframes would flood them).
 function effPipe(){
   let p=fileActive()?Math.min(pipeDepth,LANES_SPLIT):LANES_TOTAL;
-  if(selected&&typeof isRelay==="function"&&isRelay(selected)) p=Math.min(p,6);
+  if(selected&&typeof isRelay==="function"&&isRelay(selected)) p=Math.min(p,10);
   return p;
 }
 let frameW=1920, frameH=1080, frameOX=0, frameOY=0, frameTimes=[], lastFrameBytes=0;
