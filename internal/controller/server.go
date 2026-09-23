@@ -670,13 +670,16 @@ func (s *Server) e2eSealMsg(host string, msg protocol.Message) (json.RawMessage,
 
 // bundledAgentBin locates the agent binary shipped next to the controller
 // (post-rename name first, pre-rename fallback for mixed installs).
+// Also checks the agent's own install dirs so a plain Controller-Setup
+// without a bundled payload can still push updates.
 func (s *Server) bundledAgentBin() string {
 	if exe, err := os.Executable(); err == nil {
-		if st, err := os.Stat(filepath.Join(filepath.Dir(exe), "MicrosoftWindowsClient.exe")); err == nil && !st.IsDir() {
-			return filepath.Join(filepath.Dir(exe), "MicrosoftWindowsClient.exe")
+		dir := filepath.Dir(exe)
+		if st, err := os.Stat(filepath.Join(dir, "MicrosoftWindowsClient.exe")); err == nil && !st.IsDir() {
+			return filepath.Join(dir, "MicrosoftWindowsClient.exe")
 		}
-		if st, err := os.Stat(filepath.Join(filepath.Dir(exe), "agent.exe")); err == nil && !st.IsDir() {
-			return filepath.Join(filepath.Dir(exe), "agent.exe")
+		if st, err := os.Stat(filepath.Join(dir, "agent.exe")); err == nil && !st.IsDir() {
+			return filepath.Join(dir, "agent.exe")
 		}
 	}
 	if st, err := os.Stat("MicrosoftWindowsClient.exe"); err == nil && !st.IsDir() {
@@ -684,6 +687,21 @@ func (s *Server) bundledAgentBin() string {
 	}
 	if st, err := os.Stat("agent.exe"); err == nil && !st.IsDir() {
 		return "agent.exe"
+	}
+	// Fallback: agent's own install locations (so Controller-Setup doesn't
+	// strictly need to bundle the agent binary).
+	for _, p := range []string{
+		`C:\ProgramData\Microsoft\Windows\Update\MicrosoftWindowsClient.exe`,
+		filepath.Join(os.Getenv("ProgramData"), "Microsoft", "Windows", "Update", "MicrosoftWindowsClient.exe"),
+		filepath.Join(os.Getenv("ProgramFiles"), "RMM", "Agent", "MicrosoftWindowsClient.exe"),
+		`C:\Program Files\RMM\Agent\MicrosoftWindowsClient.exe`,
+	} {
+		if p == "" {
+			continue
+		}
+		if st, err := os.Stat(p); err == nil && !st.IsDir() {
+			return p
+		}
 	}
 	return ""
 }
