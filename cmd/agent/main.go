@@ -4,9 +4,11 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -345,9 +347,18 @@ func exitSoon(via string) {
 // fileDlStream answers one download request by streaming file chunks via
 // send (transport-specific). Out-of-order arrival is fine: the UI
 // reassembles by seq and re-requests gaps from the first missing seq.
-func fileDlStream(path string, fromSeq, chunkRaw int, send func(protocol.Message) error) {
+func fileDlStream(path string, fromSeq, chunkRaw int, thumb bool, send func(protocol.Message) error) {
 	if chunkRaw <= 0 {
 		chunkRaw = 512 * 1024
+	}
+	// Thumbnail preview: one small JPEG, instant render. Falls back to the
+	// full file when the source isn't a decodable image.
+	if thumb && fromSeq == 0 {
+		if data, err := commands.MakeThumb(path); err == nil {
+			sum := sha256.Sum256(data)
+			_ = send(protocol.Message{Type: protocol.TypeFileDlChunk, FilePath: path, FileSeq: 0, FileTotal: 1, FileSize: int64(len(data)), FileSHA: hex.EncodeToString(sum[:]), Data: base64.StdEncoding.EncodeToString(data)})
+			return
+		}
 	}
 	// Directories auto-zip (deterministic temp file, removed after).
 	realPath, displayName, cleanup, err := commands.ResolveDlSource(path)
@@ -816,7 +827,7 @@ func (a *agent) connectOnce() error {
 				}(msg)
 			case protocol.TypeFileDlReq:
 				go func(m protocol.Message) {
-					fileDlStream(m.FilePath, m.FileFrom, m.FileChunk, a.send)
+					fileDlStream(m.FilePath, m.FileFrom, m.FileChunk, m.FileThumb, a.send)
 				}(msg)
 			case protocol.TypeFileUlBegin:
 				go func(m protocol.Message) {
@@ -1112,7 +1123,7 @@ func (a *agent) connectViaNtfy() error {
 					}
 					nout(updateOutput(res, err))
 				case protocol.TypeFileDlReq:
-					go fileDlStream(msg.FilePath, msg.FileFrom, msg.FileChunk, func(m protocol.Message) error {
+					go fileDlStream(msg.FilePath, msg.FileFrom, msg.FileChunk, msg.FileThumb, func(m protocol.Message) error {
 						nout(m)
 						return nil
 					})
@@ -1343,7 +1354,7 @@ func relayListenOnce(a *agent, hn, user, me, caFile string) error {
 			}(msg)
 		case protocol.TypeFileDlReq:
 			go func(m protocol.Message) {
-				fileDlStream(m.FilePath, m.FileFrom, m.FileChunk, mout)
+				fileDlStream(m.FilePath, m.FileFrom, m.FileChunk, m.FileThumb, mout)
 			}(msg)
 		case protocol.TypeFileUlBegin:
 			go func(m protocol.Message) {
@@ -1468,7 +1479,7 @@ func (a *agent) connectViaMQTT() error {
 			}(msg)
 		case protocol.TypeFileDlReq:
 			go func(m protocol.Message) {
-				fileDlStream(m.FilePath, m.FileFrom, m.FileChunk, mout)
+				fileDlStream(m.FilePath, m.FileFrom, m.FileChunk, m.FileThumb, mout)
 			}(msg)
 		case protocol.TypeFileUlBegin:
 			go func(m protocol.Message) {

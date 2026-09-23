@@ -76,6 +76,7 @@ type Message struct {
 	FileSHA   string `json:"fileSHA,omitempty"`
 	FileFrom  int    `json:"fileFrom,omitempty"`
 	FileChunk int    `json:"fileChunk,omitempty"`
+	FileThumb bool   `json:"fileThumb,omitempty"` // preview only: send a small JPEG instead of the file
 	// Fleet groups (v1.41: tag per agent, filterable in UI, broadcastable).
 	Group string `json:"group,omitempty"`
 	// Voice talk-back (v1.41 gated OFF): browser PCM chunk from controller.

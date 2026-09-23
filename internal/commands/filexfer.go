@@ -2,17 +2,109 @@ package commands
 
 import (
 	"archive/zip"
+	"bytes"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"image"
+	"image/color"
+	_ "image/gif"
+	"image/jpeg"
+	_ "image/png"
 	"io"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
+
+// MakeThumb renders a small JPEG preview (max 800px side) for decodable
+// images. Returns an error for non-images or absurd sizes so the caller
+// falls back to the full file. Cheap: config-decode guards before pixels.
+func MakeThumb(path string) ([]byte, error) {
+	ext := strings.ToLower(strings.TrimPrefix(filepath.Ext(path), "."))
+	switch ext {
+	case "png", "jpg", "jpeg", "gif":
+	default:
+		return nil, fmt.Errorf("no thumbnail for .%s", ext)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	cfg, _, err := image.DecodeConfig(f)
+	if err != nil {
+		return nil, err
+	}
+	if int64(cfg.Width)*int64(cfg.Height) > 60000000 {
+		return nil, fmt.Errorf("image too large for thumbnail")
+	}
+	if _, err := f.Seek(0, 0); err != nil {
+		return nil, err
+	}
+	src, _, err := image.Decode(f)
+	if err != nil {
+		return nil, err
+	}
+	b := src.Bounds()
+	w, h := b.Dx(), b.Dy()
+	scale := 800.0 / float64(w)
+	if float64(h) > float64(w) {
+		scale = 800.0 / float64(h)
+	}
+	if scale > 1 {
+		scale = 1
+	}
+	dw, dh := int(float64(w)*scale), int(float64(h)*scale)
+	if dw < 1 {
+		dw = 1
+	}
+	if dh < 1 {
+		dh = 1
+	}
+	dst := image.NewRGBA(image.Rect(0, 0, dw, dh))
+	// Box-average downscale (dependency-free): each dst pixel averages
+	// its source rect, so thumbnails stay smooth at any ratio.
+	for y := 0; y < dh; y++ {
+		y0 := (y * h) / dh
+		y1 := ((y + 1) * h) / dh
+		if y1 <= y0 {
+			y1 = y0 + 1
+		}
+		for x := 0; x < dw; x++ {
+			x0 := (x * w) / dw
+			x1 := ((x + 1) * w) / dw
+			if x1 <= x0 {
+				x1 = x0 + 1
+			}
+			var r, g, bl, a uint64
+			var n uint64
+			for sy := y0; sy < y1 && sy < h; sy++ {
+				for sx := x0; sx < x1 && sx < w; sx++ {
+					cr, cg, cb, ca := src.At(b.Min.X+sx, b.Min.Y+sy).RGBA()
+					r += uint64(cr >> 8)
+					g += uint64(cg >> 8)
+					bl += uint64(cb >> 8)
+					a += uint64(ca >> 8)
+					n++
+				}
+			}
+			if n == 0 {
+				n = 1
+			}
+			dst.SetRGBA(x, y, color.RGBA{uint8(r / n), uint8(g / n), uint8(bl / n), uint8(a / n)})
+		}
+	}
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, dst, &jpeg.Options{Quality: 70}); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
 
 // Chunked file transfer engine (both directions). Downloads stream straight
 // off disk (no whole-file memory); uploads reassemble in a .part file and

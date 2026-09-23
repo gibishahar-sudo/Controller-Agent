@@ -891,6 +891,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		case "file-dl", "file-dl-more":
 			path, _ := msg["path"].(string)
 			via, _ := msg["via"].(string)
+			thumb, _ := msg["thumb"].(bool)
 			ac := s.getAgentByID(target)
 			if ac == nil || path == "" {
 				continue
@@ -907,7 +908,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 			if t == "file-dl" {
 				s.broadcastWS(map[string]interface{}{"type": "output", "id": ac.id, "data": fmt.Sprintf("files via %s → %s", rac.transport(), ac.hostname), "success": true})
 			}
-			_ = s.sendToAgent(rac, protocol.Message{Type: protocol.TypeFileDlReq, FilePath: path, FileFrom: from, FileChunk: fileChunkRaw(rac)})
+			_ = s.sendToAgent(rac, protocol.Message{Type: protocol.TypeFileDlReq, FilePath: path, FileFrom: from, FileChunk: fileChunkRaw(rac), FileThumb: thumb})
 		case "file-ul-begin":
 			path, _ := msg["path"].(string)
 			sha, _ := msg["sha"].(string)

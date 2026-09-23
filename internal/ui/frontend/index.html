@@ -329,7 +329,7 @@ html{touch-action:manipulation}
         </div>
       </div>
       <div style="display:flex;gap:8px"><button class="btn btn-small" id="deleteBtn">🗑 Delete Selected</button><button class="btn btn-small" id="renameBtn" title="Rename selected file/folder">✏ Rename</button><button class="btn btn-small" id="previewBtn" title="Preview selected image/text file">👁 Preview</button><button class="btn btn-small" id="queueBtn">☰ Queue</button><span style="margin-left:auto;font-size:11px;color:#888" id="fileStatus">Ready</span></div>
-      <div id="previewOverlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:60;align-items:center;justify-content:center"><div id="previewBox" style="max-width:88vw;max-height:88vh;background:#1e1e1e;border:1px solid #555;border-radius:10px;padding:12px;display:flex;flex-direction:column;gap:8px"><div style="display:flex;gap:8px;align-items:center"><span id="previewTitle" style="font-size:12px;color:#ccc"></span><button class="btn btn-small" id="previewClose" style="margin-left:auto">✕ Close</button></div><div id="previewBody" style="overflow:auto;max-width:86vw;max-height:76vh;text-align:center"></div></div></div>
+      <div id="previewOverlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:60;align-items:center;justify-content:center"><div id="previewBox" style="max-width:88vw;max-height:88vh;background:#1e1e1e;border:1px solid #555;border-radius:10px;padding:12px;display:flex;flex-direction:column;gap:8px"><div style="display:flex;gap:8px;align-items:center"><span id="previewTitle" style="font-size:12px;color:#ccc"></span><button class="btn btn-small" id="previewFullBtn" style="display:none" title="Load the full file">↧ Full</button><button class="btn btn-small" id="previewClose" style="margin-left:auto">✕ Close</button></div><div id="previewBody" style="overflow:auto;max-width:86vw;max-height:76vh;text-align:center"></div></div></div>
     </section>
 
     <!-- Dashboard — second tab, fleet at a glance (RMM) -->
@@ -579,7 +579,7 @@ function connectWS(){
               if(badge){ const sh=protOK(mv[1])?" 🛡":""; badge.textContent=ok?("agent v"+mv[1]+sh):("agent v"+mv[1]+" — UPDATE"); badge.style.color=ok?"#888":"#FFD54F"; badge.title=protOK(mv[1])?"Self-healing protection active":"No self-healing (update the agent)"; }
             }
           }
-          if(t==="out" && /^upload complete:/.test(m.data||"")){ toast("Upload complete"); if(typeof refreshFiles==="function") refreshFiles(true); }
+          if(t==="out" && /^upload complete:/.test(m.data||"")){ toast("Upload complete"); if(typeof refreshFiles==="function") refreshFiles(true); if(typeof pendingUpload!=="undefined"&&pendingUpload && (m.data||"").startsWith("upload complete: "+pendingUpload.path)){ const r=pendingUpload; pendingUpload=null; r.resolve(); } }
           if(pendingClipPull && m.id===pendingClipPull){
             pendingClipPull=null;
             const txt=m.data||"";
@@ -1535,7 +1535,18 @@ function fileKind(name){ const e=(String(name||"").split(".").pop()||"").toLower
 function previewCap(kind){ if(kind==="text") return 2*1024*1024; if(kind==="pdf") return 15*1024*1024; return 50*1024*1024; }
 function previewCapLabel(kind){ const c=previewCap(kind); return c>=1048576?(c/1048576)+"MB":(c/1024)+"KB"; }
 function openPreview(title){ $("previewTitle").textContent=title; $("previewBody").innerHTML="Loading…"; $("previewOverlay").style.display="flex"; }
-$("previewClose").onclick=()=>{ $("previewOverlay").style.display="none"; $("previewBody").innerHTML=""; };
+$("previewClose").onclick=()=>{ $("previewOverlay").style.display="none"; $("previewBody").innerHTML=""; const fb=$("previewFullBtn"); if(fb) fb.style.display="none"; };
+let lastPreview=null; // {isRemote,path} for the Full-size button
+$("previewFullBtn").onclick=()=>{
+  if(!lastPreview) return;
+  if(lastPreview.isRemote){
+    if(!selected){ toast("No agent", "err"); return; }
+    if(dlSession){ toast("A transfer is already running","err"); return; }
+    openPreview("Remote "+lastPreview.path);
+    dlSession={id:selected.id,path:lastPreview.path,total:0,size:0,sha:"",chunks:new Map(),retries:0,timer:null,mode:"preview",kind:"image",thumb:false};
+    ws.send(JSON.stringify({type:"file-dl",target:selected.id,path:lastPreview.path,via:fileVia(),thumb:false}));
+  }
+};
 $("previewOverlay").onclick=(e)=>{ if(e.target===$("previewOverlay")) $("previewClose").onclick(); };
 function renderPreview(kind, bytes, path){
   const ext=(String(path).split(".").pop()||"").toLowerCase();
@@ -1592,12 +1603,15 @@ function previewFile(isRemote, name, size){
   const dir=$(isRemote?"remotePath":"localPath").value.replace(/\\$/,"");
   const full=dir+"\\"+name;
   openPreview((isRemote?"Remote ":"Local ")+full);
-  if(!isRemote){ previewLocal(full, kind); return; }
+  if(!isRemote){ lastPreview=null; const fb=$("previewFullBtn"); if(fb) fb.style.display="none"; previewLocal(full, kind); return; }
   if(!selected){ toast("No agent", "err"); $("previewClose").onclick(); return; }
   if(!ws||ws.readyState!==1){ toast("Not connected", "err"); $("previewClose").onclick(); return; }
   if(dlSession){ toast("A transfer is already running","err"); $("previewClose").onclick(); return; }
-  dlSession={id:selected.id,path:full,total:0,size:0,sha:"",chunks:new Map(),retries:0,timer:null,mode:"preview",kind:kind};
-  ws.send(JSON.stringify({type:"file-dl",target:selected.id,path:full,via:fileVia()}));
+  const thumb=kind==="image";
+  if(thumb) addTerm(`Previewing thumbnail for ${full}…`,"out");
+  dlSession={id:selected.id,path:full,total:0,size:0,sha:"",chunks:new Map(),retries:0,timer:null,mode:"preview",kind:kind,thumb:thumb};
+  lastPreview={isRemote:true,path:full};
+  ws.send(JSON.stringify({type:"file-dl",target:selected.id,path:full,via:fileVia(),thumb:thumb}));
 }
 $("previewBtn").onclick=()=>{
   const selR=[...$("remoteList").querySelectorAll(".selected")];
@@ -1632,6 +1646,7 @@ $("xferCancelBtn").onclick=()=>{
   dlQueue=[];
   if(dlSession&&dlSession.timer) clearTimeout(dlSession.timer);
   dlSession=null;
+  try{ if(typeof pendingUpload!=="undefined"&&pendingUpload){ const r=pendingUpload; pendingUpload=null; r.reject(new Error("cancelled")); } }catch{}
   setXfer(0,"cancelled");
   addTerm("Transfers cancelled.","out");
   setTimeout(()=>{ xferCancel=false; setXfer(0,""); },1500);
@@ -1641,12 +1656,19 @@ function armDlGap(){
   if(dlSession.timer) clearTimeout(dlSession.timer);
   dlSession.timer=setTimeout(()=>{
     if(!dlSession) return;
+    // Nothing arrived yet (e.g. lost single-chunk thumb): re-request whole.
+    if(dlSession.total===0){
+      if(dlSession.retries>=3){ toast("Download stalled — no chunks arrived","err"); addTerm(`Download ${dlSession.path}: no chunks arrived`,"err"); dlSession=null; setXfer(0,""); pumpDlQueue(); return; }
+      dlSession.retries++;
+      ws.send(JSON.stringify({type:"file-dl",target:dlSession.id,path:dlSession.path,via:fileVia(),thumb:!!dlSession.thumb}));
+      armDlGap(); return;
+    }
     let first=-1; for(let i=0;i<dlSession.total;i++){ if(!dlSession.chunks.has(i)){ first=i; break; } }
     if(first<0){ finishDownload(); return; }
     if(dlSession.retries>=3){ toast("Download stalled — missing chunks after retries","err"); addTerm(`Download ${dlSession.path}: stalled at chunk ${first}/${dlSession.total}`,"err"); dlSession=null; setXfer(0,""); pumpDlQueue(); return; }
     dlSession.retries++;
     addTerm(`Download gap at chunk ${first} — re-requesting…`,"out");
-    ws.send(JSON.stringify({type:"file-dl-more",target:dlSession.id,path:dlSession.path,fromSeq:first,via:fileVia()}));
+    ws.send(JSON.stringify({type:"file-dl-more",target:dlSession.id,path:dlSession.path,fromSeq:first,via:fileVia(),thumb:!!dlSession.thumb}));
     armDlGap();
   },3000);
 }
@@ -1657,7 +1679,7 @@ async function finishDownload(){
   const blob=new Blob(parts,{type:"application/octet-stream"});
   const bytes=new Uint8Array(await blob.arrayBuffer());
   const hex=await sha256hex(bytes);
-  if(s.mode==="preview"){ renderPreview(s.kind||"text", bytes, s.path); setXfer(100,"Done"); setTimeout(()=>setXfer(0,""),1500); pumpDlQueue(); return; }
+  if(s.mode==="preview"){ renderPreview(s.kind||"text", bytes, s.path); const fb=$("previewFullBtn"); if(fb) fb.style.display=(s.kind==="image"&&s.thumb)?"":"none"; setXfer(100,"Done"); setTimeout(()=>setXfer(0,""),1500); pumpDlQueue(); return; }
   if(s.sha && hex!==s.sha){ toast("Downloaded hash MISMATCH — saved anyway, verify before use","err"); addTerm(`Download ${s.path}: SHA MISMATCH (got ${hex.slice(0,12)}…) — saved anyway`,"err"); }
   else addTerm(`Downloaded ${s.path} (${s.size} bytes, sha ok)`,"out");
   const aEl=document.createElement("a"); aEl.href=URL.createObjectURL(blob);
@@ -1677,6 +1699,38 @@ function pumpDlQueue(){
   const item=dlQueue.shift();
   if(q>1) addTerm(`Download queue: ${q-1} remaining after this one`,"out");
   startDl(item);
+}
+let pendingUpload=null; // {path,resolve} — completed by the output branch
+async function pushChunks(target, dst, b64s, pace, tag){
+  // 4 parallel lanes (agent writes by offset, order-free); ntfy stays
+  // serial to respect rate limits.
+  const lanes=(selected&&selected.remote==="ntfy")?1:4;
+  let next=0, done=0;
+  async function lane(){
+    while(true){
+      if(xferCancel) throw new Error("cancelled");
+      const i=next++; if(i>=b64s.length) return;
+      ws.send(JSON.stringify({type:"file-ul-chunk",target,seq:i,data:b64s[i],via:fileVia()}));
+      done++;
+      setXfer(40+Math.round(60*done/b64s.length),`${tag}↑ sending ${done}/${b64s.length}`);
+      if(pace) await new Promise(r=>setTimeout(r,pace));
+    }
+  }
+  await Promise.all(Array.from({length:Math.min(lanes,Math.max(1,b64s.length))},lane));
+}
+function awaitUploadComplete(dst, total, pace, resend, tag){
+  return new Promise((resolve,reject)=>{
+    const ms=Math.min(600000, 20000+total*(pace+400));
+    const to=setTimeout(async ()=>{
+      try{
+        addTerm(`${tag}No confirmation yet — re-sending chunks once…`,"out");
+        await resend();
+        const to2=setTimeout(()=>{ if(pendingUpload&&pendingUpload.path===dst) pendingUpload=null; reject(new Error("agent never confirmed the upload — retry manually")); }, ms);
+        pendingUpload={path:dst,resolve:()=>{clearTimeout(to2); resolve();},reject:(e)=>{clearTimeout(to2); reject(e||new Error("cancelled"));}};
+      }catch(e){ pendingUpload=null; reject(e); }
+    }, ms);
+    pendingUpload={path:dst,resolve:()=>{clearTimeout(to); resolve();},reject:(e)=>{clearTimeout(to); reject(e||new Error("cancelled"));}};
+  });
 }
 async function uploadOne(src, dst, tag){
   ulActive++;
@@ -1703,13 +1757,10 @@ async function uploadOne(src, dst, tag){
     const flat=new Uint8Array(size); let p=0; for(const b of raws){ flat.set(b,p); p+=b.length; }
     const sha=await sha256hex(flat.subarray(0,p));
     ws.send(JSON.stringify({type:"file-ul-begin",target:selected.id,path:dst,size:size,sha:sha,total:b64s.length,via:fileVia()}));
-    for(let i=0;i<b64s.length;i++){
-      if(xferCancel) throw new Error("cancelled");
-      ws.send(JSON.stringify({type:"file-ul-chunk",target:selected.id,seq:i,data:b64s[i],via:fileVia()}));
-      setXfer(40+Math.round(60*(i+1)/b64s.length),`${tag}↑ sending ${i+1}/${b64s.length}`);
-      if(pace) await new Promise(r=>setTimeout(r,pace));
-    }
+    const sendAll=()=>pushChunks(selected.id, dst, b64s, pace, tag);
+    await sendAll();
     addTerm(`${tag}Upload sent — waiting for agent verify…`,"out");
+    await awaitUploadComplete(dst, b64s.length, pace, sendAll, tag);
   }catch(e){ toast("Upload failed: "+(e.message||e),"err"); addTerm(`${tag}Upload failed: `+(e.message||e),"err"); setXfer(0,""); }
   finally{ ulActive--; }
 }
@@ -2342,6 +2393,8 @@ async function handleDropFiles(files, dstDir){
   if(!selected) return toast("Select an agent first","err");
   if(!ws||ws.readyState!==1) return toast("Not connected","err");
   for(const f of [...files]){
+    if(xferCancel) break;
+    try{
     const dst=(dstDir.replace(/\\$/,"")+"\\"+f.name);
     const ab=await f.arrayBuffer(); const bytes=new Uint8Array(ab);
     let hex=""; try{ const d=await crypto.subtle.digest("SHA-256",bytes); hex=[...new Uint8Array(d)].map(x=>x.toString(16).padStart(2,"0")).join(""); }catch{}
@@ -2350,8 +2403,11 @@ async function handleDropFiles(files, dstDir){
     const parts=[]; for(let i=0;i<b64.length;i+=512*1024) parts.push(b64.slice(i,i+512*1024));
     if(!parts.length) parts.push("");
     ws.send(JSON.stringify({type:"file-ul-begin",target:selected.id,path:dst,size:f.size,sha:hex,total:parts.length,via:fileVia()}));
-    for(let i=0;i<parts.length;i++){ ws.send(JSON.stringify({type:"file-ul-chunk",target:selected.id,seq:i,data:parts[i],via:fileVia()})); setXfer(Math.round(100*(i+1)/parts.length), "↑ "+f.name+" "+(i+1)+"/"+parts.length); await new Promise(r=>setTimeout(r, xferPace(selected))); }
-    addTerm("↑ Dropped "+f.name+" → "+dst+" ("+f.size+" bytes)","out");
+    const sendAll=()=>pushChunks(selected.id, dst, parts, xferPace(selected), "↑ "+f.name+" ");
+    await sendAll();
+    addTerm("↑ Dropped "+f.name+" → "+dst+" ("+f.size+" bytes) — waiting for verify…","out");
+    await awaitUploadComplete(dst, parts.length, xferPace(selected), sendAll, "↑ "+f.name+" ");
+    }catch(e){ toast("Drop upload failed: "+(e.message||e),"err"); }
   }
 }
 document.querySelectorAll(".file-pane, #screenWrap").forEach(el=>{
