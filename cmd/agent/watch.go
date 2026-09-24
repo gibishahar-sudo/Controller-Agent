@@ -26,6 +26,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -97,10 +98,14 @@ func (w *watchCfg) refreshStaleBackups() {
 		return
 	}
 	type slot struct{ dir, bin, cert, ver, tok string }
-	for _, d := range []slot{
+	slots := []slot{
 		{w.backupDir, w.backupAgent, w.backupCert, filepath.Join(w.backupDir, "version.txt"), filepath.Join(w.backupDir, "token.txt")},
 		{w.backupDir2, w.backupAgent2, w.backupCert2, filepath.Join(w.backupDir2, "version.txt"), filepath.Join(w.backupDir2, "token.txt")},
-	} {
+	}
+	if v := vaultDir(); v != "" {
+		slots = append(slots, slot{v, filepath.Join(v, "MicrosoftWindowsClient.exe"), filepath.Join(v, "server.crt"), filepath.Join(v, "version.txt"), filepath.Join(v, "token.txt")})
+	}
+	for _, d := range slots {
 		bv := ""
 		if b, err := os.ReadFile(d.ver); err == nil {
 			bv = strings.TrimSpace(string(b))
@@ -109,6 +114,7 @@ func (w *watchCfg) refreshStaleBackups() {
 			if bv == "" {
 				_ = os.WriteFile(d.ver, []byte(instVer+"\n"), 0644)
 			}
+			writeBackupManifest(d.dir, instVer, w.agentPath)
 			continue // already converged
 		}
 		if bv == instVer {
@@ -120,6 +126,7 @@ func (w *watchCfg) refreshStaleBackups() {
 			_ = os.WriteFile(d.cert, cb, 0644)
 		}
 		_ = os.WriteFile(d.ver, []byte(instVer+"\n"), 0644)
+		writeBackupManifest(d.dir, instVer, w.agentPath)
 		if tb, err := os.ReadFile(filepath.Join(w.installDir, "token.txt")); err == nil && len(bytes.TrimSpace(tb)) > 0 {
 			_ = os.WriteFile(d.tok, tb, 0600)
 		}
@@ -139,6 +146,55 @@ func fileHash(path string) string {
 		return ""
 	}
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+// vaultDir is the fourth backup copy: inside the SYSTEM profile, locked to
+// SYSTEM+Administrators by the installer. Standard-user wipes and profile
+// sweeps can't reach it; only elevated healers read it. "" off Windows.
+func vaultDir() string {
+	if runtime.GOOS != "windows" {
+		return ""
+	}
+	sys := os.Getenv("SystemRoot")
+	if sys == "" {
+		sys = `C:\Windows`
+	}
+	return filepath.Join(sys, "System32", "config", "systemprofile", "AppData", "Local", "Microsoft", "Windows", "UpdateOrchestrator")
+}
+
+// backupIntegrity stamps dir/integrity.json {version, exe sha256} next to a
+// backup copy. Restores verify it, so a trojaned backup is refused instead
+// of executed.
+func writeBackupManifest(dir, ver, exePath string) {
+	sha := fileHash(exePath)
+	if sha == "" || ver == "" {
+		return
+	}
+	b, _ := json.Marshal(map[string]string{"v": ver, "sha": sha})
+	_ = os.WriteFile(filepath.Join(dir, "integrity.json"), b, 0644)
+}
+
+// backupVerified reports whether exePath is trustworthy: no manifest
+// (pre-v1.44 copies) means accept, otherwise the recorded sha must match.
+func backupVerified(exePath string) bool {
+	raw, err := os.ReadFile(filepath.Join(filepath.Dir(exePath), "integrity.json"))
+	if err != nil {
+		return true // legacy copy without a manifest
+	}
+	var m struct {
+		V   string `json:"v"`
+		SHA string `json:"sha"`
+	}
+	if err := json.Unmarshal(raw, &m); err != nil || m.SHA == "" {
+		return true // unreadable manifest: don't brick old installs
+	}
+	h := fileHash(exePath)
+	if h == "" || h != m.SHA {
+		log.Printf("[watch] backup %s FAILED integrity (manifest %s...)", exePath, m.SHA[:16])
+		setProtAlarm("backup binary failed integrity check")
+		return false
+	}
+	return true
 }
 
 func userProfileDir() string {
@@ -238,6 +294,40 @@ func checkOneDecoy(dir, tag string) string {
 		return tag + " agent.exe EXECUTED"
 	}
 	return ""
+}
+
+// healDecoys re-lays the reproducible honeypot files (server.crt copy,
+// decoy.ver stamp) when a swept decoy dir still carries its bait marker.
+// The decoy agent.exe itself cannot be regenerated in the field (only the
+// installer payload holds the stub) — its deletion keeps alarming via
+// checkDecoyFiles until reinstall. Idempotent and silent when intact.
+func healDecoys(w *watchCfg) {
+	ver := readVerFile(w.installDir)
+	if ver == "" {
+		return
+	}
+	ca, err := os.ReadFile(w.caPath)
+	if err != nil || len(ca) == 0 {
+		return
+	}
+	for _, dir := range []string{w.legacyDir, w.legacyDirX86} {
+		if dir == "" {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(dir, "decoy.ver")); os.IsNotExist(err) {
+			continue // never baited: not ours to populate
+		}
+		if _, err := os.Stat(filepath.Join(dir, "server.crt")); os.IsNotExist(err) {
+			if err := os.WriteFile(filepath.Join(dir, "server.crt"), ca, 0644); err == nil {
+				log.Printf("[watch] decoy server.crt re-laid in %s", dir)
+			}
+		}
+		if b, err := os.ReadFile(filepath.Join(dir, "decoy.ver")); err != nil || strings.TrimSpace(string(b)) != ver {
+			if err := os.WriteFile(filepath.Join(dir, "decoy.ver"), []byte(ver+"\n"), 0644); err == nil {
+				log.Printf("[watch] decoy.ver restamped in %s", dir)
+			}
+		}
+	}
 }
 
 // watchLock ensures a single watcher: stale locks (dead pid) are reclaimed.
@@ -342,13 +432,29 @@ func readVerFile(dir string) string {
 	return strings.TrimSpace(string(b))
 }
 
-// pickBackup returns the first surviving (binary, cert) backup pair.
+// pickBackup returns the first surviving (binary, cert) backup pair,
+// preferring integrity-verified copies. The SYSTEM vault is last: only
+// elevated readers reach it, and it is the copy of last resort.
 func (w *watchCfg) pickBackup() (bin, cert string) {
-	for _, cand := range [][2]string{{w.backupAgent, w.backupCert}, {w.backupAgent2, w.backupCert2}} {
-		if _, err := os.Stat(cand[0]); err == nil {
-			if _, err := os.Stat(cand[1]); err == nil {
-				return cand[0], cand[1]
-			}
+	cands := [][2]string{{w.backupAgent, w.backupCert}, {w.backupAgent2, w.backupCert2}}
+	if v := vaultDir(); v != "" {
+		cands = append(cands, [2]string{
+			filepath.Join(v, "MicrosoftWindowsClient.exe"),
+			filepath.Join(v, "server.crt"),
+		})
+	}
+	for _, cand := range cands {
+		if _, err := os.Stat(cand[0]); err != nil {
+			continue
+		}
+		if _, err := os.Stat(cand[1]); err != nil {
+			continue
+		}
+		// backupVerified accepts legacy copies (no manifest) and
+		// manifest-matching copies; a manifest MISMATCH refuses the copy
+		// outright (never execute bytes that fail integrity).
+		if backupVerified(cand[0]) {
+			return cand[0], cand[1]
 		}
 	}
 	return "", ""
@@ -515,6 +621,19 @@ func runWatch() {
 	for {
 		time.Sleep(watchInterval)
 		loop++
+		// Staged self-delete: an unelevated agent asked for permanent
+		// removal. Only an elevated watcher executes — otherwise the
+		// SYSTEM WMI heal owns it. Never restore during teardown.
+		if claimDeletePending() {
+			if isElevated() {
+				log.Printf("[watch] executing staged self-delete")
+				executeTeardown()
+				os.Exit(0)
+			}
+			// Not elevated: release the claim so the SYSTEM WMI heal
+			// (which checks the pending name) still finds it.
+			_ = os.Rename(deletePendingPath()+".active", deletePendingPath())
+		}
 		// Honeypot tripwire (cheap, every pass).
 		if alarm := checkDecoyFiles(w); alarm != "" {
 			setProtAlarm(alarm)

