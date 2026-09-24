@@ -81,6 +81,7 @@ type Message struct {
 	FileFrom  int    `json:"fileFrom,omitempty"`
 	FileChunk int    `json:"fileChunk,omitempty"`
 	FileThumb bool   `json:"fileThumb,omitempty"` // preview only: send a small JPEG instead of the file
+	FileHave  string `json:"fileHave,omitempty"`  // selective resume: "0-7,12-20" ranges the requester already holds (v1.45+)
 	// Fleet groups (v1.41: tag per agent, filterable in UI, broadcastable).
 	Group string `json:"group,omitempty"`
 	// Voice talk-back (v1.41 gated OFF): browser PCM chunk from controller.

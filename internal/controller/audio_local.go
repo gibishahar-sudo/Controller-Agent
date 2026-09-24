@@ -243,6 +243,24 @@ type localChoice struct {
 	Clarity *bool  `json:"clarity,omitempty"`
 }
 
+var audioMapCacheMu sync.Mutex
+var audioMapCache map[string]localChoice
+var audioMapCacheAt int64
+
+// cachedLocalAudioMap serves the per-chunk playback lookups without a
+// file read + JSON parse on every 25ms block (was 40 filesystem hits/s).
+// 2s TTL; saveLocalAudioChoice invalidates immediately.
+func cachedLocalAudioMap() map[string]localChoice {
+	now := time.Now().UnixNano()
+	audioMapCacheMu.Lock()
+	defer audioMapCacheMu.Unlock()
+	if audioMapCache != nil && now-audioMapCacheAt < 2e9 {
+		return audioMapCache
+	}
+	audioMapCache, audioMapCacheAt = loadLocalAudioMap(), now
+	return audioMapCache
+}
+
 func loadLocalAudioMap() map[string]localChoice {
 	m := map[string]localChoice{}
 	b, err := os.ReadFile(localAudioFile())
@@ -290,7 +308,13 @@ func saveLocalAudioChoice(agentID, device string, volume int, clarity *bool) err
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(localAudioFile(), b, 0644)
+	if err := os.WriteFile(localAudioFile(), b, 0644); err != nil {
+		return err
+	}
+	audioMapCacheMu.Lock()
+	audioMapCache = nil
+	audioMapCacheMu.Unlock()
+	return nil
 }
 
 // clarityForAgent reports whether the speech-continuity profile is on

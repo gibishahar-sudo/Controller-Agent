@@ -89,9 +89,18 @@ func dial(broker, clientID string, onConnect paho.OnConnectHandler) (paho.Client
 }
 
 func publish(c paho.Client, topic string, env relay.Envelope) error {
+	return publishTimeout(c, topic, env, 10*time.Second)
+}
+
+// publishTimeout bounds one QoS0 publish. Bulk payloads (file/update
+// chunks) keep 10s; interactive frames (screen/mouse/audio, small commands)
+// fail fast at 2s so one wedged broker hop never head-of-line blocks the
+// pipe behind it (loss is idempotent: fseq drops stale screens, CmdID
+// dedupes commands, audio gap-resets).
+func publishTimeout(c paho.Client, topic string, env relay.Envelope, d time.Duration) error {
 	body, _ := json.Marshal(env)
 	token := c.Publish(topic, 0, false, body)
-	if !token.WaitTimeout(10 * time.Second) {
+	if !token.WaitTimeout(d) {
 		return fmt.Errorf("publish timeout")
 	}
 	return token.Error()
@@ -246,6 +255,22 @@ func (b *AgentBus) Publish(suffix string, env relay.Envelope) error {
 	return publish(b.client, Base+"/"+suffix, env)
 }
 
+// PublishBin publishes raw bytes to Base/suffix (binary media topics:
+// no JSON/base64 framing). Fast 2s cap like PublishFast.
+func (b *AgentBus) PublishBin(suffix string, body []byte) error {
+	token := b.client.Publish(Base+"/"+suffix, 0, false, body)
+	if !token.WaitTimeout(2 * time.Second) {
+		return fmt.Errorf("publish timeout")
+	}
+	return token.Error()
+}
+
+// PublishFast is Publish with a 2s cap for small interactive frames
+// (screen/tile/mouse/audio). Bulk chunk senders keep Publish (10s).
+func (b *AgentBus) PublishFast(suffix string, env relay.Envelope) error {
+	return publishTimeout(b.client, Base+"/"+suffix, env, 2*time.Second)
+}
+
 func (b *AgentBus) Close() { b.client.Disconnect(500) }
 
 // Broker reports which broker this bus is connected through (diagnostics).
@@ -290,9 +315,29 @@ func (b *CtrlBus) Subscribe(handle func(topic string, env relay.Envelope)) error
 	return token.Error()
 }
 
+// SubscribeBin registers the binary media topic (audiobin/<host>): raw
+// frames, no envelope. Runs alongside Subscribe; the controller routes by
+// topic prefix.
+func (b *CtrlBus) SubscribeBin(handle func(topic string, body []byte)) error {
+	token := b.client.Subscribe(Base+"/audiobin/+", 0, func(_ paho.Client, m paho.Message) {
+		handle(m.Topic(), m.Payload())
+	})
+	if !token.WaitTimeout(10 * time.Second) {
+		return fmt.Errorf("subscribe timeout")
+	}
+	return token.Error()
+}
+
 // PublishCmd sends a directed command to one agent host.
 func (b *CtrlBus) PublishCmd(host string, env relay.Envelope) error {
 	return publish(b.client, Base+"/cmd/"+host, env)
+}
+
+// PublishCmdFast is PublishCmd with a 2s cap for small interactive orders
+// (screenshot requests, pings, small commands, manifests). Bulk chunks
+// keep the 10s PublishCmd.
+func (b *CtrlBus) PublishCmdFast(host string, env relay.Envelope) error {
+	return publishTimeout(b.client, Base+"/cmd/"+host, env, 2*time.Second)
 }
 
 // PublishPresence broadcasts a controller heartbeat (peer visibility for

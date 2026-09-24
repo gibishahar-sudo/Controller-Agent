@@ -22,8 +22,8 @@ func StartController(certFile, keyFile, httpAddr, screensDir string) string {
 		KeyFile:        keyFile,
 		HTTPAddr:       httpAddr,
 		ScreensDir:     screensDir,
-		EnableNtfy:     true,
-		EnableTCPRelay: false, // mobile: ntfy only, no local relay
+		EnableNtfy:     false, // ntfy removed in v1.45 (direct + MQTT only)
+		EnableTCPRelay: false, // mobile: no local relay
 	}
 	if httpAddr == "" {
 		httpAddr = "127.0.0.1:8080"

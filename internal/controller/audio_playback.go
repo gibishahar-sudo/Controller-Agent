@@ -1,7 +1,8 @@
 package controller
 
 import (
-	"bytes"
+	"bufio"
+	"fmt"
 	"io"
 	"log"
 	"os/exec"
@@ -14,7 +15,8 @@ import (
 
 // Local playback of streamed remote audio. The controller spawns one
 // powershell helper that renders raw 22050Hz mono s16 PCM from stdin to the
-// operator's chosen waveOut device. Chunks arrive from MQTT (~50ms each);
+// operator's chosen waveOut device. Chunks arrive from MQTT binary frames
+// (~25ms blocks, batched pairs by default, DTX silence skipped);
 // the writer queue absorbs jitter and drops oldest (rather than lagging)
 // on overflow.
 
@@ -113,13 +115,17 @@ public class RmmPlay {
 '@
 `
 
-// maxPlayQueue bounds the adaptive jitter buffer: 2..8 x 50ms blocks
-// (100ms floor on clean links, 400ms ceiling on jittery ones). When the
-// player falls behind, OLDEST chunks are dropped so the stream stays live
-// instead of lagging behind (dropping newest would freeze audio while
-// staying late).
+// maxPlayQueue bounds the adaptive jitter buffer in blocks (v1.45+ blocks
+// are ~25ms: 2..8 = 50ms floor on clean links, 200ms ceiling on jittery
+// ones; clarity profile raises both). When the player falls behind, OLDEST
+// chunks are dropped so the stream stays live instead of lagging behind
+// (dropping newest would freeze audio while staying late).
 const maxPlayQueue = 8
 const minPlayQueue = 2
+
+// audioBlockMs is the v2 media block duration; the jitter math below is in
+// blocks, so halving the block size halves delay with no other change.
+const audioBlockMs = 25
 
 type audioPlayerState struct {
 	cmd     *exec.Cmd
@@ -148,9 +154,9 @@ type audioPlayerState struct {
 func (st *audioPlayerState) desiredQueue() int {
 	ema := st.arrivalEMA
 	if ema <= 0 {
-		ema = 100
+		ema = 2 * audioBlockMs
 	}
-	q := int((ema*2 + 49) / 50)
+	q := int((ema*2 + audioBlockMs - 1) / audioBlockMs)
 	lo, hi := st.qMin, st.qMax
 	if lo <= 0 {
 		lo = minPlayQueue
@@ -172,11 +178,12 @@ var curAudioPlayer *audioPlayerState
 var lastPlayerSpawnFail atomic.Int64
 
 // ensureAudioPlayer (re)starts the local player when the stream source,
-// chosen device, gain or clarity profile changes, and refreshes the
-// silence watchdog otherwise.
-func ensureAudioPlayer(host, device string, gain float64, clarity bool) {
+// chosen device or clarity profile changes, and refreshes the silence
+// watchdog otherwise. Gain-only changes apply live (no restart, no
+// dropout): the writer reads st.gain per chunk under the state mutex.
+func ensureAudioPlayer(host, device string, gain float64, clarity bool) (string, error) {
 	if runtime.GOOS != "windows" {
-		return
+		return "", nil // no local playback off Windows; chunks drop silently
 	}
 	if gain < 0 {
 		gain = 0
@@ -188,28 +195,37 @@ func ensureAudioPlayer(host, device string, gain float64, clarity bool) {
 	defer audioPlayerMu.Unlock()
 	qMin, qMax, maxRep := minPlayQueue, maxPlayQueue, 4
 	if clarity {
-		qMin, qMax, maxRep = 8, 20, 8 // ~400ms-1s buffer, 400ms concealment for speech
+		qMin, qMax, maxRep = 8, 20, 8 // ~200-500ms buffer, 200ms concealment for speech
 	}
-	if curAudioPlayer != nil && curAudioPlayer.host == host && curAudioPlayer.device == device && curAudioPlayer.gain == gain && curAudioPlayer.clarity == clarity {
+	if curAudioPlayer != nil && curAudioPlayer.host == host && curAudioPlayer.device == device && curAudioPlayer.clarity == clarity {
+		if curAudioPlayer.gain != gain {
+			curAudioPlayer.mu.Lock()
+			curAudioPlayer.gain = gain
+			curAudioPlayer.mu.Unlock()
+		}
 		curAudioPlayer.lastChunk.Store(time.Now().UnixNano())
-		return
+		return "", nil
 	}
 	if time.Since(time.Unix(0, lastPlayerSpawnFail.Load())) < 5*time.Second {
-		return // spawn recently failed; back off instead of storming powershell
+		return "", nil // spawn recently failed; back off instead of storming powershell
 	}
 	stopAudioPlayerLocked()
 	script := waveOutPlayerSnippet + "[RmmPlay]::Run('" + strings.ReplaceAll(device, "'", "''") + "')"
 	cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-command", script)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
-		return
+		return "", err
 	}
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
+	// Stream stderr through a pipe so the helper's first line ("RmmPlay on
+	// [actual device]") tells us where audio REALLY landed — the fuzzy
+	// match can otherwise misroute silently.
+	stdErrR, stdErrW := io.Pipe()
+	cmd.Stderr = stdErrW
 	if err := cmd.Start(); err != nil {
 		lastPlayerSpawnFail.Store(time.Now().UnixNano())
+		stdErrW.Close()
 		log.Printf("[audio] player spawn failed: %v", err)
-		return
+		return "", err
 	}
 	st := &audioPlayerState{
 		cmd:    cmd,
@@ -229,13 +245,39 @@ func ensureAudioPlayer(host, device string, gain float64, clarity bool) {
 	// Fresh player = fresh encoder on the agent side (or a restarted
 	// stream): drop any stale predictor so playback starts clean.
 	resetAudioDecoder(host)
+	// Confirm where audio landed: the helper prints its ACTUAL device on
+	// stderr at startup (fuzzy match can misroute). Timeout = hung
+	// helper: kill it and report instead of playing into the void.
+	lineCh := make(chan string, 1)
+	go func() {
+		br := bufio.NewReader(stdErrR)
+		ln, _ := br.ReadString('\n')
+		lineCh <- strings.TrimSpace(ln)
+	}()
+	go func() {
+		<-st.done
+		stdErrW.Close()
+	}()
 	name := device
 	if name == "" {
 		name = "Default"
 	}
-	log.Printf("[audio] playing remote audio from %s on [%s] (~1s delay)", host, name)
+	select {
+	case ln := <-lineCh:
+		if strings.Contains(ln, "RmmPlay on [") {
+			name = ln[strings.Index(ln, "RmmPlay on [")+len("RmmPlay on ["):]
+			name = strings.TrimSuffix(name, "]")
+		}
+	case <-time.After(3 * time.Second):
+		_ = cmd.Process.Kill()
+		lastPlayerSpawnFail.Store(time.Now().UnixNano())
+		stopAudioPlayerLocked()
+		return "", fmt.Errorf("player helper silent for 3s (no audio device?)")
+	}
+	log.Printf("[audio] playing remote audio from %s on [%s]", host, name)
 	go audioPlayerWriter(st)
 	go audioPlayerWatchdog(st)
+	return name, nil
 }
 
 func audioPlayerWriter(st *audioPlayerState) {

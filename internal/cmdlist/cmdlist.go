@@ -155,7 +155,7 @@ var Known = map[string]string{
 	"encode-base64":           "Encode base64 - encode-base64 <text>",
 	"decode-base64":           "Decode base64",
 	"hash-text":               "Hash text - hash-text <text>",
-	"camera-shot":             "Camera snapshot - camera-shot [quality 1-100]",
+	"camera-shot":             "Camera snapshot - camera-shot [device 0-3] [quality 1-100] [width 160-1280]",
 	"ping":                    "Ping",
 	"screenshot-now":          "Take screenshot",
 }

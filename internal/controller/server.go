@@ -8,11 +8,11 @@
 //   - idCounter is atomic (was a plain int incremented from 6 accept loops).
 //   - Real RTT latency via pingSent timestamps (was UnixMilli stored as "latency").
 //   - Per-connection WS write mutex (gorilla Conn is not safe for concurrent
-//     WriteMessage; handleAgent + ntfy poll + HTTP handlers wrote concurrently).
-//   - Nil-conn guards everywhere (ntfy virtual agents have no net.Conn).
-//   - lastSeen + sweeper evicts stale ntfy agents after 90s.
-//   - Ntfy uses server-time `since` and directed To delivery (fixes cross-talk
-//     where DESKTOP-DCHQHAK executed commands meant for Shahar-LT).
+//     WriteMessage; handleAgent + relay loops + HTTP handlers wrote concurrently).
+//   - Nil-conn guards everywhere (MQTT virtual agents have no net.Conn).
+//   - lastSeen + sweeper marks stale relay agents after 90s.
+//   - Directed To delivery fixes cross-talk (DESKTOP-DCHQHAK executed
+//     commands meant for Shahar-LT).
 //   - Screenshots rotate (last 100 files) and reject >15MB payloads.
 //   - HTTP server has read/write/idle timeouts + graceful shutdown.
 package controller
@@ -53,7 +53,7 @@ import (
 )
 
 const (
-	ntfyStaleAfter  = 90 * time.Second
+	relayStaleAfter  = 90 * time.Second
 	sweepInterval   = 15 * time.Second
 	maxScreensKept  = 100
 	maxScreenBytes  = 15 << 20 // 15 MB decoded cap
@@ -70,15 +70,15 @@ type Options struct {
 	House        string // operator label for multi-house setups (e.g. Home)
 	ScreensDir   string
 	AutoOpen     bool
-	NtfyTopic    string // "" = default
-	NtfyServer   string // "" = default host
-	EnableNtfy   bool
+	NtfyTopic    string // REMOVED in v1.45 (kept so old callers still compile)
+	NtfyServer   string // REMOVED in v1.45 (kept so old callers still compile)
+	EnableNtfy   bool   // REMOVED in v1.45 (kept so old callers still compile)
 	EnableTCPRelay bool
 }
 
-// AgentConn wraps one agent (TCP or ntfy-virtual).
+// AgentConn wraps one agent (TCP or MQTT-virtual).
 type AgentConn struct {
-	conn     net.Conn // nil for ntfy-virtual
+	conn     net.Conn // nil for MQTT-virtual agents
 	enc      *json.Encoder
 	hostname string
 	user     string
@@ -110,7 +110,7 @@ func (a *AgentConn) send(msg protocol.Message) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.enc == nil || a.conn == nil {
-		return fmt.Errorf("ntfy agent: use relay publish")
+		return fmt.Errorf("relay agent: use relay publish")
 	}
 	return a.enc.Encode(msg)
 }
@@ -164,20 +164,6 @@ func (a *AgentConn) mqttHost() string {
 	return a.id
 }
 
-// ntfyName returns the name used for directed ntfy delivery. This MUST be
-// the plain hostname: agents poll with To-filter == hostname, so a To of
-// the instance id is filtered out and the command never arrives (same
-// v1.4.6 regression as mqttHost).
-func (a *AgentConn) ntfyName() string {
-	if a.hostname != "" {
-		return a.hostname
-	}
-	if strings.HasPrefix(a.id, "agent-ntfy-") {
-		return strings.TrimPrefix(a.id, "agent-ntfy-")
-	}
-	return a.id
-}
-
 // Server is a running controller instance.
 type Server struct {
 	opts        Options
@@ -216,6 +202,10 @@ type Server struct {
 	latencyMu     sync.RWMutex
 	wsClients     map[*wsClient]bool
 	wsMu          sync.Mutex
+	ulSem         chan struct{} // bounds concurrent file-ul-chunk publishes
+	screenSave    chan screenJob // background disk archival for frames
+	camFrags      map[string]*camFragAsm
+	camFragMu     sync.Mutex
 	screenshotDir string
 	httpAddr      string
 
@@ -321,20 +311,19 @@ func (c *wsClient) writeMsg(msg []byte) error {
 
 var wsUpgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
 
-// StartBackground starts listeners, HTTP UI, ntfy poll and relay dial-out.
+// StartBackground starts listeners, HTTP UI and relay dial-out.
 // It returns immediately; call s.Close() to stop.
 func StartBackground(opts Options) (*Server, error) {
-	if opts.NtfyServer != "" {
-		relay.SetServer(opts.NtfyServer)
-	}
-	if opts.NtfyTopic != "" {
-		relay.SetTopic(opts.NtfyTopic)
+	if opts.NtfyServer != "" || opts.NtfyTopic != "" {
+		log.Printf("[!] ntfy relay was removed in v1.45 — NtfyServer/NtfyTopic ignored")
 	}
 	s := &Server{
 		opts:      opts,
 		agents:    make(map[string]*AgentConn),
 		latency:   make(map[string]int64),
 		wsClients: make(map[*wsClient]bool),
+		ulSem:     make(chan struct{}, 8),
+		screenSave: make(chan screenJob, 64),
 		closeCh:   make(chan struct{}),
 		httpAddr:  opts.HTTPAddr,
 		house:     opts.House,
@@ -440,7 +429,7 @@ func StartBackground(opts Options) (*Server, error) {
 		}(l)
 	}
 	if len(s.listeners) == 0 {
-		fmt.Printf("[!] No TLS listeners (all in use) - continuing with ntfy relay only\n")
+		fmt.Printf("[!] No TLS listeners (all in use) - continuing with MQTT relay only\n")
 	} else {
 		var names []string
 		for _, l := range s.listeners {
@@ -468,11 +457,7 @@ func StartBackground(opts Options) (*Server, error) {
 		}
 	}
 	if opts.EnableNtfy {
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
-			s.ntfyLoop()
-		}()
+		log.Printf("[!] ntfy relay was removed in v1.45 — EnableNtfy ignored")
 	}
 	if opts.EnableTCPRelay {
 		s.wg.Add(1)
@@ -497,6 +482,11 @@ func StartBackground(opts Options) (*Server, error) {
 	go func() {
 		defer s.wg.Done()
 		s.cmdRetryLoop()
+	}()
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.screenSaveLoop()
 	}()
 	return s, nil
 }
@@ -741,26 +731,21 @@ func (s *Server) bundledAgentBin() string {
 	return ""
 }
 
-// fileChunkRaw sizes one file-transfer chunk per transport. HARD LIMITS:
-// ntfy.sh rejects messages over 4096 bytes, so ntfy chunks stay at 2KB raw
-// (~2.7KB base64 + envelope ≈ 3KB total — do NOT raise this). MQTT is roomy
+// fileChunkRaw sizes one file-transfer chunk per transport. MQTT is roomy
 // (HiveMQ verified ≥100KB) but 128KB keeps loss blast radius small.
 func fileChunkRaw(ac *AgentConn) int {
 	switch ac.transport() {
 	case "mqtt":
 		return 128 * 1024
-	case "ntfy":
-		return 2 * 1024
 	default:
 		return 512 * 1024
 	}
 }
 
 // fileAgentFor picks the transport for bulk file transfer. MQTT is
-// preferred: no 4KB cap like ntfy and no dependence on a possibly-flaky
-// direct TCP link. Falls back to the selected agent. Chunk replies may
-// arrive under the sibling's id — both UI and dlTo sessions match by
-// hostname+path, so this is transparent.
+// preferred over a possibly-flaky direct TCP link. Falls back to the
+// selected agent. Chunk replies may arrive under the sibling's id — both
+// UI and dlTo sessions match by hostname+path, so this is transparent.
 func (s *Server) fileAgentFor(ac *AgentConn) *AgentConn {
 	if ac == nil {
 		return nil
@@ -799,6 +784,7 @@ func (s *Server) fileRoute(ac *AgentConn, via string) (*AgentConn, error) {
 // controller-local .part file (for "save to a path on this PC"), renamed
 // into place on completion. Keyed by agent id + remote path.
 type dlToSession struct {
+	mu        sync.Mutex
 	localPath string
 	part      string
 	chunkRaw  int
@@ -807,6 +793,7 @@ type dlToSession struct {
 	sha       string
 	have      map[int]bool
 	started   time.Time
+	lastChunk time.Time
 }
 
 func (s *Server) dlToKey(host, remote string) string { return host + "\x00" + remote }
@@ -831,13 +818,93 @@ func (s *Server) startDlTo(ac *AgentConn, remote, local string) {
 	if s.dlTo == nil {
 		s.dlTo = map[string]*dlToSession{}
 	}
-	s.dlTo[s.dlToKey(ac.hostname, remote)] = &dlToSession{
+	key := s.dlToKey(ac.hostname, remote)
+	s.dlTo[key] = &dlToSession{
 		localPath: local, part: local + ".part",
 		chunkRaw: chunkRaw, have: map[int]bool{}, started: time.Now(),
+		lastChunk: time.Now(),
 	}
 	s.dlToMu.Unlock()
 	_ = os.Remove(local + ".part")
 	_ = s.sendToAgent(ac, protocol.Message{Type: protocol.TypeFileDlReq, FilePath: remote, FileFrom: 0, FileChunk: chunkRaw})
+	go s.dlToGapLoop(key, remote)
+}
+
+// haveRanges compresses a have-set into "0-7,12-20" form.
+func haveRanges(have map[int]bool, total int) string {
+	var parts []string
+	start := -1
+	for i := 0; i <= total; i++ {
+		if i < total && have[i] {
+			if start < 0 {
+				start = i
+			}
+			continue
+		}
+		if start >= 0 {
+			if i-1 == start {
+				parts = append(parts, strconv.Itoa(start))
+			} else {
+				parts = append(parts, fmt.Sprintf("%d-%d", start, i-1))
+			}
+			start = -1
+		}
+	}
+	return strings.Join(parts, ",")
+}
+
+// dlToGapLoop re-requests missing ranges for a server-side save while it
+// is incomplete and idle: the browser path has gap recovery, dlTo had
+// none (one QoS0 hole stalled it to the 30min fail). Exits when the
+// session completes, fails, or is replaced.
+func (s *Server) dlToGapLoop(key, remote string) {
+	t := time.NewTicker(5 * time.Second)
+	defer t.Stop()
+	reqs := 0
+	for {
+		select {
+		case <-s.closeCh:
+			return
+		case <-t.C:
+		}
+		s.dlToMu.Lock()
+		sess, ok := s.dlTo[key]
+		s.dlToMu.Unlock()
+		if !ok {
+			return
+		}
+		sess.mu.Lock()
+		total, haveN := sess.total, len(sess.have)
+		idle := time.Since(sess.lastChunk)
+		var missing []int
+		if total > 0 && haveN < total && idle >= 5*time.Second && reqs < 8 {
+			for i := 0; i < total; i++ {
+				if !sess.have[i] {
+					missing = append(missing, i)
+				}
+			}
+		}
+		sess.mu.Unlock()
+		if len(missing) == 0 {
+			continue
+		}
+		host := strings.SplitN(key, "\x00", 2)[0]
+		ac := s.findAgentByHostname(host)
+		if ac == nil {
+			continue
+		}
+		rac, err := s.fileRoute(ac, "")
+		if err != nil {
+			continue
+		}
+		sess.mu.Lock()
+		ranges := haveRanges(sess.have, total)
+		chunkRaw := sess.chunkRaw
+		sess.mu.Unlock()
+		reqs++
+		log.Printf("[dlto] gap: %d/%d chunks idle, re-requesting (try %d)", len(missing), total, reqs)
+		_ = s.sendToAgent(rac, protocol.Message{Type: protocol.TypeFileDlReq, FilePath: remote, FileFrom: missing[0], FileChunk: chunkRaw, FileHave: ranges})
+	}
 }
 
 // handleFileDlChunk fans one agent chunk out to the browser AND feeds any
@@ -866,6 +933,8 @@ func (s *Server) dlToFail(id string, sess *dlToSession, remote, why string) {
 }
 
 func (s *Server) feedDlTo(id string, sess *dlToSession, msg protocol.Message) {
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
 	if msg.Error != "" {
 		s.dlToFail(id, sess, msg.FilePath, msg.Error)
 		return
@@ -900,6 +969,7 @@ func (s *Server) feedDlTo(id string, sess *dlToSession, msg protocol.Message) {
 		return
 	}
 	sess.have[msg.FileSeq] = true
+	sess.lastChunk = time.Now()
 	s.broadcastWS(map[string]interface{}{"type": "file-progress", "id": id, "path": msg.FilePath, "local": sess.localPath, "sent": len(sess.have), "total": sess.total, "status": "saving"})
 	if sess.total > 0 && len(sess.have) >= sess.total {
 		if st, err := os.Stat(sess.part); err != nil || st.Size() != sess.size {
@@ -943,6 +1013,59 @@ func (s *Server) feedDlTo(id string, sess *dlToSession, msg protocol.Message) {
 		s.broadcastWS(map[string]interface{}{"type": "file-progress", "id": id, "path": msg.FilePath, "local": sess.localPath, "sent": sess.total, "total": sess.total, "size": sess.size, "status": "done"})
 		s.broadcastWS(map[string]interface{}{"type": "output", "id": id, "data": fmt.Sprintf("Saved %s -> %s (%d bytes, sha ok)", msg.FilePath, sess.localPath, sess.size), "success": true})
 	}
+}
+
+type camFragAsm struct {
+	total int
+	parts map[int]string
+	at    time.Time
+}
+
+// isCamFragLine reports a single-line CAMFRAG camera fragment.
+func isCamFragLine(result string) bool {
+	f := strings.Fields(strings.TrimSpace(result))
+	return len(f) >= 4 && f[0] == "CAMFRAG"
+}
+
+// assembleCamFrag feeds one CAMFRAG <id> <seq>/<total> <b64> line,
+// returning the reassembled data-URL when the set completes. Assemblies
+// older than a minute restart (stale frag ids never poison new shots);
+// totals over 16 are refused.
+func (s *Server) assembleCamFrag(id, line string) (string, bool) {
+	f := strings.Fields(strings.TrimSpace(line))
+	if len(f) < 4 || f[0] != "CAMFRAG" {
+		return "", false
+	}
+	var seq, total int
+	if _, err := fmt.Sscanf(f[2], "%d/%d", &seq, &total); err != nil || total <= 0 || total > 16 || seq < 0 || seq >= total {
+		return "", false
+	}
+	key := id + "\x00" + f[1]
+	s.camFragMu.Lock()
+	defer s.camFragMu.Unlock()
+	if s.camFrags == nil {
+		s.camFrags = map[string]*camFragAsm{}
+	}
+	a, ok := s.camFrags[key]
+	if !ok || a.total != total || time.Since(a.at) > time.Minute {
+		a = &camFragAsm{total: total, parts: map[int]string{}}
+		s.camFrags[key] = a
+	}
+	a.parts[seq] = f[3]
+	a.at = time.Now()
+	if len(a.parts) < total {
+		return "", false
+	}
+	var sb strings.Builder
+	for i := 0; i < total; i++ {
+		p, ok := a.parts[i]
+		if !ok {
+			return "", false
+		}
+		sb.WriteString(p)
+	}
+	delete(s.camFrags, key)
+	return sb.String(), true
 }
 
 // updateProg emits a live progress event for the UI progress readout.
@@ -1301,7 +1424,7 @@ func (s *Server) pushAgentUpdate(ac *AgentConn, bin string) bool {
 	// hello with the new version, on skip, or on holdback.
 	s.setDesiredUpdate(ac.hostname, version.DesktopAgentVersion)
 	// Route bulk update via the best link (MQTT sibling when the selected
-	// record is ntfy/direct-flaky), exactly like file transfers. Have
+	// record is direct-flaky), exactly like file transfers. Have
 	// tracking follows the routed record so resume reports land.
 	rac := s.fileAgentFor(ac)
 	if rac == nil {
@@ -1330,13 +1453,6 @@ func (s *Server) pushAgentUpdate(ac *AgentConn, bin string) bool {
 		pacing = 40 * time.Millisecond
 		haveTimeout = 10 * time.Second
 		lanes = 2
-	case "ntfy":
-		// 2KB raw: ntfy.sh hard-rejects messages over 4096 bytes
-		// (base64 + envelope must fit — do NOT raise this).
-		chunkRaw = 2 * 1024
-		pacing = 500 * time.Millisecond
-		haveTimeout = 30 * time.Second
-		slowWarn = " (ntfy is slow even gzipped — direct/MQTT preferred)"
 	}
 	// Ghost wakes 45s every ~75s: a 4s/10s have-timeout always misses when
 	// the order lands during the 30s dark window. Wait past one full cycle.
@@ -1348,12 +1464,8 @@ func (s *Server) pushAgentUpdate(ac *AgentConn, bin string) bool {
 		slowWarn += " (ghost: waiting through sleep cycle)"
 	}
 	total := (len(payload.data) + chunkRaw - 1) / chunkRaw
-	eta := ""
-	if rac.transport() == "ntfy" && pacing > 0 {
-		eta = fmt.Sprintf(" (~%s over ntfy — direct/MQTT is minutes faster)", (time.Duration(total)*pacing).Round(time.Minute))
-	}
 	log.Printf("[update] pushing agent binary (gzipped %d bytes, %d chunks) to %s via %s%s", len(payload.data), total, ac.hostname, rac.transport(), slowWarn)
-	s.broadcastWS(map[string]interface{}{"type": "output", "id": ac.id, "data": fmt.Sprintf("pushing update v%s (gzipped %d bytes, %d chunks via %s)%s%s", version.DesktopAgentVersion, len(payload.data), total, rac.transport(), slowWarn, eta), "success": true})
+	s.broadcastWS(map[string]interface{}{"type": "output", "id": ac.id, "data": fmt.Sprintf("pushing update v%s (gzipped %d bytes, %d chunks via %s)%s", version.DesktopAgentVersion, len(payload.data), total, rac.transport(), slowWarn), "success": true})
 	s.updateProg(ac, 0, total, "pushing")
 	begin := protocol.Message{Type: protocol.TypeUpdateBegin, UpdateVer: version.DesktopAgentVersion, UpdateSize: int64(len(payload.data)), UpdateSHA: payload.sha, UpdateTotal: total, UpdateGzip: true, UpdateChunk: chunkRaw}
 	// Multi-round converge: QoS0 relays drop packets, so one pass rarely
@@ -1367,9 +1479,9 @@ func (s *Server) pushAgentUpdate(ac *AgentConn, bin string) bool {
 	for round := 1; round <= maxRounds; round++ {
 		timeout := haveTimeout
 		if round > 1 && timeout < 6*time.Second {
-			// Fast transports re-check quickly; slow ones (ntfy 30s,
-			// ghost 80s) keep their window or every later round times
-			// out and resends-all forever.
+			// Fast transports re-check quickly; ghost (80s) keeps its
+			// window or every later round times out and resends-all
+			// forever.
 			timeout = 6 * time.Second
 		}
 		beginAt := time.Now()
@@ -1487,7 +1599,7 @@ func (s *Server) pushAgentUpdateAll(bin string) (pushed, skipped, offline, heldb
 	for id, a := range s.agents {
 		online := true
 		if strings.HasPrefix(id, "agent-ntfy-") || strings.HasPrefix(id, "agent-mqtt-") {
-			online = time.Since(a.seen()) <= ntfyStaleAfter
+			online = time.Since(a.seen()) <= relayStaleAfter
 		}
 		if !online {
 			offline++
@@ -1510,18 +1622,12 @@ func (s *Server) pushAgentUpdateAll(bin string) (pushed, skipped, offline, heldb
 	}
 	s.broadcastWS(map[string]interface{}{"type": "output", "data": fmt.Sprintf("update-all: pushing %d agent(s) (%d up to date, %d offline, %d held back skipped)", len(targets), skipped, offline, heldback), "success": true})
 	// Fleet fan-out: direct/MQTT pushes run up to 3 at a time (independent
-	// agents, independent topics); ntfy stays strictly serial with a gap
-	// because that bus is rate-limited.
+	// agents, independent topics).
 	sem := make(chan struct{}, 3)
 	var wg sync.WaitGroup
 	for _, id := range targets {
 		ac := s.getAgentByID(id)
 		if ac == nil {
-			continue
-		}
-		if ac.transport() == "ntfy" {
-			s.pushAgentUpdate(ac, bin)
-			time.Sleep(800 * time.Millisecond)
 			continue
 		}
 		wg.Add(1)
@@ -2167,6 +2273,36 @@ func (s *Server) schedLoop() {
 	}
 }
 
+// verOlderThan reports whether v is a dotted version strictly older than
+// min. Empty/unparseable versions return false (unknown, not required).
+func verOlderThan(v, min string) bool {
+	parse := func(s string) ([]int, bool) {
+		var parts []int
+		for _, p := range strings.Split(strings.TrimSpace(s), ".") {
+			n, err := strconv.Atoi(p)
+			if err != nil || n < 0 {
+				return nil, false
+			}
+			parts = append(parts, n)
+		}
+		if len(parts) == 0 {
+			return nil, false
+		}
+		return parts, true
+	}
+	a, ok1 := parse(v)
+	b, ok2 := parse(min)
+	if !ok1 || !ok2 {
+		return false
+	}
+	for i := 0; i < len(a) && i < len(b); i++ {
+		if a[i] != b[i] {
+			return a[i] < b[i]
+		}
+	}
+	return len(a) < len(b)
+}
+
 // Agents returns a snapshot for UI/API.
 func (s *Server) Agents() []map[string]interface{} {
 	s.agentsMu.RLock()
@@ -2185,13 +2321,16 @@ func (s *Server) Agents() []map[string]interface{} {
 		if strings.HasPrefix(a.id, "agent-ntfy-") || strings.HasPrefix(a.id, "agent-mqtt-") {
 			ago := time.Since(a.seen())
 			seenAgo = int64(ago.Seconds())
-			online = ago <= ntfyStaleAfter
+			online = ago <= relayStaleAfter
 		} else if a.conn == nil {
 			ago := time.Since(a.seen())
 			seenAgo = int64(ago.Seconds())
 			online = false
 		}
 		outdated := a.version != "" && a.version != version.DesktopAgentVersion
+		// v1.45 removed ntfy and changed relay behavior: agents older
+		// than 1.45.0 must update (their ntfy path is dead code).
+		updateRequired := verOlderThan(a.version, "1.45.0")
 		prot := a.prot
 		rb, rt := a.rollbackBad, a.rollbackTo
 		if rb == "" {
@@ -2207,6 +2346,7 @@ func (s *Server) Agents() []map[string]interface{} {
 		out = append(out, map[string]interface{}{
 			"id": a.id, "hostname": a.hostname, "user": a.user,
 			"version": a.version, "outdated": outdated,
+			"updateRequired": updateRequired,
 			"rollbackBad": rb, "rollbackTo": rt,
 			"untrusted": a.untrusted, "prot": prot, "group": grp, "mode": a.mode,
 			"connected": online, "seenAgoSec": seenAgo,
@@ -2311,35 +2451,78 @@ func (s *Server) handleAudioChunk(topic string, env relay.Envelope) {
 	if err := json.Unmarshal(payload, &chunk); err != nil {
 		return
 	}
-	// Lockstep guard: keyframes and sequence gaps both reset the
-	// predictor, bounding any divergence window. Gaps are counted.
-	if noteAudioSeq(host, chunk.Seq, chunk.K) {
-		resetAudioDecoder(host)
-	}
 	wire, err := base64.StdEncoding.DecodeString(chunk.Data)
 	if err != nil || len(wire) == 0 {
 		return
 	}
-	raw := decodeAudioChunk(host, chunk.V, wire)
+	s.ingestAudioChunk(host, chunk.Seq, chunk.K, chunk.V, wire)
+}
+
+// ingestAudioChunk is the shared tail for v1 JSON and v2 binary audio:
+// lockstep guard, decode, player routing, write.
+func (s *Server) ingestAudioChunk(host string, seq int, key bool, v int, wire []byte) {
+	// Lockstep guard: keyframes and sequence gaps both reset the
+	// predictor, bounding any divergence window. Gaps are counted.
+	if noteAudioSeq(host, seq, key) {
+		resetAudioDecoder(host)
+	}
+	raw := decodeAudioChunk(host, v, wire)
 	if len(raw) == 0 {
 		return
 	}
 	dev := ""
 	gain := 1.0
 	clarity := true
+	m := cachedLocalAudioMap()
 	if ac := s.findAgentByHostname(host); ac != nil {
-		m := loadLocalAudioMap()
 		dev = choiceForAgent(m, ac.id)
 		gain = float64(volumeForAgent(m, ac.id)) / 100
 		clarity = clarityForAgent(m, ac.id)
 	} else {
-		m := loadLocalAudioMap()
 		dev = choiceForAgent(m, "")
 		gain = float64(volumeForAgent(m, "")) / 100
 		clarity = clarityForAgent(m, "")
 	}
-	ensureAudioPlayer(host, dev, gain, clarity)
+	if played, err := ensureAudioPlayer(host, dev, gain, clarity); err != nil {
+		log.Printf("[audio] %s: player error: %v", host, err)
+		s.broadcastWS(map[string]interface{}{"type": "output", "id": host, "data": "audio player: " + err.Error(), "success": false})
+	} else if played != "" {
+		s.broadcastWS(map[string]interface{}{"type": "output", "id": host, "data": "audio playing on [" + played + "]", "success": true})
+	}
 	writeAudioChunk(raw)
+}
+
+// handleAudioBin ingests binary v2 media frames from audiobin/<host>:
+// ver(1) + frames of seq u32LE(4) + flags(1) + ADPCM(276), batched 1-2.
+// ver 0x03 = sealed blob (nonce||ciphertext) opened with the host key.
+// Legacy v1 JSON keeps flowing through audio/+ untouched.
+func (s *Server) handleAudioBin(topic string, body []byte) {
+	s.mqttLastMsg.Store(time.Now().UnixNano())
+	host := topic[strings.LastIndex(topic, "/")+1:]
+	if host == "" || len(body) < 1 {
+		return
+	}
+	if body[0] == 0x03 {
+		key, ok := s.e2eGet(host)
+		if !ok {
+			return
+		}
+		plain, err := relay.OpenRaw(key, body[1:])
+		if err != nil {
+			return
+		}
+		body = plain
+	}
+	const frameLen = 282 // 1 ver + 4 seq + 1 flags + 276 ADPCM
+	for len(body) >= frameLen {
+		f := body[:frameLen]
+		if f[0] != 0x02 {
+			return
+		}
+		seq := int(f[1]) | int(f[2])<<8 | int(f[3])<<16 | int(f[4])<<24
+		s.ingestAudioChunk(host, seq, f[5]&1 == 1, 1, f[6:frameLen])
+		body = body[frameLen:]
+	}
 }
 
 // disconnectAgent ends the session with one agent WITHOUT touching the
@@ -2424,7 +2607,8 @@ func (s *Server) broadcastAudiolistIfJSON(result, id string) bool {
 	return true
 }
 
-// sendToAgent routes via MQTT/ntfy (directed) for virtual agents, TLS otherwise.
+// sendToAgent routes via MQTT (directed) for virtual agents, TLS otherwise.
+// Ntfy was removed in v1.45: any lingering agent-ntfy-* record is dead.
 func (s *Server) sendToAgent(ac *AgentConn, msg protocol.Message) error {
 	// Unique command id so agents drop duplicates when two controllers
 	// deliver the same command (one fleet, several houses).
@@ -2432,12 +2616,7 @@ func (s *Server) sendToAgent(ac *AgentConn, msg protocol.Message) error {
 		msg.CmdID = fmt.Sprintf("c%d-%d", s.idCounter.Add(1), time.Now().UnixNano())
 	}
 	if strings.HasPrefix(ac.id, "agent-ntfy-") {
-		name := ac.ntfyName()
-		s.trackCmd(msg, ac.id) // relay loss is real: retry if no output
-		if payload, enc := s.e2eSealMsg(name, msg); enc {
-			return relay.PublishEnvelope(relay.Envelope{From: "controller", To: name, Payload: payload, Enc: true, Time: time.Now().UnixMilli()})
-		}
-		return relay.PublishTo("controller", name, msg)
+		return fmt.Errorf("ntfy transport removed in v1.45 (agent %s must update to direct/MQTT)", ac.hostname)
 	}
 	if strings.HasPrefix(ac.id, "agent-mqtt-") {
 		s.mqttMu.Lock()
@@ -2458,22 +2637,32 @@ func (s *Server) sendToAgent(ac *AgentConn, msg protocol.Message) error {
 		// agent picked the other broker. Secondary goes async: publish
 		// blocks up to 10s on a blackholed bus, and serial would double
 		// worst-case command latency.
+		//
+		// Small interactive orders ride the 2s fast publish (a wedged hop
+		// fails over in 2s, not 10s); bulk chunks keep 10s.
+		pub := bus.PublishCmd
+		switch msg.Type {
+		case protocol.TypeScreenshotRequest, protocol.TypePing,
+			protocol.TypeCommand, protocol.TypeFileDlReq,
+			protocol.TypeUpdateBegin, protocol.TypeFileUlBegin:
+			pub = bus.PublishCmdFast
+		}
 		s.trackCmd(msg, ac.id) // relay loss is real: retry if no output
-		// Update chunks are idempotent (agent reassembles by seq) but huge:
-		// dual-bus delivery doubles a multi-MB push for zero gain, so
-		// chunks ride the primary bus only. Begins stay dual (tiny,
-		// must not be missed).
-		if msg.Type != protocol.TypeUpdateChunk && bus2 != nil {
+		// Bulk chunks are idempotent (agent reassembles by seq) but huge:
+		// dual-bus delivery doubles multi-MB pushes for zero gain, so
+		// update/file chunks ride the primary bus only. Begins stay dual
+		// (tiny, must not be missed).
+		if msg.Type != protocol.TypeUpdateChunk && msg.Type != protocol.TypeFileUlChunk && bus2 != nil {
 			go bus2.PublishCmd(host, env)
 		}
 		if bus != nil {
-			return bus.PublishCmd(host, env)
+			return pub(host, env)
 		}
 		return nil
 	}
 	if err := ac.send(msg); err != nil {
-		// Direct link died: fail over to the same host's relay record
-		// (mqtt preferred, ntfy last) instead of dropping the command.
+	// Direct link died: fail over to the same host's MQTT relay record
+	// instead of dropping the command.
 		// CmdID dedupe on the agent makes double delivery harmless.
 		if sib := s.siblingRelay(ac); sib != nil {
 			log.Printf("[failover] %s direct failed (%v), retrying via %s", ac.hostname, err, sib.id)
@@ -2484,15 +2673,14 @@ func (s *Server) sendToAgent(ac *AgentConn, msg protocol.Message) error {
 	return nil
 }
 
-// siblingRelay finds another record for the same hostname on a relay
-// transport (mqtt preferred over ntfy), excluding the given record.
+// siblingRelay finds another record for the same hostname on the MQTT
+// relay, excluding the given record.
 func (s *Server) siblingRelay(ac *AgentConn) *AgentConn {
 	if ac == nil || ac.hostname == "" {
 		return nil
 	}
 	s.agentsMu.RLock()
 	defer s.agentsMu.RUnlock()
-	var ntfy *AgentConn
 	for _, v := range s.agents {
 		if v == ac || v.hostname != ac.hostname {
 			continue
@@ -2500,11 +2688,8 @@ func (s *Server) siblingRelay(ac *AgentConn) *AgentConn {
 		if strings.HasPrefix(v.id, "agent-mqtt-") {
 			return v
 		}
-		if strings.HasPrefix(v.id, "agent-ntfy-") && ntfy == nil {
-			ntfy = v
-		}
 	}
-	return ntfy
+	return nil
 }
 
 func mustJSON(v interface{}) json.RawMessage {
@@ -2570,6 +2755,13 @@ func (s *Server) handleAgent(conn net.Conn, id string) {
 			s.broadcastWS(map[string]interface{}{"type": "mouse", "id": id, "x": msg.X, "y": msg.Y, "buttons": msg.Buttons})
 		case protocol.TypeOutput:
 			s.ackCmd(msg.CmdID)
+			if isCamFragLine(msg.Result) {
+				if url, ok := s.assembleCamFrag(id, msg.Result); ok {
+					msg.Result = url
+				} else {
+					continue // more frags coming; already acked
+				}
+			}
 			s.noteUpdateHave(id, msg.Result)
 			s.broadcastWS(map[string]interface{}{"type": "output", "id": id, "data": msg.Result, "error": msg.Error, "success": msg.Error == ""})
 			if msg.Error == "" {
@@ -2617,6 +2809,17 @@ func (s *Server) handleAgent(conn net.Conn, id string) {
 	s.broadcastWS(map[string]interface{}{"type": "output", "data": fmt.Sprintf("Agent %s disconnected", id), "success": false})
 }
 
+// screenJob is one frame awaiting disk archival.
+type screenJob struct {
+	id  string
+	msg protocol.Message
+}
+
+// handleScreen validates a frame and queues it for background disk
+// archival. Decoding + mkdir + write + readdir on the hot path cost
+// 5-15ms per frame at stream rates; the UI already got its copy via the
+// broadcast at the call site, so the archive follows asynchronously. A
+// full queue drops the save (best-effort archive, never blocks live view).
 func (s *Server) handleScreen(msg protocol.Message, id string) {
 	if msg.Data == "" {
 		return
@@ -2625,6 +2828,25 @@ func (s *Server) handleScreen(msg protocol.Message, id string) {
 		fmt.Printf("\n[screen:%s] payload too large (%d chars), dropped\n> ", id, len(msg.Data))
 		return
 	}
+	select {
+	case s.screenSave <- screenJob{id: id, msg: msg}:
+	default:
+	}
+}
+
+// screenSaveLoop is the single background disk writer for frames.
+func (s *Server) screenSaveLoop() {
+	for {
+		select {
+		case <-s.closeCh:
+			return
+		case job := <-s.screenSave:
+			s.saveScreenFrame(job.msg, job.id)
+		}
+	}
+}
+
+func (s *Server) saveScreenFrame(msg protocol.Message, id string) {
 	data, err := base64.StdEncoding.DecodeString(msg.Data)
 	if err != nil {
 		fmt.Printf("\n[screen:%s] base64 decode error: %v\n> ", id, err)
@@ -2653,8 +2875,8 @@ func (s *Server) handleScreen(msg protocol.Message, id string) {
 		return
 	}
 	// Throttle directory rotation: a readdir+stat of the kept files on
-	// EVERY frame is pure hot-path waste during a live stream. A missed
-	// rotate here only delays cleanup; the next one catches up.
+	// EVERY frame is pure waste during a live stream. A missed rotate
+	// only delays cleanup; the next one catches up.
 	if now := time.Now().UnixNano(); now-s.lastScreenRotate.Swap(now) > 30e9 {
 		s.rotateScreens()
 	}
@@ -2688,127 +2910,6 @@ func (s *Server) rotateScreens() {
 	sort.Slice(files, func(i, j int) bool { return files[i].mod.Before(files[j].mod) })
 	for _, f := range files[:len(files)-maxScreensKept] {
 		_ = os.Remove(filepath.Join(s.screenshotDir, f.name))
-	}
-}
-
-// ntfyLoop long-polls for agent messages over HTTPS (no port forward needed).
-// relay.Poll blocks up to ~60s when idle: one hanging GET, not a hot loop.
-func (s *Server) ntfyLoop() {
-	for {
-		select {
-		case <-s.closeCh:
-			return
-		default:
-		}
-		envs, err := relay.Poll("controller", "")
-		if err != nil {
-			log.Printf("[ntfy] poll: %v", err)
-			select {
-			case <-s.closeCh:
-				return
-			case <-time.After(2 * time.Second):
-			}
-			continue
-		}
-		for _, env := range envs {
-			if !strings.HasPrefix(env.From, "agent:") {
-				continue
-			}
-			name := strings.TrimPrefix(env.From, "agent:")
-			payload := env.Payload
-			if env.Enc {
-				plain, ok := s.e2eDecryptEnv(name, env)
-				if !ok {
-					continue
-				}
-				payload = plain
-			}
-			var msg protocol.Message
-			if err := json.Unmarshal(payload, &msg); err != nil {
-				continue
-			}
-			// Key exchange precedes registration (no agent entry needed).
-			if msg.Type == protocol.TypeKeyExchange {
-				s.e2eKeyxchg(name, msg.Data)
-				continue
-			}
-			hostname := msg.Hostname
-			if hostname == "" {
-				hostname = name
-			}
-			inst := msg.Instance
-			if inst == "" {
-				inst = name // old agents without instance ids
-			}
-		id := "agent-ntfy-" + inst
-		allow, untrusted := s.checkAuth(msg, id)
-		if !allow {
-			continue
-		}
-		s.agentsMu.RLock()
-		ac, exists := s.agents[id]
-		s.agentsMu.RUnlock()
-		// Stash version from hello ("" = old agent).
-			if msg.Version != "" {
-				s.agentsMu.Lock()
-				if ex, ok := s.agents[id]; ok {
-					ex.version = msg.Version
-				}
-				s.agentsMu.Unlock()
-			}
-		if !exists && msg.Type == protocol.TypeConnect {
-			ac = &AgentConn{hostname: hostname, user: msg.User, id: id, version: msg.Version, untrusted: untrusted, mode: msg.Mode}
-			s.setAgent(ac)
-			fmt.Printf("\n[+] Ntfy agent connected: %s (%s) v%s\n", hostname, id, msg.Version)
-			_ = relay.PublishTo("controller", name, protocol.Message{Type: protocol.TypeConnected, ID: id, E2E: true, RollbackAck: msg.RollbackBad != ""})
-			s.broadcastWS(map[string]interface{}{"type": "output", "data": fmt.Sprintf("Ntfy agent %s connected", hostname), "success": true})
-			s.noteHello(id, hostname, msg.Version, msg.RollbackBad, msg.RollbackTo, msg.Prot, msg.ProtDetail, msg.Mode)
-			continue
-		}
-		if !exists {
-			continue
-		}
-		ac.touch()
-		switch msg.Type {
-		case protocol.TypeConnect:
-			if msg.Version != "" {
-				ac.version = msg.Version
-			}
-			ac.untrusted = untrusted
-			if msg.Mode != "" {
-				ac.mode = msg.Mode
-			}
-			s.noteHello(id, hostname, msg.Version, msg.RollbackBad, msg.RollbackTo, msg.Prot, msg.ProtDetail, msg.Mode)
-			_ = relay.PublishTo("controller", name, protocol.Message{Type: protocol.TypeConnected, ID: id, E2E: true, RollbackAck: msg.RollbackBad != ""})
-			case protocol.TypeOutput:
-					s.ackCmd(msg.CmdID)
-					s.noteUpdateHave(id, msg.Result)
-					s.broadcastWS(map[string]interface{}{"type": "output", "id": id, "data": msg.Result, "error": msg.Error, "success": msg.Error == ""})
-					if msg.Error == "" {
-						s.broadcastAudiolistIfJSON(msg.Result, id)
-					}
-					fmt.Printf("\n[ntfy output:%s]\n%s\n> ", name, msg.Result)
-  	case protocol.TypeScreen:
-  		s.broadcastWS(map[string]interface{}{"type": "screen", "id": id, "data": msg.Data, "width": msg.Width, "height": msg.Height, "ox": msg.OX, "oy": msg.OY, "format": msg.Format, "fseq": msg.FSeq})
-  		s.handleScreen(msg, id)
-			case protocol.TypeTile:
-					s.broadcastWS(map[string]interface{}{"type": "tile", "id": id, "data": msg.Data, "width": msg.Width, "height": msg.Height, "ox": msg.OX, "oy": msg.OY, "format": msg.Format, "fseq": msg.FSeq})
-			case protocol.TypeFileDlChunk:
-					s.handleFileDlChunk(id, msg)
-			case protocol.TypeMouse:
-				s.broadcastWS(map[string]interface{}{"type": "mouse", "id": id, "x": msg.X, "y": msg.Y})
-			case protocol.TypePong:
-				ac.pingSentMu.Lock()
-				sent := ac.pingSent
-				ac.pingSentMu.Unlock()
-				if !sent.IsZero() {
-					s.latencyMu.Lock()
-					s.latency[id] = time.Since(sent).Milliseconds()
-					s.latencyMu.Unlock()
-				}
-				s.broadcastWS(map[string]interface{}{"type": "pong", "id": id})
-			}
-		}
 	}
 }
 
@@ -2847,7 +2948,7 @@ func (s *Server) tcpRelayLoop() {
 	}
 }
 
-// sweepLoop evicts relay agents (ntfy/mqtt) unseen for ntfyStaleAfter.
+// sweepLoop heartbeats relay agents (mqtt) unseen for relayStaleAfter.
 func (s *Server) sweepLoop() {
 	t := time.NewTicker(sweepInterval)
 	defer t.Stop()
@@ -2984,19 +3085,25 @@ func (s *Server) mqttLoop() {
 				}
 				continue
 			}
-			if err := nb.Subscribe(func(topic string, env relay.Envelope) {
-				s.mqttLastMsg1.Store(time.Now().UnixNano())
-				s.handleMQTTMsg(topic, env)
-			}); err != nil {
-				log.Printf("[mqtt] subscribe: %v", err)
-				nb.Close()
-				select {
-				case <-s.closeCh:
-					return
-				case <-time.After(5 * time.Second):
-				}
-				continue
+		if err := nb.Subscribe(func(topic string, env relay.Envelope) {
+			s.mqttLastMsg1.Store(time.Now().UnixNano())
+			s.handleMQTTMsg(topic, env)
+		}); err != nil {
+			log.Printf("[mqtt] subscribe: %v", err)
+			nb.Close()
+			select {
+			case <-s.closeCh:
+				return
+			case <-time.After(5 * time.Second):
 			}
+			continue
+		}
+		if err := nb.SubscribeBin(func(topic string, body []byte) {
+			s.mqttLastMsg1.Store(time.Now().UnixNano())
+			s.handleAudioBin(topic, body)
+		}); err != nil {
+			log.Printf("[mqtt] subscribe audiobin: %v", err)
+		}
 		s.mqttMu.Lock()
 		s.mqttBus = nb
 		s.mqttMu.Unlock()
@@ -3015,6 +3122,14 @@ func (s *Server) mqttLoop() {
 				}); err != nil {
 					nb2.Close()
 				} else {
+					// Binary audio is best-effort: a failure here only
+					// loses audiobin on this bus (JSON audio still flows).
+					if err := nb2.SubscribeBin(func(topic string, body []byte) {
+						s.mqttLastMsg2.Store(time.Now().UnixNano())
+						s.handleAudioBin(topic, body)
+					}); err != nil {
+						log.Printf("[mqtt] secondary subscribe audiobin: %v", err)
+					}
 					s.mqttMu.Lock()
 					// Re-check: primary may have rotated while we dialed.
 					if s.mqttBus != nil && s.mqttBus.Broker() != nb2.Broker() {
@@ -3196,6 +3311,13 @@ func (s *Server) handleMQTTMsg(topic string, env relay.Envelope) {
 	switch msg.Type {
 			case protocol.TypeOutput:
 				s.ackCmd(msg.CmdID)
+				if isCamFragLine(msg.Result) {
+					if url, ok := s.assembleCamFrag(id, msg.Result); ok {
+						msg.Result = url
+					} else {
+						return // more frags coming; already acked
+					}
+				}
 				s.noteUpdateHave(id, msg.Result)
 				s.broadcastWS(map[string]interface{}{"type": "output", "id": id, "data": msg.Result, "error": msg.Error, "success": msg.Error == ""})
 				if msg.Error == "" {

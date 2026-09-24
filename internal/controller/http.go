@@ -301,7 +301,7 @@ func (s *Server) startHTTP(addr, dir string) {
 		s.latencyMu.RUnlock()
 		online := true
 		if strings.HasPrefix(ac.id, "agent-ntfy-") || strings.HasPrefix(ac.id, "agent-mqtt-") {
-			online = time.Since(ac.seen()) <= ntfyStaleAfter
+			online = time.Since(ac.seen()) <= relayStaleAfter
 		}
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"connected": true, "id": ac.id, "hostname": ac.hostname, "user": ac.user,
@@ -918,10 +918,11 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 			if f, ok := msg["fromSeq"].(float64); ok && f > 0 {
 				from = int(f)
 			}
+			have, _ := msg["have"].(string)
 			if t == "file-dl" {
 				s.broadcastWS(map[string]interface{}{"type": "output", "id": ac.id, "data": fmt.Sprintf("files via %s → %s", rac.transport(), ac.hostname), "success": true})
 			}
-			_ = s.sendToAgent(rac, protocol.Message{Type: protocol.TypeFileDlReq, FilePath: path, FileFrom: from, FileChunk: fileChunkRaw(rac), FileThumb: thumb})
+			_ = s.sendToAgent(rac, protocol.Message{Type: protocol.TypeFileDlReq, FilePath: path, FileFrom: from, FileChunk: fileChunkRaw(rac), FileThumb: thumb, FileHave: have})
 		case "file-ul-begin":
 			path, _ := msg["path"].(string)
 			sha, _ := msg["sha"].(string)
@@ -960,7 +961,16 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 			if f, ok := msg["seq"].(float64); ok {
 				seq = int(f)
 			}
-			_ = s.sendWithRetry(rac, protocol.Message{Type: protocol.TypeFileUlChunk, FileSeq: seq, Data: data, FileChunk: fileChunkRaw(rac)}, fmt.Sprintf("file-chunk %d", seq))
+			// Upload chunks are order-free (agent WriteAt by seq), so fan
+			// them out instead of serializing the whole browser lane
+			// behind one blocking publish + its 1s retry sleep. The
+			// semaphore bounds in-flight publishes (backpressure).
+			chunk := protocol.Message{Type: protocol.TypeFileUlChunk, FileSeq: seq, Data: data, FileChunk: fileChunkRaw(rac)}
+			s.ulSem <- struct{}{}
+			go func() {
+				defer func() { <-s.ulSem }()
+				_ = s.sendWithRetry(rac, chunk, fmt.Sprintf("file-chunk %d", seq))
+			}()
 		case "file-dl-to":
 			remote, _ := msg["remotePath"].(string)
 			local, _ := msg["localPath"].(string)
