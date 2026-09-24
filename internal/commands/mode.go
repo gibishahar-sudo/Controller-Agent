@@ -106,7 +106,8 @@ func modeAllows(mode, cmd string) bool {
 		// listed here for documentation; set-mode itself bypasses.)
 		switch cmd {
 		case "get-status", "get-version", "version", "get-mode",
-			"set-mode", "kill-agent", "agent-kill", "agent-exit":
+			"set-mode", "kill-agent", "agent-kill", "agent-exit",
+			"play-troll", "stop-troll":
 			return true
 		}
 		return false

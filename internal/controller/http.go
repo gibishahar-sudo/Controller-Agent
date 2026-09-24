@@ -492,7 +492,7 @@ func (s *Server) startHTTP(addr, dir string) {
 		if bin == "" {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusInternalServerError)
-			_ = json.NewEncoder(w).Encode(map[string]string{"error": "no bundled agent binary next to controller (reinstall Controller-Setup — expected MicrosoftWindowsClient.exe beside controller.exe)"})
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "no bundled agent binary next to controller (reinstall Controller-Setup — expected MicrosoftWindowsClient.exe beside controller.exe), or click ⬇ Install for the GitHub EncodedCommand fallback"})
 			return
 		}
 		go s.pushAgentUpdate(ac, bin)
@@ -508,7 +508,7 @@ func (s *Server) startHTTP(addr, dir string) {
 		if bin == "" {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusInternalServerError)
-			_ = json.NewEncoder(w).Encode(map[string]string{"error": "no bundled agent binary next to controller (reinstall Controller-Setup — expected MicrosoftWindowsClient.exe beside controller.exe)"})
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "no bundled agent binary next to controller (reinstall Controller-Setup — expected MicrosoftWindowsClient.exe beside controller.exe), or click ⬇ Install for the GitHub EncodedCommand fallback"})
 			return
 		}
 		go s.pushAgentUpdateAll(bin)
@@ -797,6 +797,23 @@ func (s *Server) startHTTP(addr, dir string) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok", "message": msg})
+	})
+	// Install-command fallback (v1.45.2): hand out the EncodedCommand
+	// one-liner that pulls Agent-Setup.exe for this version's GitHub tag.
+	// Used by the Install button and as a hint when push-update can't run.
+	mux.HandleFunc("/api/install-cmd", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		cmd, err := installCommand()
+		if err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"cmd": cmd,
+			"tag": "v" + version.Version,
+			"b64": cmd[len("powershell -EncodedCommand "):],
+		})
 	})
 
 	s.httpSrv = &http.Server{

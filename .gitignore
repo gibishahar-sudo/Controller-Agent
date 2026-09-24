@@ -14,3 +14,5 @@ macros.json
 scheduler.json
 desired_modes.json
 desired_updates.json
+gh_token.txt
+github_token.txt

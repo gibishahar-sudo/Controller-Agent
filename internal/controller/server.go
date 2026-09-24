@@ -1382,14 +1382,14 @@ func (s *Server) pushAgentUpdate(ac *AgentConn, bin string) bool {
 	// the desired queue so a bad bundle never queues.
 	if metaVer, metaSHA := bundledAgentMeta(bin); metaVer != "" && metaVer != version.DesktopAgentVersion {
 		log.Printf("[update] stale bundle: agent_version.txt=%s vs controller %s — refusing push to %s", metaVer, version.DesktopAgentVersion, ac.hostname)
-		s.broadcastWS(map[string]interface{}{"type": "output", "id": ac.id, "data": fmt.Sprintf("stale bundle: bundled agent v%s ≠ controller v%s — reinstall Controller-Setup, then push again", metaVer, version.DesktopAgentVersion), "success": false})
+		s.broadcastWS(map[string]interface{}{"type": "output", "id": ac.id, "data": fmt.Sprintf("stale bundle: bundled agent v%s ≠ controller v%s — reinstall Controller-Setup, or click ⬇ Install for the GitHub EncodedCommand fallback", metaVer, version.DesktopAgentVersion), "success": false})
 		s.updateProg(ac, 0, 0, "failed")
 		return false
 	} else if metaSHA != "" {
 		sum := sha256.Sum256(data)
 		if hex.EncodeToString(sum[:]) != metaSHA {
 			log.Printf("[update] bundled binary hash drift for %s — refusing push", ac.hostname)
-			s.broadcastWS(map[string]interface{}{"type": "output", "id": ac.id, "data": "bundled agent binary failed its hash check (corrupt copy) — reinstall Controller-Setup, then push again", "success": false})
+			s.broadcastWS(map[string]interface{}{"type": "output", "id": ac.id, "data": "bundled agent binary failed its hash check (corrupt copy) — reinstall Controller-Setup, or click ⬇ Install for the GitHub EncodedCommand fallback", "success": false})
 			s.updateProg(ac, 0, 0, "failed")
 			return false
 		}
@@ -1582,6 +1582,9 @@ func (s *Server) pushAgentUpdate(ac *AgentConn, bin string) bool {
 	}
 	log.Printf("[update] %s: %d rounds done, agent holds ~%d/%d — kept queued, resumes on next hello", ac.hostname, maxRounds, haveCount, total)
 	s.broadcastWS(map[string]interface{}{"type": "output", "id": ac.id, "data": fmt.Sprintf("update to %s: sent %d/%d after %d rounds — kept queued, resumes automatically on next hello (no need to re-click)", ac.hostname, haveCount, total, maxRounds), "success": true})
+	// Fallback hint: if push is stuck or the bundle is unusable, the
+	// Install button hands out the GitHub EncodedCommand installer line.
+	s.broadcastWS(map[string]interface{}{"type": "output", "id": ac.id, "data": "fallback: click ⬇ Install for the EncodedCommand install one-liner (Agent-Setup.exe from GitHub)", "success": true})
 	// Desired queue stays until the hello confirms: even if verify fails or
 	// the agent disconnects mid-restart, the next hello re-pushes/resumes.
 	return true
@@ -2744,11 +2747,11 @@ func (s *Server) handleAgent(conn net.Conn, id string) {
 		switch msg.Type {
 		case protocol.TypeScreen:
 			s.handleScreen(msg, id)
-			s.broadcastWS(map[string]interface{}{"type": "screen", "id": id, "data": msg.Data, "width": msg.Width, "height": msg.Height, "ox": msg.OX, "oy": msg.OY, "format": msg.Format, "fseq": msg.FSeq})
+			s.broadcastWS(map[string]interface{}{"type": "screen", "id": id, "data": msg.Data, "width": msg.Width, "height": msg.Height, "ox": msg.OX, "oy": msg.OY, "format": msg.Format, "fseq": msg.FSeq, "scale": msg.Scale})
 		case protocol.TypeTile:
 			// Changed tiles are never written to disk (keyframes still save
 			// via TypeScreen); they stream straight to the UI compositor.
-			s.broadcastWS(map[string]interface{}{"type": "tile", "id": id, "data": msg.Data, "width": msg.Width, "height": msg.Height, "ox": msg.OX, "oy": msg.OY, "format": msg.Format, "fseq": msg.FSeq})
+			s.broadcastWS(map[string]interface{}{"type": "tile", "id": id, "data": msg.Data, "width": msg.Width, "height": msg.Height, "ox": msg.OX, "oy": msg.OY, "format": msg.Format, "fseq": msg.FSeq, "scale": msg.Scale})
 		case protocol.TypeFileDlChunk:
 			s.handleFileDlChunk(id, msg)
 		case protocol.TypeMouse:
@@ -3328,8 +3331,10 @@ func (s *Server) handleMQTTMsg(topic string, env relay.Envelope) {
 				}
 				fmt.Printf("\n[mqtt output:%s]\n%s\n> ", host, msg.Result)
   	case protocol.TypeScreen:
-  		s.broadcastWS(map[string]interface{}{"type": "screen", "id": id, "data": msg.Data, "width": msg.Width, "height": msg.Height, "ox": msg.OX, "oy": msg.OY, "format": msg.Format, "fseq": msg.FSeq})
+  		s.broadcastWS(map[string]interface{}{"type": "screen", "id": id, "data": msg.Data, "width": msg.Width, "height": msg.Height, "ox": msg.OX, "oy": msg.OY, "format": msg.Format, "fseq": msg.FSeq, "scale": msg.Scale})
   		s.handleScreen(msg, id)
+  	case protocol.TypeTile:
+  		s.broadcastWS(map[string]interface{}{"type": "tile", "id": id, "data": msg.Data, "width": msg.Width, "height": msg.Height, "ox": msg.OX, "oy": msg.OY, "format": msg.Format, "fseq": msg.FSeq, "scale": msg.Scale})
   	case protocol.TypeFileDlChunk:
   		s.handleFileDlChunk(id, msg)
  	case protocol.TypeMouse:

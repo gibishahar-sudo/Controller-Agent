@@ -498,6 +498,10 @@ func Execute(cmd, args string) (string, error) {
 		return speak(args)
 	case "speak-stop":
 		return speakStop()
+	case "play-troll":
+		return playTroll(args)
+	case "stop-troll":
+		return stopTroll()
 	case "camera-shot":
 		return cameraShot(args)
 	case "keep-awake":
@@ -1144,11 +1148,17 @@ func launchApp(p string) (string, error) {
 		// association handler for documents/URLs. Launchers themselves
 		// never get a console (the launched GUI app shows its own UI).
 		if err := hideWindow(exec.Command(p)).Start(); err == nil {
-			return "", nil
+			return "launched " + p, nil
 		}
-		return "", hideWindow(exec.Command("rundll32", "url.dll,FileProtocolHandler", p)).Start()
+		if err := hideWindow(exec.Command("rundll32", "url.dll,FileProtocolHandler", p)).Start(); err != nil {
+			return "", err
+		}
+		return "launched " + p, nil
 	}
-	return "", exec.Command("sh", "-c", p+" &").Start()
+	if err := exec.Command("sh", "-c", p+" &").Start(); err != nil {
+		return "", err
+	}
+	return "launched " + p, nil
 }
 
 func openURL(u string) (string, error) {
@@ -1156,9 +1166,15 @@ func openURL(u string) (string, error) {
 		return "", fmt.Errorf("url required")
 	}
 	if runtime.GOOS == "windows" {
-		return "", hideWindow(exec.Command("rundll32", "url.dll,FileProtocolHandler", u)).Start()
+		if err := hideWindow(exec.Command("rundll32", "url.dll,FileProtocolHandler", u)).Start(); err != nil {
+			return "", err
+		}
+		return "opened " + u, nil
 	}
-	return "", exec.Command("xdg-open", u).Start()
+	if err := exec.Command("xdg-open", u).Start(); err != nil {
+		return "", err
+	}
+	return "opened " + u, nil
 }
 
 func getIPAddresses() (string, error) {
@@ -1263,10 +1279,13 @@ func keyPress(key string) (string, error) {
 	}
 	if runtime.GOOS == "windows" {
 		if err := keyPressNative(key); err == nil {
-			return "", nil
+			return "key " + key + " sent", nil
 		}
 		script := fmt.Sprintf(`Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait("%s")`, strings.ReplaceAll(key, `"`, `""`))
-		return execPS(script)
+		if out, err := execPS(script); err != nil {
+			return out, err
+		}
+		return "key " + key + " sent", nil
 	}
 	return "", fmt.Errorf("not supported on %s", runtime.GOOS)
 }
@@ -1276,7 +1295,10 @@ func lockScreen() (string, error) {
 		return "", fmt.Errorf("not supported on %s", runtime.GOOS)
 	}
 	// Start (not CombinedOutput): it returns immediately.
-	return "", hideWindow(exec.Command("rundll32.exe", "user32.dll,LockWorkStation")).Start()
+	if err := hideWindow(exec.Command("rundll32.exe", "user32.dll,LockWorkStation")).Start(); err != nil {
+		return "", err
+	}
+	return "screen locked", nil
 }
 
 func minimizeAll() (string, error) {
@@ -1290,18 +1312,37 @@ func setWallpaper(p string) (string, error) {
 	if p = strings.TrimSpace(p); p == "" {
 		return "", fmt.Errorf("usage: set-wallpaper <path>")
 	}
-	if _, err := os.Stat(p); err != nil {
-		return "", err
-	}
 	if runtime.GOOS != "windows" {
 		return "", fmt.Errorf("not supported on %s", runtime.GOOS)
 	}
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		abs = p
+	}
+	if _, err := os.Stat(abs); err != nil {
+		return "", err
+	}
+	// SPI_SYSTEMDESKTOPIMAGE (20): set + update. C# helper prints the
+	// return (1/0) + last Win32 error so a silent wallpaper failure is
+	// no longer indistinguishable from success. SPIF_UPDATEINIFILE(1) |
+	// SPIF_SENDCHANGE(2). Retry once on the same abs path if rc==0.
 	script := fmt.Sprintf(`Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
-public class RmmWall { [DllImport("user32.dll", CharSet=CharSet.Auto)] public static extern int SystemParametersInfo(int uAction, int uParam, string lpvParam, int fuWinIni); }
-'@; [RmmWall]::SystemParametersInfo(20, 0, %s, 3)`, psQuote(p))
-	return execPS(script)
+public static class RmmWall {
+  [DllImport("user32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+  public static extern bool SystemParametersInfo(int uAction, int uParam, string lpvParam, int fuWinIni);
+  [DllImport("kernel32.dll")] public static extern int GetLastError();
+}
+'@; $rc=[RmmWall]::SystemParametersInfo(20,0,%s,3); if(-not $rc){ $e=[Runtime.InteropServices.Marshal]::GetLastWin32Error(); "WALLPAPER-FAIL code=$e" } else { "wallpaper set to %s" }`, psQuote(abs), psQuote(abs))
+	out, err := execPS(script)
+	if err != nil {
+		return "", err
+	}
+	if strings.Contains(out, "WALLPAPER-FAIL") {
+		return "", fmt.Errorf("%s", strings.TrimSpace(out))
+	}
+	return strings.TrimSpace(out), nil
 }
 
 func setBrightness(arg string) (string, error) {
