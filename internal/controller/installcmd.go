@@ -119,12 +119,12 @@ func buildInstallPS(assetID int64) string {
 		"$o=($env:TEMP+'\\A.exe');" +
 		"iwr -Headers ($h+@{Accept='application/octet-stream'}) -Uri $u -OutFile $o;" +
 		"$a=[bool]((whoami /groups)-match'S-1-16-12288');" +
-		"if($a){$c=Start-Process $o '--silent' -Wait -PassThru}" +
-		"else{$c=Start-Process $o '--silent' -Verb RunAs -Wait -PassThru};" +
+		"if($a){$c=Start-Process $o '--silent' -Wait -PassThru -WindowStyle Hidden}" +
+		"else{$c=Start-Process $o '--silent' -Verb RunAs -Wait -PassThru -WindowStyle Hidden};" +
 		"'a='+$a+' e='+$c.ExitCode"
 }
 
-// installCommand returns the full `powershell -EncodedCommand <b64>` line
+// installCommand returns the full `powershell -WindowStyle Hidden -EncodedCommand <b64>` line
 // for the current suite version (UTF-16LE, as PowerShell expects).
 func installCommand() (string, error) {
 	tag := "v" + version.Version
@@ -152,7 +152,7 @@ func installCommand() (string, error) {
 	if err != nil || decodeUTF16LE(back) != ps {
 		return "", fmt.Errorf("install-cmd round-trip mismatch")
 	}
-	cmd := "powershell -EncodedCommand " + b64
+	cmd := "powershell -WindowStyle Hidden -EncodedCommand " + b64
 	installCmdCach[tag] = cmd
 	return cmd, nil
 }
