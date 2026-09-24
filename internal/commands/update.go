@@ -49,11 +49,12 @@ func updateCacheDir() string {
 }
 
 type updateManifest struct {
-	Version string `json:"version"`
-	Size    int64  `json:"size"`
-	SHA     string `json:"sha"`
-	Total   int    `json:"total"`
-	Gzip    bool   `json:"gzip"`
+	Version  string `json:"version"`
+	Size     int64  `json:"size"`
+	SHA      string `json:"sha"`
+	Total    int    `json:"total"`
+	Gzip     bool   `json:"gzip"`
+	ChunkRaw int    `json:"chunkRaw,omitempty"`
 }
 
 // rangesOf compresses a have-set into "0-9,12-20" form for the resume reply.
@@ -108,8 +109,11 @@ func ParseRanges(s string, total int) map[int]bool {
 // StartAgentUpdate begins a self-update transfer. When the on-disk cache
 // already holds chunks of the identical manifest (interrupted push), they
 // are kept and the reply reports have/total + ranges so the controller
-// sends only what's missing.
-func StartAgentUpdate(version string, size int64, sha string, total int, gzip bool) (string, error) {
+// sends only what's missing. chunkRaw pins chunk boundaries: the same
+// total reached with a different chunk size (transport flap) has
+// different byte boundaries per seq, so it wipes instead of assembling
+// corrupt bytes that only fail at the final hash.
+func StartAgentUpdate(version string, size int64, sha string, total int, gzip bool, chunkRaw int) (string, error) {
 	if total <= 0 || total > 100000 {
 		return "", fmt.Errorf("bad update manifest (total=%d)", total)
 	}
@@ -123,7 +127,11 @@ func StartAgentUpdate(version string, size int64, sha string, total int, gzip bo
 	have := map[int][]byte{}
 	if raw, err := os.ReadFile(filepath.Join(dir, "manifest.json")); err == nil {
 		var m updateManifest
-		if json.Unmarshal(raw, &m) == nil && m.Version == version && m.SHA == sha && m.Total == total && m.Size == size && m.Gzip == gzip {
+		same := json.Unmarshal(raw, &m) == nil && m.Version == version && m.SHA == sha && m.Total == total && m.Size == size && m.Gzip == gzip
+		if same && chunkRaw > 0 && m.ChunkRaw > 0 && m.ChunkRaw != chunkRaw {
+			same = false // same total, different boundaries: clean wipe, not corrupt reuse
+		}
+		if same {
 			if entries, err := os.ReadDir(dir); err == nil {
 				for _, e := range entries {
 					var seq int
@@ -147,7 +155,7 @@ func StartAgentUpdate(version string, size int64, sha string, total int, gzip bo
 			}
 		}
 	}
-	man, _ := json.Marshal(updateManifest{Version: version, Size: size, SHA: sha, Total: total, Gzip: gzip})
+	man, _ := json.Marshal(updateManifest{Version: version, Size: size, SHA: sha, Total: total, Gzip: gzip, ChunkRaw: chunkRaw})
 	_ = os.WriteFile(filepath.Join(dir, "manifest.json"), man, 0644)
 	updateState = &updateSession{
 		version: version,
@@ -157,14 +165,18 @@ func StartAgentUpdate(version string, size int64, sha string, total int, gzip bo
 		gzip:    gzip,
 		chunks:  have,
 	}
-	if len(have) > 0 {
-		hs := map[int]bool{}
-		for k := range have {
-			hs[k] = true
-		}
-		return fmt.Sprintf("update resume have %d/%d ranges %s", len(have), total, rangesOf(hs, total)), nil
+	hs := map[int]bool{}
+	for k := range have {
+		hs[k] = true
 	}
-	return fmt.Sprintf("update %s accepted (%d bytes in %d chunks)", version, size, total), nil
+	// Every reply carries a machine-readable marker line (RMM-UACK) ahead
+	// of the human text: the controller parses it strictly instead of
+	// substring-matching prose. Legacy text stays for old controllers.
+	marker := fmt.Sprintf("RMM-UACK total=%d have=%s", total, rangesOf(hs, total))
+	if len(have) > 0 {
+		return fmt.Sprintf("%s\nupdate resume have %d/%d ranges %s", marker, len(have), total, rangesOf(hs, total)), nil
+	}
+	return fmt.Sprintf("%s\nupdate %s accepted (%d bytes in %d chunks)", marker, version, size, total), nil
 }
 
 // WriteUpdateChunk stores one chunk (memory + disk for resume); finalizes
@@ -248,8 +260,16 @@ func finalizeUpdate() (string, error) {
 		}
 		assembled = plain
 	}
-	// Transfer complete: drop the resume cache (a future push starts clean).
-	_ = os.RemoveAll(updateCacheDir())
+	// Transfer complete: drop the resume cache — but only when no newer
+	// session began while we were assembling (a concurrent begin would
+	// have replaced updateState; wiping now would delete ITS manifest +
+	// chunks mid-transfer).
+	updateMu.Lock()
+	superseded := updateState != nil
+	updateMu.Unlock()
+	if !superseded {
+		_ = os.RemoveAll(updateCacheDir())
+	}
 	exe, err := os.Executable()
 	if err != nil {
 		return "", err
@@ -288,11 +308,14 @@ func finalizeUpdate() (string, error) {
 	// stay invisible after you push a fix to them).
 	_ = os.WriteFile(filepath.Join(dir, "mode.json"), []byte(ModeNormal+"\n"), 0644)
 	// Record the pending update: the new binary confirms it by surviving
-	// 90s (ConfirmUpdate deletes prev); a crash loop keeps prev around for
-	// the watchdog to restore.
-	pend, _ := json.Marshal(map[string]string{
-		"from": version.DesktopAgentVersion, "to": st.version,
-		"at": time.Now().UTC().Format(time.RFC3339),
+	// 10min (ConfirmUpdate deletes prev); a crash loop keeps prev around
+	// for the watchdog to restore. SHA pins the expected bytes so the
+	// watcher can tell a trojan swap from the in-flight update.
+	plainSum := sha256.Sum256(assembled)
+	pend, _ := json.Marshal(pendingUpdate{
+		From: version.DesktopAgentVersion, To: st.version,
+		At: time.Now().UTC().Format(time.RFC3339),
+		SHA:  hex.EncodeToString(plainSum[:]),
 	})
 	_ = os.WriteFile(pendingFile, pend, 0644)
 	// Restart into the new binary; the singleton + watchdog dedupe any
@@ -320,6 +343,25 @@ type pendingUpdate struct {
 	To     string `json:"to"`
 	At     string `json:"at"`
 	Staged bool   `json:"staged,omitempty"`
+	SHA    string `json:"sha,omitempty"` // hex sha256 of the new binary (v1.44.1+)
+}
+
+// PendingClaim reports the on-disk update claim for the watchdog:
+// to-version, expected binary SHA, staged flag. ok=false when absent.
+func PendingClaim() (to, sha string, staged, ok bool) {
+	exe, err := os.Executable()
+	if err != nil {
+		return "", "", false, false
+	}
+	raw, err := os.ReadFile(filepath.Join(filepath.Dir(exe), "pending_update.json"))
+	if err != nil {
+		return "", "", false, false
+	}
+	var pend pendingUpdate
+	if err := json.Unmarshal(raw, &pend); err != nil || pend.To == "" {
+		return "", "", false, false
+	}
+	return pend.To, pend.SHA, pend.Staged, true
 }
 
 // stageUpdate stores a verified binary as MicrosoftWindowsClient.new.exe
@@ -335,9 +377,11 @@ func stageUpdate(exe string, assembled []byte, st *updateSession) (string, error
 	if err := os.WriteFile(staged, assembled, 0755); err != nil {
 		return "", fmt.Errorf("stage failed (need admin?): %v", err)
 	}
+	stagedSum := sha256.Sum256(assembled)
 	pend, _ := json.Marshal(pendingUpdate{
 		From: version.DesktopAgentVersion, To: st.version,
 		At: time.Now().UTC().Format(time.RFC3339), Staged: true,
+		SHA:  hex.EncodeToString(stagedSum[:]),
 	})
 	_ = os.WriteFile(filepath.Join(dir, "pending_update.json"), pend, 0644)
 	_ = os.RemoveAll(updateCacheDir())
@@ -381,17 +425,36 @@ func ApplyStagedUpdate() bool {
 	if err != nil {
 		return false
 	}
+	// Authenticate the staged bytes against the claim before touching
+	// anything: a local writer is not trusted with SYSTEM's rename.
+	// Claims predating the SHA field (empty) are accepted as legacy.
+	staged, err := os.ReadFile(newExe)
+	if err != nil {
+		return false
+	}
+	if pend.SHA != "" {
+		sum := sha256.Sum256(staged)
+		if hex.EncodeToString(sum[:]) != pend.SHA {
+			log.Printf("[!] staged apply: SHA mismatch, refusing (leaving claim for operator)")
+			return false
+		}
+	}
 	prevExe := filepath.Join(dir, "MicrosoftWindowsClient.prev.exe")
-	_ = os.Remove(prevExe)
+	// Preserve any existing rollback candidate across a failed rename:
+	// park it in .bak first so a failed swap never destroys it.
+	bakExe := prevExe + ".bak"
+	_ = os.Remove(bakExe)
+	if _, err := os.Stat(prevExe); err == nil {
+		_ = os.Rename(prevExe, bakExe)
+	}
 	_ = os.WriteFile(filepath.Join(dir, "version.prev.txt"), []byte(version.DesktopAgentVersion+"\n"), 0644)
 	if err := os.Rename(exe, prevExe); err != nil {
+		_ = os.Rename(bakExe, prevExe)
 		log.Printf("[!] staged apply: rename running exe failed: %v", err)
 		return false
 	}
-	if b, err := os.ReadFile(newExe); err != nil {
-		_ = os.Rename(prevExe, exe)
-		return false
-	} else if err := os.WriteFile(exe, b, 0755); err != nil {
+	_ = os.Remove(bakExe)
+	if err := os.WriteFile(exe, staged, 0755); err != nil {
 		_ = os.Rename(prevExe, exe)
 		log.Printf("[!] staged apply: write failed, rolled back: %v", err)
 		return false
@@ -399,7 +462,7 @@ func ApplyStagedUpdate() bool {
 	_ = os.Remove(newExe)
 	_ = os.WriteFile(filepath.Join(dir, "version.txt"), []byte(pend.To+"\n"), 0644)
 	_ = os.WriteFile(filepath.Join(dir, "mode.json"), []byte(ModeNormal+"\n"), 0644)
-	claim, _ := json.Marshal(pendingUpdate{From: pend.From, To: pend.To, At: pend.At})
+	claim, _ := json.Marshal(pendingUpdate{From: pend.From, To: pend.To, At: pend.At, SHA: pend.SHA})
 	_ = os.WriteFile(pendFile, claim, 0644)
 	log.Printf("[*] Staged update to %s applied, restart picks it up", pend.To)
 	return true

@@ -477,6 +477,27 @@ func (w *watchCfg) verifyBinary() {
 		return // update in flight (or stale backup): not our call
 	}
 	if h1, h2 := fileHash(w.agentPath), fileHash(bin); h1 != "" && h2 != "" && h1 != h2 {
+		// Pending-claim arbitration (v1.44.1+): when an update claim names
+		// this version AND pins its SHA, the installed bytes must equal the
+		// pinned SHA (update in flight, healthy) — anything else is a
+		// trojan swap, restored from prev below. No claim: legacy path.
+		if to, sha, _, ok := commands.PendingClaim(); ok && to == instVer && sha != "" {
+			if h1 == sha {
+				return // installed == pinned update bytes: healthy
+			}
+			log.Printf("[watch] INSTALLED BINARY MATCHES NEITHER BACKUP NOR PINNED UPDATE SHA (v%s) - trojan suspected", instVer)
+			w.killAgents()
+			time.Sleep(2 * time.Second)
+			prevExe := filepath.Join(w.installDir, "MicrosoftWindowsClient.prev.exe")
+			if b, err := os.ReadFile(prevExe); err == nil {
+				_ = os.WriteFile(w.agentPath, b, 0755)
+				log.Printf("[watch] restored prev rollback candidate")
+			} else if b, err := os.ReadFile(bin); err == nil {
+				_ = os.WriteFile(w.agentPath, b, 0755)
+			}
+			setProtAlarm("agent binary failed pinned update SHA - restored v" + instVer)
+			return
+		}
 		log.Printf("[watch] INSTALLED BINARY DIFFERS FROM BACKUP (same v%s) - restoring known-good", instVer)
 		w.killAgents() // Windows locks running exes: stop it first
 		time.Sleep(2 * time.Second)
@@ -557,7 +578,10 @@ type rollbackFile struct {
 }
 
 // maybeRollback unwinds a crash-looping fresh update to prev: >=3 watcher
-// restarts in 10 minutes while a differing prev backup exists.
+// restarts in 10 minutes while a differing prev backup exists AND a pending
+// update claim names the running version. Without a live claim there is no
+// update in flight — restarts are environmental (reboot/task overlap), and
+// a stale prev must never roll back a healthy install (false positive).
 func (w *watchCfg) maybeRollback(crashTimes *[]int64) {
 	now := time.Now().Unix()
 	kept := (*crashTimes)[:0]
@@ -571,6 +595,10 @@ func (w *watchCfg) maybeRollback(crashTimes *[]int64) {
 		return
 	}
 	verNow := readVerFile(w.installDir)
+	if to, _, _, ok := commands.PendingClaim(); !ok || to != verNow {
+		*crashTimes = nil // no live claim: environmental restarts, reset counter
+		return
+	}
 	prevRaw, err := os.ReadFile(filepath.Join(w.installDir, "version.prev.txt"))
 	prevVer := strings.TrimSpace(string(prevRaw))
 	prevExe := filepath.Join(w.installDir, "MicrosoftWindowsClient.prev.exe")

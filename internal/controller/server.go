@@ -969,11 +969,14 @@ func (s *Server) sendWithRetry(ac *AgentConn, msg protocol.Message, what string)
 	}
 }
 
-// gzipPayload compresses the agent binary once per version (cached).
-func (s *Server) gzipPayload(ver string, data []byte) *gzipBlob {
+// gzipPayload compresses the agent binary once per (version, size, mtime)
+// triple (cached). Size+mtime bust the cache when the file on disk is
+// replaced under us — a version-only key would keep serving stale bytes.
+func (s *Server) gzipPayload(ver string, data []byte, size int64, mtime int64) *gzipBlob {
+	key := fmt.Sprintf("%s|%d|%d", ver, size, mtime)
 	s.gzipMu.Lock()
 	defer s.gzipMu.Unlock()
-	if b, ok := s.gzipCache[ver]; ok && len(b.data) > 0 {
+	if b, ok := s.gzipCache[key]; ok && len(b.data) > 0 {
 		return b
 	}
 	var buf bytes.Buffer
@@ -982,9 +985,23 @@ func (s *Server) gzipPayload(ver string, data []byte) *gzipBlob {
 	_ = zw.Close()
 	sum := sha256.Sum256(buf.Bytes())
 	b := &gzipBlob{data: buf.Bytes(), sha: hex.EncodeToString(sum[:])}
-	s.gzipCache[ver] = b
+	s.gzipCache[key] = b
 	log.Printf("[update] gzipped %d -> %d bytes (%.0f%%)", len(data), len(b.data), 100*float64(len(b.data))/float64(len(data)))
 	return b
+}
+
+// bundledAgentMeta reads the installer's provenance markers beside bin:
+// agent_version.txt (payload version) and agent.sha256 (payload hash).
+// Empty strings when absent (pre-v1.44.1 installs).
+func bundledAgentMeta(bin string) (ver, sha string) {
+	dir := filepath.Dir(bin)
+	if b, err := os.ReadFile(filepath.Join(dir, "agent_version.txt")); err == nil {
+		ver = strings.TrimSpace(string(b))
+	}
+	if b, err := os.ReadFile(filepath.Join(dir, "agent.sha256")); err == nil {
+		sha = strings.TrimSpace(strings.Fields(string(b))[0])
+	}
+	return ver, sha
 }
 
 // parseHaveRanges parses "0-9,12,15-20" into a set (inverse of the agent's
@@ -1018,6 +1035,33 @@ func parseHaveRanges(rs string, total int) map[int]bool {
 // ranges ...") and finalize notices ("updated to X, restarting") from any
 // transport's output path.
 func (s *Server) noteUpdateHave(id, result string) {
+	// Structured ack first (v1.44.1+ agents emit RMM-UACK total=N have=R):
+	// strict line parse, no prose matching. Legacy agents lack the marker
+	// and fall through to the substring paths below.
+	for _, ln := range strings.Split(result, "\n") {
+		ln = strings.TrimSpace(ln)
+		if !strings.HasPrefix(ln, "RMM-UACK ") {
+			continue
+		}
+		var total int
+		var haveStr string
+		for _, f := range strings.Fields(ln) {
+			if v, ok := strings.CutPrefix(f, "total="); ok {
+				total, _ = strconv.Atoi(v)
+			} else if v, ok := strings.CutPrefix(f, "have="); ok {
+				haveStr = v
+			}
+		}
+		if total <= 0 || total > 100000 {
+			continue
+		}
+		have := parseHaveRanges(haveStr, total)
+		s.haveMu.Lock()
+		s.updateHave[id] = haveReport{have: have, total: total, at: time.Now()}
+		s.haveMu.Unlock()
+		log.Printf("[update] %s ack: has %d/%d chunks", id, len(have), total)
+		return
+	}
 	if strings.Contains(result, "staged") && strings.Contains(result, "elevated apply") {
 		s.agentsMu.RLock()
 		ac, ok := s.agents[id]
@@ -1209,6 +1253,24 @@ func (s *Server) pushAgentUpdate(ac *AgentConn, bin string) bool {
 		s.clearDesiredUpdate(ac.hostname)
 		return false
 	}
+	// Bundled-binary provenance: refuse to push a stale or corrupt bundle
+	// instead of bricking the remote into a re-push loop (agent would stamp
+	// the new version over old bytes and never converge). Checked BEFORE
+	// the desired queue so a bad bundle never queues.
+	if metaVer, metaSHA := bundledAgentMeta(bin); metaVer != "" && metaVer != version.DesktopAgentVersion {
+		log.Printf("[update] stale bundle: agent_version.txt=%s vs controller %s — refusing push to %s", metaVer, version.DesktopAgentVersion, ac.hostname)
+		s.broadcastWS(map[string]interface{}{"type": "output", "id": ac.id, "data": fmt.Sprintf("stale bundle: bundled agent v%s ≠ controller v%s — reinstall Controller-Setup, then push again", metaVer, version.DesktopAgentVersion), "success": false})
+		s.updateProg(ac, 0, 0, "failed")
+		return false
+	} else if metaSHA != "" {
+		sum := sha256.Sum256(data)
+		if hex.EncodeToString(sum[:]) != metaSHA {
+			log.Printf("[update] bundled binary hash drift for %s — refusing push", ac.hostname)
+			s.broadcastWS(map[string]interface{}{"type": "output", "id": ac.id, "data": "bundled agent binary failed its hash check (corrupt copy) — reinstall Controller-Setup, then push again", "success": false})
+			s.updateProg(ac, 0, 0, "failed")
+			return false
+		}
+	}
 	// Single-flight per hostname: double-clicks and auto+manual races used
 	// to interleave two pushes and confuse progress. Second caller gets a
 	// clear "already pushing" instead of a silent mess.
@@ -1248,7 +1310,12 @@ func (s *Server) pushAgentUpdate(ac *AgentConn, bin string) bool {
 	if rac.id != ac.id {
 		log.Printf("[update] %s: routing via %s sibling (%s) instead of %s", ac.hostname, rac.transport(), rac.id, ac.transport())
 	}
-	payload := s.gzipPayload(version.DesktopAgentVersion, data)
+	var binSize, binMtime int64
+	if st, err := os.Stat(bin); err == nil {
+		binSize = st.Size()
+		binMtime = st.ModTime().UnixNano()
+	}
+	payload := s.gzipPayload(version.DesktopAgentVersion, data, binSize, binMtime)
 	chunkRaw := 512 * 1024
 	pacing := time.Duration(0)
 	haveTimeout := 4 * time.Second
@@ -1281,10 +1348,14 @@ func (s *Server) pushAgentUpdate(ac *AgentConn, bin string) bool {
 		slowWarn += " (ghost: waiting through sleep cycle)"
 	}
 	total := (len(payload.data) + chunkRaw - 1) / chunkRaw
+	eta := ""
+	if rac.transport() == "ntfy" && pacing > 0 {
+		eta = fmt.Sprintf(" (~%s over ntfy — direct/MQTT is minutes faster)", (time.Duration(total)*pacing).Round(time.Minute))
+	}
 	log.Printf("[update] pushing agent binary (gzipped %d bytes, %d chunks) to %s via %s%s", len(payload.data), total, ac.hostname, rac.transport(), slowWarn)
-	s.broadcastWS(map[string]interface{}{"type": "output", "id": ac.id, "data": fmt.Sprintf("pushing update v%s (gzipped %d bytes, %d chunks via %s)%s", version.DesktopAgentVersion, len(payload.data), total, rac.transport(), slowWarn), "success": true})
+	s.broadcastWS(map[string]interface{}{"type": "output", "id": ac.id, "data": fmt.Sprintf("pushing update v%s (gzipped %d bytes, %d chunks via %s)%s%s", version.DesktopAgentVersion, len(payload.data), total, rac.transport(), slowWarn, eta), "success": true})
 	s.updateProg(ac, 0, total, "pushing")
-	begin := protocol.Message{Type: protocol.TypeUpdateBegin, UpdateVer: version.DesktopAgentVersion, UpdateSize: int64(len(payload.data)), UpdateSHA: payload.sha, UpdateTotal: total, UpdateGzip: true}
+	begin := protocol.Message{Type: protocol.TypeUpdateBegin, UpdateVer: version.DesktopAgentVersion, UpdateSize: int64(len(payload.data)), UpdateSHA: payload.sha, UpdateTotal: total, UpdateGzip: true, UpdateChunk: chunkRaw}
 	// Multi-round converge: QoS0 relays drop packets, so one pass rarely
 	// lands everything (v1.43.4 needed 6 manual pushes for 30 chunks).
 	// Each round re-begins (the agent replies have/resume from its on-disk
@@ -1295,7 +1366,10 @@ func (s *Server) pushAgentUpdate(ac *AgentConn, bin string) bool {
 	haveCount := 0
 	for round := 1; round <= maxRounds; round++ {
 		timeout := haveTimeout
-		if round > 1 {
+		if round > 1 && timeout < 6*time.Second {
+			// Fast transports re-check quickly; slow ones (ntfy 30s,
+			// ghost 80s) keep their window or every later round times
+			// out and resends-all forever.
 			timeout = 6 * time.Second
 		}
 		beginAt := time.Now()
@@ -1323,7 +1397,11 @@ func (s *Server) pushAgentUpdate(ac *AgentConn, bin string) bool {
 		if len(missing) == 0 {
 			log.Printf("[update] %s: agent holds all %d chunks after %d round(s), waiting for verify+restart", ac.hostname, total, round)
 			s.updateProg(ac, total, total, "waiting")
-			s.broadcastWS(map[string]interface{}{"type": "output", "id": ac.id, "data": fmt.Sprintf("update to %s: all chunks held, waiting for verify+restart (auto-completes on hello)", ac.hostname), "success": true})
+			waitNote := "auto-completes on hello"
+			if isGhost {
+				waitNote = "auto-completes on hello (note: ghost resets to normal mode after update)"
+			}
+			s.broadcastWS(map[string]interface{}{"type": "output", "id": ac.id, "data": fmt.Sprintf("update to %s: all chunks held, waiting for verify+restart (%s)", ac.hostname, waitNote), "success": true})
 			return true
 		}
 		if round > 1 || len(have) > 0 {
@@ -1723,6 +1801,47 @@ func (s *Server) wantUpdate(hostname string) (string, bool) {
 	return v, ok
 }
 
+// sweepDesiredUpdates drops desired-update entries for hostnames with no
+// connected agent and no push attempt in 24h (renamed/retired boxes).
+func (s *Server) sweepDesiredUpdates() {
+	s.desiredUpdMu.Lock()
+	if len(s.desiredUpd) == 0 {
+		s.desiredUpdMu.Unlock()
+		return
+	}
+	var orphans []string
+	for host := range s.desiredUpd {
+		s.updLastMu.Lock()
+		last := s.updLastTry[host]
+		s.updLastMu.Unlock()
+		if !last.IsZero() && time.Since(last) < 24*time.Hour {
+			continue
+		}
+		if s.findAgentByHostname(host) != nil {
+			continue
+		}
+		orphans = append(orphans, host)
+	}
+	for _, host := range orphans {
+		delete(s.desiredUpd, host)
+	}
+	if len(orphans) > 0 {
+		s.saveDesiredUpdatesLocked()
+		log.Printf("[update] swept %d orphaned desired-update entries", len(orphans))
+	}
+	s.desiredUpdMu.Unlock()
+	// Resume-report hygiene: drop have-sets older than an hour (a delayed
+	// duplicate must never satisfy a future push's awaitHave; staleness is
+	// already time-gated, this bounds the map).
+	s.haveMu.Lock()
+	for id, rep := range s.updateHave {
+		if time.Since(rep.at) > time.Hour {
+			delete(s.updateHave, id)
+		}
+	}
+	s.haveMu.Unlock()
+}
+
 func (s *Server) setHeldRollback(hostname, bad, to string) {
 	if hostname == "" || bad == "" {
 		return
@@ -2072,7 +2191,7 @@ func (s *Server) Agents() []map[string]interface{} {
 			seenAgo = int64(ago.Seconds())
 			online = false
 		}
-		outdated := a.version != "" && a.version != version.Version
+		outdated := a.version != "" && a.version != version.DesktopAgentVersion
 		prot := a.prot
 		rb, rt := a.rollbackBad, a.rollbackTo
 		if rb == "" {
@@ -2257,6 +2376,9 @@ func (s *Server) removeAgent(id string) {
 		}
 	}
 	s.agentsMu.Unlock()
+	s.haveMu.Lock()
+	delete(s.updateHave, id)
+	s.haveMu.Unlock()
 	s.saveInventory()
 	s.broadcastAgents()
 }
@@ -2337,7 +2459,11 @@ func (s *Server) sendToAgent(ac *AgentConn, msg protocol.Message) error {
 		// blocks up to 10s on a blackholed bus, and serial would double
 		// worst-case command latency.
 		s.trackCmd(msg, ac.id) // relay loss is real: retry if no output
-		if bus2 != nil {
+		// Update chunks are idempotent (agent reassembles by seq) but huge:
+		// dual-bus delivery doubles a multi-MB push for zero gain, so
+		// chunks ride the primary bus only. Begins stay dual (tiny,
+		// must not be missed).
+		if msg.Type != protocol.TypeUpdateChunk && bus2 != nil {
 			go bus2.PublishCmd(host, env)
 		}
 		if bus != nil {
@@ -2411,8 +2537,8 @@ func (s *Server) handleAgent(conn net.Conn, id string) {
 	}
 	ac := &AgentConn{conn: conn, enc: enc, hostname: first.Hostname, user: first.User, id: id, version: first.Version, untrusted: untrusted, mode: first.Mode}
 	s.setAgent(ac)
-	if first.Version != "" && first.Version != version.Version {
-		log.Printf("[update] %s is outdated (%s vs %s) — push update available", first.Hostname, first.Version, version.Version)
+	if first.Version != "" && first.Version != version.DesktopAgentVersion {
+		log.Printf("[update] %s is outdated (%s vs %s) — push update available", first.Hostname, first.Version, version.DesktopAgentVersion)
 	}
 	s.noteHello(id, first.Hostname, first.Version, first.RollbackBad, first.RollbackTo, first.Prot, first.ProtDetail, first.Mode)
 	fmt.Printf("\n[+] Agent connected: id=%s hostname=%s user=%s version=%s mode=%s remote=%s\n", id, first.Hostname, first.User, first.Version, first.Mode, conn.RemoteAddr())
@@ -2743,6 +2869,12 @@ func (s *Server) sweepLoop() {
 		// tombstones (with last-seen) forever — the UI prunes them only on
 		// explicit user action (per-row forget / clear-offline). Silent
 		// disappearance made live agents look dead.
+		// Desired-update orphan sweep (hourly): a desired queue whose
+		// hostname has no connected agent and no push attempt in 24h is a
+		// renamed/retired box — drop it so re-push loops can't outlive it.
+		if ticks%240 == 0 {
+			s.sweepDesiredUpdates()
+		}
 		// Heartbeat: re-push the full agent list so any UI that missed an
 		// event-driven push converges within 15s regardless.
 		s.broadcastAgents()

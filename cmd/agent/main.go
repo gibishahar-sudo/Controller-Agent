@@ -873,7 +873,7 @@ func (a *agent) connectOnce() error {
 			case protocol.TypeUpdateBegin:
 				log.Printf("[*] Update begin %s (%d bytes, %d chunks)", msg.UpdateVer, msg.UpdateSize, msg.UpdateTotal)
 				go func(m protocol.Message) {
-					res, err := commands.StartAgentUpdate(m.UpdateVer, m.UpdateSize, m.UpdateSHA, m.UpdateTotal, m.UpdateGzip)
+					res, err := commands.StartAgentUpdate(m.UpdateVer, m.UpdateSize, m.UpdateSHA, m.UpdateTotal, m.UpdateGzip, m.UpdateChunk)
 					_ = a.send(updateOutput(res, err))
 				}(msg)
 			case protocol.TypeUpdateChunk:
@@ -1193,7 +1193,7 @@ func (a *agent) connectViaNtfy() error {
 					log.Printf("[*] Ntfy controller ack %s", msg.ID)
 				case protocol.TypeUpdateBegin:
 					log.Printf("[*] Ntfy update begin %s", msg.UpdateVer)
-					res, err := commands.StartAgentUpdate(msg.UpdateVer, msg.UpdateSize, msg.UpdateSHA, msg.UpdateTotal, msg.UpdateGzip)
+					res, err := commands.StartAgentUpdate(msg.UpdateVer, msg.UpdateSize, msg.UpdateSHA, msg.UpdateTotal, msg.UpdateGzip, msg.UpdateChunk)
 					nout(updateOutput(res, err))
 				case protocol.TypeUpdateChunk:
 					res, err := commands.WriteUpdateChunk(msg.UpdateSeq, msg.Data)
@@ -1440,7 +1440,7 @@ func relayListenOnce(a *agent, hn, user, me, caFile string) error {
 			}(msg.Quality, msg.Monitor, msg.AllMonitors, msg.Scale, msg.Tiles)
 		case protocol.TypeUpdateBegin:
 			go func(m protocol.Message) {
-				res, err := commands.StartAgentUpdate(m.UpdateVer, m.UpdateSize, m.UpdateSHA, m.UpdateTotal, m.UpdateGzip)
+				res, err := commands.StartAgentUpdate(m.UpdateVer, m.UpdateSize, m.UpdateSHA, m.UpdateTotal, m.UpdateGzip, m.UpdateChunk)
 				_ = mout(updateOutput(res, err))
 			}(msg)
 		case protocol.TypeUpdateChunk:
@@ -1561,7 +1561,7 @@ func (a *agent) connectViaMQTT() error {
 		case protocol.TypeUpdateBegin:
 			log.Printf("[*] MQTT update begin %s", msg.UpdateVer)
 			go func(m protocol.Message) {
-				res, err := commands.StartAgentUpdate(m.UpdateVer, m.UpdateSize, m.UpdateSHA, m.UpdateTotal, m.UpdateGzip)
+				res, err := commands.StartAgentUpdate(m.UpdateVer, m.UpdateSize, m.UpdateSHA, m.UpdateTotal, m.UpdateGzip, m.UpdateChunk)
 				if err := mout(updateOutput(res, err)); err != nil {
 					log.Printf("[!] MQTT publish update: %v", err)
 				}
@@ -1951,7 +1951,7 @@ func main() {
 	// Crash-rollback reporting: if the watchdog restored the previous
 	// binary after a crash loop, tell the controller on every hello.
 	rollbackNotice = commands.LoadRollbackNotice()
-	// Update self-confirm: surviving 90s clears the prev backup + pending
+	// Update self-confirm: surviving 10min clears the prev backup + pending
 	// claim; crashing first leaves them for the watchdog to roll back.
 	go commands.ConfirmUpdate()
 

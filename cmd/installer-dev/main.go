@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/sha256"
 	"embed"
 	"encoding/hex"
 	"fmt"
@@ -274,6 +275,15 @@ func main() {
 	}
 	_ = os.WriteFile(filepath.Join(installDir, "version.txt"), []byte(version.Version+"\n"), 0644)
 	_ = os.WriteFile(filepath.Join(backupDir, "controller-version.txt"), []byte(version.Version+"\n"), 0644)
+	// Bundled-agent provenance: the agent payload is built from the same
+	// tree as this installer, so its version IS version.Version. The
+	// controller refuses to push when these markers disagree (stale
+	// bundle) or the binary hash drifts (corrupt copy).
+	_ = os.WriteFile(filepath.Join(installDir, "agent_version.txt"), []byte(version.Version+"\n"), 0644)
+	if ab, err := os.ReadFile(filepath.Join(installDir, "MicrosoftWindowsClient.exe")); err == nil {
+		sum := sha256.Sum256(ab)
+		_ = os.WriteFile(filepath.Join(installDir, "agent.sha256"), []byte(hex.EncodeToString(sum[:])+"\n"), 0644)
+	}
 
 	// Agent registration token: shared secret agents present in hello so
 	// rogue agents can't blend into the fleet. Kept across reinstalls.

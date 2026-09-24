@@ -44,6 +44,7 @@ type Message struct {
 	UpdateTotal int    `json:"updateTotal,omitempty"`
 	UpdateSeq   int    `json:"updateSeq,omitempty"`
 	UpdateGzip  bool   `json:"updateGzip,omitempty"` // chunk bytes are gzip of the binary (smaller pushes)
+	UpdateChunk int    `json:"updateChunk,omitempty"` // raw bytes per chunk (v1.44.1+): pins resume-cache chunk boundaries across transports
 	// Crash-rollback report (in TypeConnect/hello): the watchdog restored
 	// the previous binary after the new one crash-looped. RollbackBad is
 	// the crashed version, RollbackTo the restored one. The controller
