@@ -670,12 +670,14 @@ function connectWS(){
         if(m.data){
           if(m.fseq){ if(m.fseq<lastFSeq && (lastFSeq-m.fseq)<1000000){ topUpShots(); return; } lastFSeq=m.fseq; }
           const fmt=(m.format==="jpeg")?"jpeg":"png";
-          frameW=m.width||frameW; frameH=m.height||frameH;
-          frameOX=m.ox||0; frameOY=m.oy||0;
           if(m.fseq) tileGen=m.fseq; // keyframes advance the shared generation
           pushFrameStats(Date.now(), (m.data||"").length);
-          showScreen(m.data, fmt);
-          $("screenRes").textContent=m.width+"×"+m.height+" "+fmt.toUpperCase();
+          // Geometry commits at paint time inside showScreen (metadata
+          // arrives before pixels decode; clicks must map to visible
+          // pixels, never to a frame still decoding).
+          showScreen(m.data, fmt, {w:m.width||0, h:m.height||0, ox:(m.ox||0), oy:(m.oy||0), scale:(m.scale||1), fseq:(m.fseq||0)});
+          const sc=(m.scale&&m.scale<1)?" (½ res)":"";
+          $("screenRes").textContent=m.width+"×"+m.height+" "+fmt.toUpperCase()+sc;
           topUpShots();
         } else { pushFrameStats(Date.now(), 0); topUpShots(); } // heartbeat: alive, nothing changed
       }
@@ -1187,10 +1189,16 @@ function effPipe(){
   if(selected&&typeof isRelay==="function"&&isRelay(selected)) p=Math.min(p,10);
   return p;
 }
-let frameW=1920, frameH=1080, frameOX=0, frameOY=0, frameTimes=[], lastFrameBytes=0;
-// remoteXY maps a pointer event on the stream image to remote virtual-screen
-// coords: accounts for letterboxing (object-fit:contain) and the capture
-// origin of multi-monitor frames. Shared by click, wheel, follow, cursor.
+let frameW=1920, frameH=1080, frameOX=0, frameOY=0, frameScale=1, frameTimes=[], lastFrameBytes=0;
+// Paint-order guards: frame metadata arrives before pixels decode, so
+// geometry is committed at paint time (never ahead of visible pixels).
+// frameArrival counts keyframe arrivals; framePainted the latest painted.
+let frameArrival=0, framePainted=0;
+// remoteXY maps a pointer event on the stream image to REAL remote
+// virtual-screen coords: accounts for letterboxing (object-fit:contain),
+// the capture origin of multi-monitor frames, and the frame downscale
+// (half-res relay frames live in scaled space; clicks go back in real
+// pixels). Geometry used is always the currently PAINTED frame's.
 function remoteXY(e){
   const img=$("screenImg"); if(!img) return null;
   const r=img.getBoundingClientRect();
@@ -1200,7 +1208,8 @@ function remoteXY(e){
   const dw=iw*scale, dh=ih*scale;
   const dx=e.clientX-r.left-(r.width-dw)/2, dy=e.clientY-r.top-(r.height-dh)/2;
   if(dx<0||dy<0||dx>dw||dy>dh) return null;
-  return {x: Math.round(frameOX+dx/dw*frameW), y: Math.round(frameOY+dy/dh*frameH)};
+  const s=frameScale||1;
+  return {x: Math.round((frameOX+dx/dw*frameW)/s), y: Math.round((frameOY+dy/dh*frameH)/s)};
 }
 function updateStreamStats(){
   const el=$("streamStats"); if(!el) return;
@@ -1213,10 +1222,12 @@ function positionRemoteCursor(x,y){
   const wrap=$("screenWrap"); const r=img.getBoundingClientRect(), wr=wrap.getBoundingClientRect();
   const iw=img.naturalWidth||frameW, ih=img.naturalHeight||frameH;
   if(iw<=0||ih<=0) return;
+  // Agent positions arrive in real pixels; the frame may be downscaled.
+  const s=frameScale||1, fx=x*s, fy=y*s;
   const scale=Math.min(r.width/iw, r.height/ih);
   const dw=iw*scale, dh=ih*scale;
-  const ex=r.left-wr.left+(r.width-dw)/2+(x-frameOX)/frameW*dw;
-  const ey=r.top-wr.top+(r.height-dh)/2+(y-frameOY)/frameH*dh;
+  const ex=r.left-wr.left+(r.width-dw)/2+(fx-frameOX)/frameW*dw;
+  const ey=r.top-wr.top+(r.height-dh)/2+(fy-frameOY)/frameH*dh;
   dot.style.display="block"; dot.style.left=(ex-6)+"px"; dot.style.top=(ey-6)+"px";
 }
 let qualityTouched=false; // set once the user picks a quality: manual choice always wins
@@ -1393,12 +1404,24 @@ function screenCanvas(){
   }
   return cv;
 }
-function showScreen(b64, fmt){
+function showScreen(b64, fmt, meta){
   const cv=screenCanvas();
+  const myArrival=++frameArrival;
   const im=new Image();
   im.onload=()=>{
+    if(myArrival<framePainted) return; // a newer keyframe already painted; don't flash back
+    framePainted=myArrival;
     if(cv.width!==im.naturalWidth||cv.height!==im.naturalHeight){ cv.width=im.naturalWidth; cv.height=im.naturalHeight; }
     cv.getContext("2d").drawImage(im,0,0);
+    // Commit geometry with the pixels: clicks from here on map to what
+    // is actually on screen. meta.scale converts frame space to real.
+    if(meta){
+      if(meta.w>0) frameW=meta.w;
+      if(meta.h>0) frameH=meta.h;
+      frameOX=meta.ox||0; frameOY=meta.oy||0;
+      frameScale=meta.scale||1;
+      if(meta.fseq) tileGen=meta.fseq;
+    }
   };
   im.src=`data:image/${fmt};base64,${b64}`;
 }
@@ -1408,10 +1431,16 @@ function drawTile(m){
   const cv=$("screenImg");
   if(!cv || cv.tagName!=="CANVAS") return; // no keyframe yet; next one heals
   if(m.fseq && tileGen && m.fseq<tileGen && (tileGen-m.fseq)<1000000) return; // stale
+  // Snapshot arrival-time geometry: the canvas may resize under us while
+  // this tile decodes (newer keyframe), so offsets are computed against
+  // the frame the tile was requested in, verified at paint.
+  const fw=frameW, fh=frameH, fox=frameOX, foy=frameOY;
   const fmt=(m.format==="jpeg")?"jpeg":"png";
   const im=new Image();
   im.onload=()=>{
-    const x=(m.ox||0)-frameOX, y=(m.oy||0)-frameOY;
+    if(m.fseq && m.fseq<tileGen && (tileGen-m.fseq)<1000000) return; // superseded while decoding
+    if(cv.width!==fw||cv.height!==fh) return; // canvas moved on; keyframe heals
+    const x=(m.ox||0)-fox, y=(m.oy||0)-foy;
     if(x<0||y<0||x+m.width>cv.width||y+m.height>cv.height) return; // outside canvas; keyframe heals
     cv.getContext("2d").drawImage(im,x,y,m.width,m.height);
     if(m.fseq) tileGen=m.fseq;

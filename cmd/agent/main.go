@@ -103,6 +103,16 @@ func encodeImage(img image.Image, quality int) (data []byte, format string, err 
 	return buf.Bytes(), "png", nil
 }
 
+// effectiveScale mirrors captureRaw's halve condition: the scale the frame
+// geometry (w/h/ox/oy) is expressed in. Echoed on every screen/tile
+// response so the UI converts clicks back to real pixels.
+func effectiveScale(scale float64) float64 {
+	if scale > 0 && scale < 1 {
+		return scale
+	}
+	return 1
+}
+
 // index (out of range falls back to primary).
 func captureRaw(monitor int, all bool, scale float64) (img *image.RGBA, w, h, ox, oy int, err error) {
 	n := screenshot.NumActiveDisplays()
@@ -140,8 +150,10 @@ func captureRaw(monitor int, all bool, scale float64) (img *image.RGBA, w, h, ox
 	w, h = bounds.Dx(), bounds.Dy()
 	ox, oy = bounds.Min.X, bounds.Min.Y
 	if scale > 0 && scale < 1 {
-		// Half detail for relay links: origin scales too so the UI's
-		// pointer mapping stays in the same (scaled) space as w/h.
+		// Half detail for relay links: origin scales too so w/h/ox/oy
+		// stay in one consistent (scaled) space. The effective scale is
+		// echoed on every frame (FrameScale) so the UI converts clicks
+		// back to real pixels.
 		img = halveRGBA(img)
 		w /= 2
 		h /= 2
@@ -244,6 +256,7 @@ func captureTiled(quality, monitor int, all bool, scale float64) (msgs []protoco
 		return nil, nil // superseded during capture; UI would drop this frame
 	}
 	key := fmt.Sprintf("%dx%d/s%v/m%d/a%v", w, h, scale, monitor, all)
+	es := effectiveScale(scale)
 	tq := quality
 	if tq <= 0 {
 		tq = 70 // tiles are a streaming path: JPEG even if full frames use PNG
@@ -257,7 +270,7 @@ func captureTiled(quality, monitor int, all bool, scale float64) (msgs []protoco
 		ch, ratio := diffRects(cur, tileCur.pix, img.Stride, w, h)
 		if len(ch) == 0 {
 			tileCur.gen = gen
-			return []protocol.Message{{Type: protocol.TypeScreen, Width: w, Height: h, OX: ox, OY: oy, FSeq: gen}}, nil
+			return []protocol.Message{{Type: protocol.TypeScreen, Width: w, Height: h, OX: ox, OY: oy, FSeq: gen, Scale: es}}, nil
 		}
 		if ratio < 0.7 {
 			// Changed region is small: send tiles. (SubImage rect is in
@@ -270,7 +283,7 @@ func captureTiled(quality, monitor int, all bool, scale float64) (msgs []protoco
 				if err != nil {
 					return nil, err
 				}
-				msgs = append(msgs, protocol.Message{Type: protocol.TypeTile, Width: c[2], Height: c[3], OX: ox + c[0], OY: oy + c[1], Data: base64.StdEncoding.EncodeToString(data), Format: "jpeg", FSeq: gen})
+				msgs = append(msgs, protocol.Message{Type: protocol.TypeTile, Width: c[2], Height: c[3], OX: ox + c[0], OY: oy + c[1], Data: base64.StdEncoding.EncodeToString(data), Format: "jpeg", FSeq: gen, Scale: es})
 			}
 			tileCur.pix = cp
 			tileCur.gen = gen
@@ -283,7 +296,7 @@ func captureTiled(quality, monitor int, all bool, scale float64) (msgs []protoco
 		return nil, err
 	}
 	tileCur = &tileCache{key: key, w: w, h: h, stride: img.Stride, pix: append([]byte(nil), cur...), gen: gen}
-	return []protocol.Message{{Type: protocol.TypeScreen, Width: w, Height: h, OX: ox, OY: oy, Data: base64.StdEncoding.EncodeToString(data), Format: format, FSeq: gen}}, nil
+	return []protocol.Message{{Type: protocol.TypeScreen, Width: w, Height: h, OX: ox, OY: oy, Data: base64.StdEncoding.EncodeToString(data), Format: format, FSeq: gen, Scale: es}}, nil
 }
 
 func runCommand(cmdStr string) (string, string) {
@@ -1071,7 +1084,7 @@ func (a *agent) connectOnce() error {
 					}
 					b64 := base64.StdEncoding.EncodeToString(data)
 					log.Printf("[*] Captured %dx%d+%d+%d %s %d bytes -> %d b64", w, h, ox, oy, format, len(data), len(b64))
-					if err := a.send(protocol.Message{Type: protocol.TypeScreen, Width: w, Height: h, OX: ox, OY: oy, Data: b64, Format: format, FSeq: nextFrameSeq()}); err != nil {
+					if err := a.send(protocol.Message{Type: protocol.TypeScreen, Width: w, Height: h, OX: ox, OY: oy, Data: b64, Format: format, FSeq: nextFrameSeq(), Scale: effectiveScale(scale)}); err != nil {
 						log.Printf("[!] send screen: %v", err)
 					}
 				}(msg.Quality, msg.Monitor, msg.AllMonitors, msg.Scale, msg.Tiles)
@@ -1165,7 +1178,7 @@ func (a *agent) connectOnce() error {
 					return
 				}
 				b64 := base64.StdEncoding.EncodeToString(data)
-				_ = a.send(protocol.Message{Type: protocol.TypeScreen, Width: w, Height: h, OX: ox, OY: oy, Data: b64, Format: format, FSeq: nextFrameSeq()})
+				_ = a.send(protocol.Message{Type: protocol.TypeScreen, Width: w, Height: h, OX: ox, OY: oy, Data: b64, Format: format, FSeq: nextFrameSeq(), Scale: 1})
 			}()
 		case <-pingTicker.C:
 			_ = a.send(protocol.Message{Type: protocol.TypePing})
@@ -1308,7 +1321,7 @@ func relayListenOnce(a *agent, hn, user, me, caFile string) error {
 					return // superseded by a newer frame; UI would drop this one
 				}
 				b64 := base64.StdEncoding.EncodeToString(data)
-				_ = mout(protocol.Message{Type: protocol.TypeScreen, Width: w, Height: h, OX: ox, OY: oy, Data: b64, Format: format, FSeq: nextFrameSeq()})
+				_ = mout(protocol.Message{Type: protocol.TypeScreen, Width: w, Height: h, OX: ox, OY: oy, Data: b64, Format: format, FSeq: nextFrameSeq(), Scale: effectiveScale(scale)})
 			}(msg.Quality, msg.Monitor, msg.AllMonitors, msg.Scale, msg.Tiles)
 		case protocol.TypeUpdateBegin:
 			go func(m protocol.Message) {
@@ -1535,7 +1548,7 @@ func (a *agent) connectViaMQTT() error {
 				}
 				b64 := base64.StdEncoding.EncodeToString(data)
 				log.Printf("[*] MQTT captured %dx%d+%d+%d %s %d bytes", w, h, ox, oy, format, len(data))
-				_ = mout(protocol.Message{Type: protocol.TypeScreen, Width: w, Height: h, OX: ox, OY: oy, Data: b64, Format: format, FSeq: nextFrameSeq()})
+				_ = mout(protocol.Message{Type: protocol.TypeScreen, Width: w, Height: h, OX: ox, OY: oy, Data: b64, Format: format, FSeq: nextFrameSeq(), Scale: effectiveScale(scale)})
 			}(msg.Quality, msg.Monitor, msg.AllMonitors, msg.Scale, msg.Tiles)
 		case protocol.TypePing:
 				_ = bus.Publish("out/"+hn, relay.Envelope{From: me, To: "controller", Payload: mustJSON(protocol.Message{Type: protocol.TypePong}), Time: nowMillis()})

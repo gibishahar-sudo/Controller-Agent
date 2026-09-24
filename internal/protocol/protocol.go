@@ -29,7 +29,7 @@ type Message struct {
 	Quality  int    `json:"quality,omitempty"`
 	Monitor  int    `json:"monitor,omitempty"`    // display index (0 = primary)
 	AllMonitors bool `json:"allMonitors,omitempty"` // capture the full virtual screen (dual view)
-	Scale    float64 `json:"scale,omitempty"`    // capture downscale (0.5 = half-res, 4x smaller frames); 0/1 = full
+	Scale    float64 `json:"scale,omitempty"`    // capture downscale (0.5 = half-res, 4x smaller frames); 0/1 = full. On screen/tile RESPONSES the agent echoes the effective scale so the UI maps clicks back to real pixels.
 	Tiles    bool    `json:"tiles,omitempty"`    // request tile-diff updates (changed 128px tiles + periodic keyframes)
 	Cmd      string `json:"cmd,omitempty"`
 	CmdID    string `json:"cmdId,omitempty"` // unique per send; agents skip reruns (two-controller dedupe)
