@@ -496,6 +496,40 @@ func ConfirmUpdate() {
 	log.Printf("[*] Update to %s confirmed healthy (10min survived), prev backup cleared", version.DesktopAgentVersion)
 }
 
+// VersionReport answers "which version am I really on": the running
+// binary first (what hello reports and the UI version-check parses),
+// then the on-disk breadcrumbs (version.txt, pending claim, rollback
+// backup). After an update they must all agree; any skew tells exactly
+// which step hasn't landed yet (swap pending, restart pending, or a
+// stale duplicate process still running the old binary).
+func VersionReport() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return version.Agent()
+	}
+	dir := filepath.Dir(exe)
+	read := func(name string) string {
+		b, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			return "-"
+		}
+		if s := strings.TrimSpace(string(b)); s != "" {
+			return s
+		}
+		return "-"
+	}
+	out := version.Agent() + "\nfile=" + read("version.txt")
+	if to, _, staged, ok := PendingClaim(); ok {
+		kind := "pending-update"
+		if staged {
+			kind = "pending-staged"
+		}
+		out += "\n" + kind + "->" + to
+	}
+	out += "\nprev=" + read("version.prev.txt")
+	return out
+}
+
 // RollbackNotice is a crash-rollback report left by the watchdog.
 type RollbackNotice struct {
 	Bad string `json:"bad"`

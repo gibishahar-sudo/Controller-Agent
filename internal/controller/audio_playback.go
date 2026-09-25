@@ -211,7 +211,7 @@ func ensureAudioPlayer(host, device string, gain float64, clarity bool) (string,
 	}
 	stopAudioPlayerLocked()
 	script := waveOutPlayerSnippet + "[RmmPlay]::Run('" + strings.ReplaceAll(device, "'", "''") + "')"
-	cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-command", script)
+	cmd := hideChild(exec.Command("powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-command", script))
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return "", err
