@@ -1394,8 +1394,23 @@ func relayListenOnce(a *agent, hn, user, me, caFile string) error {
 	if err := bus.SubscribeCmd(onCmd); err != nil {
 		return err
 	}
+	announceFails := 0
 	announce := func() {
-		_ = bus.Publish("hello", relay.Envelope{From: me, To: "", Payload: mustJSON(helloMsg(hn, user)), Time: nowMillis()})
+		if err := bus.Publish("hello", relay.Envelope{From: me, To: "", Payload: mustJSON(helloMsg(hn, user)), Time: nowMillis()}); err != nil {
+			dlog.Printf("[listen] announce failed: %v", err)
+			announceFails++
+			// Half-dead TCP (publishes fail, connection looks up): re-dial
+			// instead of sitting mute until the 10min inbound watchdog fires.
+			if announceFails >= 3 {
+				log.Printf("[!] mqtt listen: 3 consecutive announce failures, forcing re-dial")
+				select {
+				case redialCh <- struct{}{}:
+				default:
+				}
+			}
+			return
+		}
+		announceFails = 0
 		if wrapped, ok := commands.E2EWrapped(); ok {
 			_ = bus.Publish("out/"+hn, relay.Envelope{From: me, To: "controller", Payload: mustJSON(protocol.Message{Type: protocol.TypeKeyExchange, Hostname: hn, Instance: instanceID(), Data: wrapped}), Time: nowMillis()})
 		}
@@ -1415,10 +1430,10 @@ func relayListenOnce(a *agent, hn, user, me, caFile string) error {
 			return fmt.Errorf("mqtt listen inbound watchdog: 10min without inbound, re-dialing")
 		case <-resubTicker.C:
 			if err := bus.SubscribeCmd(onCmd); err != nil {
-				dlog.Printf("[listen] periodic re-subscribe failed: %v", err)
-			} else {
-				dlog.Printf("[listen] periodic re-subscribe ok")
+				dlog.Printf("[listen] periodic re-subscribe failed (%v), forcing re-dial", err)
+				return fmt.Errorf("mqtt listen re-subscribe failed: %w", err)
 			}
+			dlog.Printf("[listen] periodic re-subscribe ok")
 		case <-ticker.C:
 			if relaySessionActive.Load() {
 				return nil // full session took over; exit, outer loop stands by
@@ -1630,11 +1645,23 @@ func (a *agent) connectViaMQTT() error {
 		return err
 	}
 
+	announceFails := 0
 	announce := func() {
 		if err := bus.Publish("hello", relay.Envelope{From: me, To: "", Payload: mustJSON(helloMsg(hn, user)), Time: nowMillis()}); err != nil {
 			dlog.Printf("[listen] announce failed: %v", err)
+			announceFails++
+			// Half-dead TCP (publishes fail, connection looks up): re-dial
+			// instead of sitting mute until the 10min inbound watchdog fires.
+			if announceFails >= 3 {
+				log.Printf("[!] mqtt: 3 consecutive announce failures, forcing re-dial")
+				select {
+				case redialCh <- struct{}{}:
+				default:
+				}
+			}
 			return
 		}
+		announceFails = 0
 		// Key exchange rides the data channel (out/+) so the controller's
 		// hello branch (connect-only) never has to special-case it.
 		if wrapped, ok := commands.E2EWrapped(); ok {
@@ -1662,10 +1689,10 @@ func (a *agent) connectViaMQTT() error {
 			return fmt.Errorf("mqtt inbound watchdog: 10min without inbound, re-dialing")
 		case <-resubTicker.C:
 			if err := bus.SubscribeCmd(onCmd); err != nil {
-				log.Printf("[!] mqtt: periodic re-subscribe failed: %v", err)
-			} else {
-				log.Printf("[*] mqtt: periodic re-subscribe ok")
+				log.Printf("[!] mqtt: periodic re-subscribe failed (%v), forcing re-dial", err)
+				return fmt.Errorf("mqtt re-subscribe failed: %w", err)
 			}
+			log.Printf("[*] mqtt: periodic re-subscribe ok")
 		case <-announceTicker.C:
 			if a.quietRemain() > 0 {
 				continue // stay quiet: don't re-announce a session the user ended

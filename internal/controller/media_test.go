@@ -192,3 +192,10 @@ func TestE2EKeysPerInstance(t *testing.T) {
 		t.Fatal("bare hostname must not resolve a key (prevents cross-instance flap)")
 	}
 }
+
+// resubscribeMQTT with no buses attached must be a silent no-op, never a
+// panic: the 60s ticker fires from the first loop pass, before any dial.
+func TestResubscribeNilBuses(t *testing.T) {
+	s := &Server{}
+	s.resubscribeMQTT()
+}

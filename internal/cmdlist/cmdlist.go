@@ -94,6 +94,7 @@ var Known = map[string]string{
 	"get-position":            "Get mouse position",
 	"send-text":               "Send text - send-text <text>",
 	"key-press":               "Key press - key-press <key>",
+	"keylog":                  "Capture keystrokes for N seconds - keylog 60 (5-3600, tags window switches)",
 	"clipboard-get":           "Get clipboard",
 	"clipboard-set":           "Set clipboard - clipboard-set <text>",
 	"get-active-window":       "Get active window",

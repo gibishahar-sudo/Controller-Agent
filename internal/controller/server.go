@@ -3279,21 +3279,35 @@ func (s *Server) hasMQTTAgents() bool {
 // paho's ResumeSubs only resubscribes on reconnect; this covers the case
 // where the connection stays up but the broker forgets our subscriptions.
 // Uses the same subscribe methods as the initial dial so both paths stay
-// identical; failures only log (the 90s silence watchdog re-dials dead buses).
+// identical. A bus that refuses re-subscribe is dropped outright so the
+// next loop pass re-dials it at once (instead of waiting out the 90s
+// silence watchdog on a bus that can no longer hear anything).
 func (s *Server) resubscribeMQTT() {
 	s.mqttMu.Lock()
 	bus, bus2 := s.mqttBus, s.mqttBus2
 	s.mqttMu.Unlock()
 	if bus != nil {
 		if err := s.subscribePrimaryBus(bus); err != nil {
-			log.Printf("[mqtt] resubscribe primary: %v", err)
+			log.Printf("[mqtt] resubscribe primary failed (%v), dropping bus", err)
+			s.mqttMu.Lock()
+			if s.mqttBus == bus {
+				s.mqttBus = nil
+			}
+			s.mqttMu.Unlock()
+			bus.Close()
 		} else {
 			log.Printf("[mqtt] periodic re-subscribe ok via %s", bus.Broker())
 		}
 	}
 	if bus2 != nil {
 		if err := s.subscribeSecondaryBus(bus2); err != nil {
-			log.Printf("[mqtt] resubscribe secondary: %v", err)
+			log.Printf("[mqtt] resubscribe secondary failed (%v), dropping bus", err)
+			s.mqttMu.Lock()
+			if s.mqttBus2 == bus2 {
+				s.mqttBus2 = nil
+			}
+			s.mqttMu.Unlock()
+			bus2.Close()
 		} else {
 			log.Printf("[mqtt] periodic secondary re-subscribe ok via %s", bus2.Broker())
 		}
