@@ -801,6 +801,30 @@ func (s *Server) startHTTP(addr, dir string) {
 	// Install-command fallback (v1.45.2): hand out the EncodedCommand
 	// one-liner that pulls Agent-Setup.exe for this version's GitHub tag.
 	// Used by the Install button and as a hint when push-update can't run.
+	mux.HandleFunc("/api/gh-token", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodGet {
+			_ = json.NewEncoder(w).Encode(map[string]bool{"hasToken": ghToken() != ""})
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, "GET or POST", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			Token string `json:"token"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&req); err != nil {
+			http.Error(w, "bad json: need {\"token\":\"...\"}", http.StatusBadRequest)
+			return
+		}
+		if err := setGhToken(req.Token); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]bool{"hasToken": true})
+	})
 	mux.HandleFunc("/api/install-cmd", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		cmd, err := installCommand()

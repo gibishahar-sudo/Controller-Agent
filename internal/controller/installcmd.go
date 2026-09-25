@@ -49,6 +49,37 @@ func ghToken() string {
 	return ""
 }
 
+// ghTokenPath is where a UI-saved token lives (next to the binary so it
+// survives restarts; 0600).
+func ghTokenPath() string {
+	if exe, err := os.Executable(); err == nil {
+		return filepath.Join(filepath.Dir(exe), "gh_token.txt")
+	}
+	return "gh_token.txt"
+}
+
+// setGhToken stores a GitHub token for install-cmd asset resolution and
+// clears cached commands (they embed the token).
+func setGhToken(tok string) error {
+	tok = strings.TrimSpace(tok)
+	if tok == "" {
+		return fmt.Errorf("empty token")
+	}
+	if len(tok) < 20 {
+		return fmt.Errorf("token too short to be valid")
+	}
+	if err := os.WriteFile(ghTokenPath(), []byte(tok+"\n"), 0600); err != nil {
+		return err
+	}
+	installCmdMu.Lock()
+	installCmdCach = map[string]string{}
+	installCmdMu.Unlock()
+	ghAssetIDMu.Lock()
+	ghAssetIDCach = map[string]int64{}
+	ghAssetIDMu.Unlock()
+	return nil
+}
+
 func ghHeaders(tok string) map[string]string {
 	h := map[string]string{
 		"Accept":               "application/vnd.github+json",

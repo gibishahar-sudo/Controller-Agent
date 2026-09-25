@@ -3,6 +3,7 @@ package controller
 import (
 	"fmt"
 	"testing"
+	"time"
 )
 
 // verOlderThan gates the 1.45 update-required flag.
@@ -109,6 +110,42 @@ func TestAssembleCamFrag(t *testing.T) {
 	}
 	if isCamFragLine("data:image/jpeg;base64,QUJD") {
 		t.Fatal("data URL mistaken for frag")
+	}
+}
+
+// supersededRow evicts only stale, version-mismatched same-host rows.
+func TestSupersededRow(t *testing.T) {
+	now := time.Now()
+	mk := func(id, host, ver string, ago time.Duration) (string, *AgentConn) {
+		ac := &AgentConn{id: id, hostname: host, version: ver}
+		ac.lastSeenMu.Lock()
+		ac.lastSeen = now.Add(-ago)
+		ac.lastSeenMu.Unlock()
+		return id, ac
+	}
+	idOld, old := mk("agent-mqtt-H-1", "H", "1.45.8", 10*time.Minute)
+	if !supersededRow(idOld, old, "agent-mqtt-H-2", "H", "1.45.9", now) {
+		t.Fatal("stale old-version duplicate not evicted")
+	}
+	_, live := mk("agent-mqtt-H-3", "H", "1.45.8", 10*time.Second)
+	if supersededRow("agent-mqtt-H-3", live, "agent-mqtt-H-2", "H", "1.45.9", now) {
+		t.Fatal("fresh old-version row evicted (slow sibling handshake)")
+	}
+	_, same := mk("agent-mqtt-H-4", "H", "1.45.9", 10*time.Minute)
+	if supersededRow("agent-mqtt-H-4", same, "agent-mqtt-H-2", "H", "1.45.9", now) {
+		t.Fatal("stale same-version sibling evicted")
+	}
+	_, other := mk("agent-mqtt-X-1", "X", "1.45.8", 10*time.Minute)
+	if supersededRow("agent-mqtt-X-1", other, "agent-mqtt-H-2", "H", "1.45.9", now) {
+		t.Fatal("different-host row evicted")
+	}
+	_, self := mk("agent-mqtt-H-2", "H", "1.45.9", 10*time.Minute)
+	if supersededRow("agent-mqtt-H-2", self, "agent-mqtt-H-2", "H", "1.45.9", now) {
+		t.Fatal("confirmed row evicted itself")
+	}
+	_, unk := mk("agent-mqtt-H-5", "H", "", 10*time.Minute)
+	if !supersededRow("agent-mqtt-H-5", unk, "agent-mqtt-H-2", "H", "1.45.9", now) {
+		t.Fatal("stale unknown-version row not evicted")
 	}
 }
 

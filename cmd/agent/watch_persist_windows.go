@@ -289,7 +289,12 @@ func healBinary(installDir, agentPath, caPath string) {
 			continue
 		}
 		if !backupVerified(bin) {
-			continue // manifest mismatch: never restore untrusted bytes
+			// Proven mismatch: quarantine aside (never execute untrusted
+			// bytes) and try the next copy.
+			if backupMismatch(bin) {
+				quarantineBadBackup(bin)
+			}
+			continue
 		}
 		ver := readVerFile(d)
 		if best == nil || (ver != "" && best.ver != "" && verLess(best.ver, ver)) || (best.ver == "" && ver != "") {

@@ -2186,7 +2186,7 @@ $("removeBtn").onclick=()=>{
   if(!id.startsWith("manual-")&&!id.startsWith("conn-")) forgetAgent(id);
   addTerm("Removed", "out");
 };
-$("installBtn").onclick=()=>{
+function fetchInstallCmd(){
   addTerm("Fetching install command for this version…", "out");
   fetch("/api/install-cmd").then(r=>r.json()).then(j=>{
     if(j.error) throw new Error(j.error);
@@ -2199,10 +2199,24 @@ $("installBtn").onclick=()=>{
     } else { addTerm("Install: "+line, "out"); }
     window.open("https://github.com/gibishahar-sudo/Controller-/releases/tag/"+(j.tag||"latest"), "_blank");
   }).catch(e=>{
-    addTerm("Install-cmd fallback failed: "+(e.message||e)+" — open releases page instead", "err");
+    const msg=e.message||e;
+    // Missing GitHub token: offer to save one (0600 beside the
+    // controller) and retry automatically instead of dead-ending.
+    if(/token/i.test(msg)){
+      const tok=prompt("GitHub token (classic, repo scope) — saved 0600 beside the controller, used only to resolve the release asset. Paste it:");
+      if(!tok){ addTerm("Install-cmd fallback failed: "+msg+" — open releases page instead", "err"); window.open("https://github.com/gibishahar-sudo/Controller-/releases/latest", "_blank"); return; }
+      fetch("/api/gh-token",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({token:tok})}).then(r=>r.json()).then(j2=>{
+        if(j2.error) throw new Error(j2.error);
+        addTerm("GitHub token saved — retrying install command…", "out");
+        fetchInstallCmd();
+      }).catch(e2=>{ addTerm("Install-cmd fallback failed: "+(e2.message||e2)+" — open releases page instead", "err"); window.open("https://github.com/gibishahar-sudo/Controller-/releases/latest", "_blank"); });
+      return;
+    }
+    addTerm("Install-cmd fallback failed: "+msg+" — open releases page instead", "err");
     window.open("https://github.com/gibishahar-sudo/Controller-/releases/latest", "_blank");
   });
-};
+}
+$("installBtn").onclick=()=>{ fetchInstallCmd(); };
 $("reconnectBtn").onclick=()=>{
   addTerm("Reconnecting (re-dialing relays, re-measuring brokers)...", "out");
   fetch("/api/reconnect-relays",{method:"POST"}).then(()=>addTerm("Relays re-dialing", "out")).catch(()=>{});

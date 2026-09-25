@@ -1727,6 +1727,7 @@ func (s *Server) noteHello(id, hostname, ver, bad, to, prot, tamp, mode string) 
 				delete(s.updStaged, hostname)
 				s.updStagedMu.Unlock()
 				log.Printf("[update] %s reached v%s ✓", hostname, ver)
+				s.evictSupersededDuplicates(hostname, id, ver)
 				s.broadcastWS(map[string]interface{}{"type": "update-progress", "id": id, "hostname": hostname, "sent": 1, "total": 1, "status": "done"})
 				s.broadcastWS(map[string]interface{}{"type": "output", "id": id, "data": fmt.Sprintf("update to %s DONE ✓ now v%s", hostname, ver), "success": true})
 			} else if ver != version.DesktopAgentVersion {
@@ -2549,6 +2550,47 @@ func (s *Server) disconnectAgent(id string) {
 	}
 	s.removeAgent(aid)
 	fmt.Printf("\n[-] Disconnected %s (%s) — agent service keeps running, PC untouched\n> ", name, aid)
+}
+
+// supersededRow reports whether a same-hostname row is a stale duplicate
+// of the confirmed (keepID, ver) process: different id, version that is
+// not the confirmed one, and unseen past the relay-stale horizon. Live
+// sibling transports (current version, or recently seen) never qualify.
+func supersededRow(aid string, ac *AgentConn, keepID, hostname, ver string, now time.Time) bool {
+	if aid == keepID || ac.hostname != hostname {
+		return false
+	}
+	if ac.version == ver {
+		return false
+	}
+	return now.Sub(ac.seen()) > relayStaleAfter
+}
+
+// evictSupersededDuplicates drops other records for the same hostname
+// once one of them confirms the new version: the old rows are dead
+// processes (killed by the update restart / singleton), kept only as
+// tombstones. Only stale, version-mismatched rows go — a live sibling
+// transport on the current version is never touched.
+func (s *Server) evictSupersededDuplicates(hostname, keepID, ver string) {
+	if hostname == "" || ver == "" {
+		return
+	}
+	var dead []string
+	s.agentsMu.RLock()
+	now := time.Now()
+	for aid, ac := range s.agents {
+		if supersededRow(aid, ac, keepID, hostname, ver, now) {
+			dead = append(dead, aid)
+		}
+	}
+	s.agentsMu.RUnlock()
+	for _, aid := range dead {
+		log.Printf("[update] evicting stale duplicate %s (%s)", aid, hostname)
+		s.removeAgent(aid)
+	}
+	if len(dead) > 0 {
+		s.broadcastWS(map[string]interface{}{"type": "output", "id": keepID, "data": fmt.Sprintf("cleared %d stale duplicate row(s) for %s", len(dead), hostname), "success": true})
+	}
 }
 
 func (s *Server) removeAgent(id string) {

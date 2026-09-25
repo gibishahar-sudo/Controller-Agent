@@ -121,12 +121,19 @@ func (w *watchCfg) refreshStaleBackups() {
 			continue // same version, different bytes: tamper, owned by verifyBinary
 		}
 		_ = os.MkdirAll(d.dir, 0755)
-		_ = os.WriteFile(d.bin, instBin, 0755)
+		// Crash-safe order: binary via temp+rename, then cert, manifest,
+		// version LAST as the commit marker. Any torn state therefore has
+		// a stale version and lands back in this converge path — never in
+		// the skip branch above with a mismatched manifest that would read
+		// as tampering.
+		if err := writeFileAtomic(d.bin, instBin, 0755); err != nil {
+			continue
+		}
 		if cb, err := os.ReadFile(w.caPath); err == nil {
 			_ = os.WriteFile(d.cert, cb, 0644)
 		}
-		_ = os.WriteFile(d.ver, []byte(instVer+"\n"), 0644)
 		writeBackupManifest(d.dir, instVer, w.agentPath)
+		_ = os.WriteFile(d.ver, []byte(instVer+"\n"), 0644)
 		if tb, err := os.ReadFile(filepath.Join(w.installDir, "token.txt")); err == nil && len(bytes.TrimSpace(tb)) > 0 {
 			_ = os.WriteFile(d.tok, tb, 0600)
 		}
@@ -174,6 +181,50 @@ func writeBackupManifest(dir, ver, exePath string) {
 	_ = os.WriteFile(filepath.Join(dir, "integrity.json"), b, 0644)
 }
 
+// writeFileAtomic writes via temp+rename so a crash/power loss can never
+// leave a torn backup (half-written exe with a fresh manifest or vice
+// versa — both look exactly like tampering to backupVerified).
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, perm); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+// quarantineBadBackup renames an integrity-failed backup aside (with
+// timestamp) instead of deleting it: forensics stay possible, and the
+// next refreshStaleBackups pass re-converges a clean copy. Returns the
+// quarantine path or "".
+func quarantineBadBackup(exePath string) string {
+	q := fmt.Sprintf("%s.quarantined-%d", exePath, time.Now().Unix())
+	if err := os.Rename(exePath, q); err != nil {
+		log.Printf("[watch] quarantine failed for %s: %v", exePath, err)
+		return ""
+	}
+	log.Printf("[watch] quarantined integrity-failed backup %s -> %s", exePath, q)
+	return q
+}
+
+// backupMismatch reports a PROVEN mismatch: manifest present, parseable,
+// non-empty sha, and bytes differ. Absent/unreadable manifests are legacy
+// (accepted by backupVerified) and never count as mismatch.
+func backupMismatch(exePath string) bool {
+	raw, err := os.ReadFile(filepath.Join(filepath.Dir(exePath), "integrity.json"))
+	if err != nil {
+		return false
+	}
+	var m struct {
+		V   string `json:"v"`
+		SHA string `json:"sha"`
+	}
+	if err := json.Unmarshal(raw, &m); err != nil || m.SHA == "" {
+		return false
+	}
+	h := fileHash(exePath)
+	return h != "" && h != m.SHA
+}
+
 // backupVerified reports whether exePath is trustworthy: no manifest
 // (pre-v1.44 copies) means accept, otherwise the recorded sha must match.
 func backupVerified(exePath string) bool {
@@ -190,8 +241,14 @@ func backupVerified(exePath string) bool {
 	}
 	h := fileHash(exePath)
 	if h == "" || h != m.SHA {
-		log.Printf("[watch] backup %s FAILED integrity (manifest %s...)", exePath, m.SHA[:16])
-		setProtAlarm("backup binary failed integrity check")
+		// No alarm here: pickBackup quarantines proven mismatches and
+		// trips the wire only when nothing usable remains (avoids latching
+		// on transient mid-write states).
+		man := m.SHA
+		if len(man) > 16 {
+			man = man[:16]
+		}
+		log.Printf("[watch] backup %s FAILED integrity (manifest %s...)", exePath, man)
 		return false
 	}
 	return true
@@ -443,6 +500,7 @@ func (w *watchCfg) pickBackup() (bin, cert string) {
 			filepath.Join(v, "server.crt"),
 		})
 	}
+	mismatched := 0
 	for _, cand := range cands {
 		if _, err := os.Stat(cand[0]); err != nil {
 			continue
@@ -451,11 +509,20 @@ func (w *watchCfg) pickBackup() (bin, cert string) {
 			continue
 		}
 		// backupVerified accepts legacy copies (no manifest) and
-		// manifest-matching copies; a manifest MISMATCH refuses the copy
-		// outright (never execute bytes that fail integrity).
+		// manifest-matching copies. A PROVEN mismatch quarantines the
+		// copy aside (forensics preserved, never executed) instead of
+		// bricking recovery; the tripwire fires only if nothing usable
+		// remains.
 		if backupVerified(cand[0]) {
 			return cand[0], cand[1]
 		}
+		if backupMismatch(cand[0]) {
+			mismatched++
+			quarantineBadBackup(cand[0])
+		}
+	}
+	if mismatched > 0 {
+		setProtAlarm("backup binary failed integrity check")
 	}
 	return "", ""
 }
@@ -548,25 +615,34 @@ func (w *watchCfg) restoreBinary() {
 			}
 		}
 	}
+	// syncBackupDir copies a whole backup slot (binary atomically, cert,
+	// version, manifest, token): a partial copy (exe without its manifest)
+	// reads as tampering, so the set always travels together.
+	syncBackupDir := func(srcDir, dstDir, dstBin, dstCert string) {
+		_ = os.MkdirAll(dstDir, 0755)
+		if b, err := os.ReadFile(filepath.Join(srcDir, "MicrosoftWindowsClient.exe")); err == nil {
+			_ = writeFileAtomic(dstBin, b, 0755)
+		}
+		if b, err := os.ReadFile(filepath.Join(srcDir, "server.crt")); err == nil {
+			_ = os.WriteFile(dstCert, b, 0644)
+		}
+		if b, err := os.ReadFile(filepath.Join(srcDir, "version.txt")); err == nil {
+			_ = os.WriteFile(filepath.Join(dstDir, "version.txt"), b, 0644)
+		}
+		if b, err := os.ReadFile(filepath.Join(srcDir, "integrity.json")); err == nil {
+			_ = os.WriteFile(filepath.Join(dstDir, "integrity.json"), b, 0644)
+		}
+		if b, err := os.ReadFile(filepath.Join(srcDir, "token.txt")); err == nil && len(bytes.TrimSpace(b)) > 0 {
+			_ = os.WriteFile(filepath.Join(dstDir, "token.txt"), b, 0600)
+		}
+	}
 	if _, err := os.Stat(w.backupAgent); os.IsNotExist(err) {
 		if _, err2 := os.Stat(w.backupAgent2); err2 == nil {
-			_ = os.MkdirAll(w.backupDir, 0755)
-			if b, err := os.ReadFile(w.backupAgent2); err == nil {
-				_ = os.WriteFile(w.backupAgent, b, 0755)
-			}
-			if b, err := os.ReadFile(w.backupCert2); err == nil {
-				_ = os.WriteFile(w.backupCert, b, 0644)
-			}
+			syncBackupDir(w.backupDir2, w.backupDir, w.backupAgent, w.backupCert)
 			log.Printf("[watch] re-synced primary backup from secondary")
 		}
 	} else if _, err := os.Stat(w.backupAgent2); os.IsNotExist(err) {
-		_ = os.MkdirAll(w.backupDir2, 0755)
-		if b, err := os.ReadFile(w.backupAgent); err == nil {
-			_ = os.WriteFile(w.backupAgent2, b, 0755)
-		}
-		if b, err := os.ReadFile(w.backupCert); err == nil {
-			_ = os.WriteFile(w.backupCert2, b, 0644)
-		}
+		syncBackupDir(w.backupDir, w.backupDir2, w.backupAgent2, w.backupCert2)
 		log.Printf("[watch] re-synced secondary backup from primary")
 	}
 }
