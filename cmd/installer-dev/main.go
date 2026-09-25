@@ -30,9 +30,9 @@ func hideWindow(cmd *exec.Cmd) *exec.Cmd {
 	return cmd
 }
 
-// hiddenExec is a shorthand for hideWindow(hiddenExec(...)).
+// hiddenExec is a shorthand for hideWindow(exec.Command(...)).
 func hiddenExec(name string, args ...string) *exec.Cmd {
-	return hideWindow(hiddenExec(name, args...))
+	return hideWindow(exec.Command(name, args...))
 }
 
 var (
