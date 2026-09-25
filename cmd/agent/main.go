@@ -1258,6 +1258,7 @@ func relayListenOnce(a *agent, hn, user, me, caFile string) error {
 	// to heal silent broker-side subscription drops (broker loses subs without TCP close).
 	var lastInbound atomic.Int64
 	lastInbound.Store(time.Now().UnixNano())
+	redialCh := make(chan struct{}, 1) // watchdog -> main loop: break out and re-dial
 	go func() {
 		ticker := time.NewTicker(60 * time.Second)
 		defer ticker.Stop()
@@ -1268,14 +1269,18 @@ func relayListenOnce(a *agent, hn, user, me, caFile string) error {
 			case <-ticker.C:
 				if time.Since(time.Unix(0, lastInbound.Load())) > 10*time.Minute {
 					log.Printf("[!] mqtt listen: no inbound messages for 10min, forcing re-dial")
-					return // triggers reconnect via main loop
+					select {
+					case redialCh <- struct{}{}:
+					default:
+					}
+					return
 				}
 			}
 		}
 	}()
 
 	discCh := make(chan struct{}, 1)
-	if err := bus.SubscribeCmd(func(env relay.Envelope) {
+	onCmd := func(env relay.Envelope) {
 		lastInbound.Store(time.Now().UnixNano())
 		payload := env.Payload
 		if env.Enc {
@@ -1385,7 +1390,8 @@ func relayListenOnce(a *agent, hn, user, me, caFile string) error {
 			default:
 			}
 		}
-	}); err != nil {
+	}
+	if err := bus.SubscribeCmd(onCmd); err != nil {
 		return err
 	}
 	announce := func() {
@@ -1397,12 +1403,22 @@ func relayListenOnce(a *agent, hn, user, me, caFile string) error {
 	announce()
 	ticker := time.NewTicker(60 * time.Second)
 	defer ticker.Stop()
+	resubTicker := time.NewTicker(5 * time.Minute) // heal broker-side amnesia without a full re-dial
+	defer resubTicker.Stop()
 	for {
 		select {
 		case <-a.closing:
 			return nil
 		case <-discCh:
 			return nil
+		case <-redialCh:
+			return fmt.Errorf("mqtt listen inbound watchdog: 10min without inbound, re-dialing")
+		case <-resubTicker.C:
+			if err := bus.SubscribeCmd(onCmd); err != nil {
+				dlog.Printf("[listen] periodic re-subscribe failed: %v", err)
+			} else {
+				dlog.Printf("[listen] periodic re-subscribe ok")
+			}
 		case <-ticker.C:
 			if relaySessionActive.Load() {
 				return nil // full session took over; exit, outer loop stands by
@@ -1450,6 +1466,7 @@ func (a *agent) connectViaMQTT() error {
 	// to heal silent broker-side subscription drops (broker loses subs without TCP close).
 	var lastInbound atomic.Int64
 	lastInbound.Store(time.Now().UnixNano())
+	redialCh := make(chan struct{}, 1) // watchdog -> main loop: break out and re-dial
 	go func() {
 		ticker := time.NewTicker(60 * time.Second)
 		defer ticker.Stop()
@@ -1460,14 +1477,18 @@ func (a *agent) connectViaMQTT() error {
 			case <-ticker.C:
 				if time.Since(time.Unix(0, lastInbound.Load())) > 10*time.Minute {
 					log.Printf("[!] mqtt: no inbound messages for 10min, forcing re-dial")
-					return // triggers reconnect via main loop
+					select {
+					case redialCh <- struct{}{}:
+					default:
+					}
+					return
 				}
 			}
 		}
 	}()
 
 	discCh := make(chan struct{}, 1) // user-ended session (callback runs on paho's thread)
-	if err := bus.SubscribeCmd(func(env relay.Envelope) {
+	onCmd := func(env relay.Envelope) {
 		lastInbound.Store(time.Now().UnixNano())
 		payload := env.Payload
 		if env.Enc {
@@ -1604,7 +1625,8 @@ func (a *agent) connectViaMQTT() error {
 				default:
 				}
 		}
-	}); err != nil {
+	}
+	if err := bus.SubscribeCmd(onCmd); err != nil {
 		return err
 	}
 
@@ -1625,6 +1647,8 @@ func (a *agent) connectViaMQTT() error {
 	announce()
 	announceTicker := time.NewTicker(announceEvery(25 * time.Second)) // quiet presence: the sweep still converges quickly on re-hello
 	defer announceTicker.Stop()
+	resubTicker := time.NewTicker(5 * time.Minute) // heal broker-side amnesia without a full re-dial
+	defer resubTicker.Stop()
 	mouseTicker := time.NewTicker(150 * time.Millisecond) // MQTT is cheap: near-direct cursor feel
 	defer mouseTicker.Stop()
 	lastX, lastY := -1, -1
@@ -1634,6 +1658,14 @@ func (a *agent) connectViaMQTT() error {
 			return nil
 		case <-discCh:
 			return nil
+		case <-redialCh:
+			return fmt.Errorf("mqtt inbound watchdog: 10min without inbound, re-dialing")
+		case <-resubTicker.C:
+			if err := bus.SubscribeCmd(onCmd); err != nil {
+				log.Printf("[!] mqtt: periodic re-subscribe failed: %v", err)
+			} else {
+				log.Printf("[*] mqtt: periodic re-subscribe ok")
+			}
 		case <-announceTicker.C:
 			if a.quietRemain() > 0 {
 				continue // stay quiet: don't re-announce a session the user ended

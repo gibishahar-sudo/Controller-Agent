@@ -3125,6 +3125,44 @@ func (s *Server) peerCount() int {
 // subscriptions, healing silent broker-side subscription drops without
 // requiring a full reconnect (which paho's ResumeSubs only covers on TCP
 // disconnect/reconnect).
+// subscribePrimaryBus registers hello + outputs + audio on a primary bus.
+// Shared by mqttLoop (initial dial) and resubscribeMQTT (periodic heal) so
+// both paths install identical callbacks and timestamp stores.
+func (s *Server) subscribePrimaryBus(nb *mqttrelay.CtrlBus) error {
+	if err := nb.Subscribe(func(topic string, env relay.Envelope) {
+		s.mqttLastMsg1.Store(time.Now().UnixNano())
+		s.handleMQTTMsg(topic, env)
+	}); err != nil {
+		return err
+	}
+	// Binary audio is best-effort: a failure here only loses audiobin
+	// on this bus (JSON audio still flows).
+	if err := nb.SubscribeBin(func(topic string, body []byte) {
+		s.mqttLastMsg1.Store(time.Now().UnixNano())
+		s.handleAudioBin(topic, body)
+	}); err != nil {
+		log.Printf("[mqtt] subscribe audiobin: %v", err)
+	}
+	return nil
+}
+
+// subscribeSecondaryBus is the secondary-bus twin (msg2 timestamp store).
+func (s *Server) subscribeSecondaryBus(nb *mqttrelay.CtrlBus) error {
+	if err := nb.Subscribe(func(topic string, env relay.Envelope) {
+		s.mqttLastMsg2.Store(time.Now().UnixNano())
+		s.handleMQTTMsg(topic, env)
+	}); err != nil {
+		return err
+	}
+	if err := nb.SubscribeBin(func(topic string, body []byte) {
+		s.mqttLastMsg2.Store(time.Now().UnixNano())
+		s.handleAudioBin(topic, body)
+	}); err != nil {
+		log.Printf("[mqtt] secondary subscribe audiobin: %v", err)
+	}
+	return nil
+}
+
 func (s *Server) mqttLoop() {
 	watch := time.NewTicker(20 * time.Second)
 	defer watch.Stop()
@@ -3152,10 +3190,7 @@ func (s *Server) mqttLoop() {
 				}
 				continue
 			}
-		if err := nb.Subscribe(func(topic string, env relay.Envelope) {
-			s.mqttLastMsg1.Store(time.Now().UnixNano())
-			s.handleMQTTMsg(topic, env)
-		}); err != nil {
+		if err := s.subscribePrimaryBus(nb); err != nil {
 			log.Printf("[mqtt] subscribe: %v", err)
 			nb.Close()
 			select {
@@ -3164,12 +3199,6 @@ func (s *Server) mqttLoop() {
 			case <-time.After(5 * time.Second):
 			}
 			continue
-		}
-		if err := nb.SubscribeBin(func(topic string, body []byte) {
-			s.mqttLastMsg1.Store(time.Now().UnixNano())
-			s.handleAudioBin(topic, body)
-		}); err != nil {
-			log.Printf("[mqtt] subscribe audiobin: %v", err)
 		}
 		s.mqttMu.Lock()
 		s.mqttBus = nb
@@ -3183,20 +3212,9 @@ func (s *Server) mqttLoop() {
 			// Secondary listener on a different broker. Failure is routine
 			// (only 3 brokers configured) — silent retry next round.
 			if nb2, err := mqttrelay.DialControllerExcept(bus.Broker()); err == nil {
-				if err := nb2.Subscribe(func(topic string, env relay.Envelope) {
-					s.mqttLastMsg2.Store(time.Now().UnixNano())
-					s.handleMQTTMsg(topic, env)
-				}); err != nil {
+				if err := s.subscribeSecondaryBus(nb2); err != nil {
 					nb2.Close()
 				} else {
-					// Binary audio is best-effort: a failure here only
-					// loses audiobin on this bus (JSON audio still flows).
-					if err := nb2.SubscribeBin(func(topic string, body []byte) {
-						s.mqttLastMsg2.Store(time.Now().UnixNano())
-						s.handleAudioBin(topic, body)
-					}); err != nil {
-						log.Printf("[mqtt] secondary subscribe audiobin: %v", err)
-					}
 					s.mqttMu.Lock()
 					// Re-check: primary may have rotated while we dialed.
 					if s.mqttBus != nil && s.mqttBus.Broker() != nb2.Broker() {
@@ -3260,30 +3278,25 @@ func (s *Server) hasMQTTAgents() bool {
 // silent broker-side subscription drops (broker loses subs without TCP close).
 // paho's ResumeSubs only resubscribes on reconnect; this covers the case
 // where the connection stays up but the broker forgets our subscriptions.
+// Uses the same subscribe methods as the initial dial so both paths stay
+// identical; failures only log (the 90s silence watchdog re-dials dead buses).
 func (s *Server) resubscribeMQTT() {
 	s.mqttMu.Lock()
 	bus, bus2 := s.mqttBus, s.mqttBus2
 	s.mqttMu.Unlock()
-	for _, b := range []*mqttrelay.CtrlBus{bus, bus2} {
-		if b == nil {
-			continue
+	if bus != nil {
+		if err := s.subscribePrimaryBus(bus); err != nil {
+			log.Printf("[mqtt] resubscribe primary: %v", err)
+		} else {
+			log.Printf("[mqtt] periodic re-subscribe ok via %s", bus.Broker())
 		}
-		// Subscribe (JSON) — hello, out/+, audio/+, presence
-		if err := b.Subscribe(func(topic string, env relay.Envelope) {
-			s.mqttLastMsg1.Store(time.Now().UnixNano())
-			s.handleMQTTMsg(topic, env)
-		}); err != nil {
-			log.Printf("[mqtt] resubscribe JSON: %v", err)
-			continue
+	}
+	if bus2 != nil {
+		if err := s.subscribeSecondaryBus(bus2); err != nil {
+			log.Printf("[mqtt] resubscribe secondary: %v", err)
+		} else {
+			log.Printf("[mqtt] periodic secondary re-subscribe ok via %s", bus2.Broker())
 		}
-		// SubscribeBin (binary audio)
-		if err := b.SubscribeBin(func(topic string, body []byte) {
-			s.mqttLastMsg1.Store(time.Now().UnixNano())
-			s.handleAudioBin(topic, body)
-		}); err != nil {
-			log.Printf("[mqtt] resubscribe audiobin: %v", err)
-		}
-		log.Printf("[mqtt] periodic re-subscribe via %s", b.Broker())
 	}
 }
 
