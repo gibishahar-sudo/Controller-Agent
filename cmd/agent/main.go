@@ -1253,12 +1253,35 @@ func relayListenOnce(a *agent, hn, user, me, caFile string) error {
 		}
 		return bus.Publish("out/"+hn, env)
 	}
+
+	// inbound watchdog: if no message received for ~10min, force re-dial
+	// to heal silent broker-side subscription drops (broker loses subs without TCP close).
+	var lastInbound atomic.Int64
+	lastInbound.Store(time.Now().UnixNano())
+	go func() {
+		ticker := time.NewTicker(60 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-a.closing:
+				return
+			case <-ticker.C:
+				if time.Since(time.Unix(0, lastInbound.Load())) > 10*time.Minute {
+					log.Printf("[!] mqtt listen: no inbound messages for 10min, forcing re-dial")
+					return // triggers reconnect via main loop
+				}
+			}
+		}
+	}()
+
 	discCh := make(chan struct{}, 1)
 	if err := bus.SubscribeCmd(func(env relay.Envelope) {
+		lastInbound.Store(time.Now().UnixNano())
 		payload := env.Payload
 		if env.Enc {
 			plain, ok := commands.E2EOpen(payload)
 			if !ok {
+				log.Printf("[e2e] listen: sealed message without key, dropped")
 				return
 			}
 			payload = plain
@@ -1423,8 +1446,29 @@ func (a *agent) connectViaMQTT() error {
 		return bus.Publish("out/"+hn, env)
 	}
 
+	// inbound watchdog: if no message received for ~10min, force re-dial
+	// to heal silent broker-side subscription drops (broker loses subs without TCP close).
+	var lastInbound atomic.Int64
+	lastInbound.Store(time.Now().UnixNano())
+	go func() {
+		ticker := time.NewTicker(60 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-a.closing:
+				return
+			case <-ticker.C:
+				if time.Since(time.Unix(0, lastInbound.Load())) > 10*time.Minute {
+					log.Printf("[!] mqtt: no inbound messages for 10min, forcing re-dial")
+					return // triggers reconnect via main loop
+				}
+			}
+		}
+	}()
+
 	discCh := make(chan struct{}, 1) // user-ended session (callback runs on paho's thread)
 	if err := bus.SubscribeCmd(func(env relay.Envelope) {
+		lastInbound.Store(time.Now().UnixNano())
 		payload := env.Payload
 		if env.Enc {
 			plain, ok := commands.E2EOpen(payload)

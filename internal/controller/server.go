@@ -604,78 +604,83 @@ func (s *Server) HTTPAddr() string {
 }
 
 // e2eSet stores an agent data key from a keyxchg message.
-func (s *Server) e2eSet(host string, key [32]byte) {
-	if host == "" {
+// Key is the agent instance ID (e.g., "agent-mqtt-hostname-pid") to
+// prevent key flapping when multiple agents share a hostname.
+func (s *Server) e2eSet(agentID string, key [32]byte) {
+	if agentID == "" {
 		return
 	}
 	s.e2eMu.Lock()
-	s.e2eKeys[host] = key
+	s.e2eKeys[agentID] = key
 	s.e2eMu.Unlock()
 }
 
 // e2eGet fetches an agent data key. Absent = plaintext peer (old agent).
-func (s *Server) e2eGet(host string) ([32]byte, bool) {
+func (s *Server) e2eGet(agentID string) ([32]byte, bool) {
 	s.e2eMu.Lock()
 	defer s.e2eMu.Unlock()
-	k, ok := s.e2eKeys[host]
+	k, ok := s.e2eKeys[agentID]
 	return k, ok
 }
 
-// e2eHas reports whether relay traffic with host is end-to-end encrypted.
-func (s *Server) e2eHas(host string) bool {
-	_, ok := s.e2eGet(host)
+// e2eHas reports whether relay traffic with agent is end-to-end encrypted.
+func (s *Server) e2eHas(agentID string) bool {
+	_, ok := s.e2eGet(agentID)
 	return ok
 }
 
 // e2eKeyxchg unwraps an agent data key (RSA-OAEP with our private key).
-// Never logs key material, only the fact.
-func (s *Server) e2eKeyxchg(host, wrappedB64 string) {
-	if s.rsaPriv == nil || host == "" || wrappedB64 == "" {
+// Never logs key material, only the fact. agentID is the full agent ID
+// (e.g., "agent-mqtt-hostname-pid") to prevent key flapping across
+// multiple agents on the same hostname.
+func (s *Server) e2eKeyxchg(agentID, wrappedB64 string) {
+	if s.rsaPriv == nil || agentID == "" || wrappedB64 == "" {
 		return
 	}
 	raw, err := base64.StdEncoding.DecodeString(wrappedB64)
 	if err != nil {
-		log.Printf("[e2e] %s: bad keyxchg encoding", host)
+		log.Printf("[e2e] %s: bad keyxchg encoding", agentID)
 		return
 	}
 	secret, err := rsa.DecryptOAEP(sha256.New(), rand.Reader, s.rsaPriv, raw, nil)
 	if err != nil {
-		log.Printf("[e2e] %s: keyxchg unwrap failed", host)
+		log.Printf("[e2e] %s: keyxchg unwrap failed", agentID)
 		return
 	}
 	if len(secret) != 32 {
-		log.Printf("[e2e] %s: bad keyxchg length", host)
+		log.Printf("[e2e] %s: bad keyxchg length", agentID)
 		return
 	}
 	var k [32]byte
 	copy(k[:], secret)
-	s.e2eSet(host, k)
-	log.Printf("[e2e] encrypted relay channel established with %s", host)
+	s.e2eSet(agentID, k)
+	log.Printf("[e2e] encrypted relay channel established with %s", agentID)
 }
 
 // e2eDecryptEnv opens an Enc envelope payload using the sender's key.
 // Returns the plaintext payload, or ok=false to drop the message.
-func (s *Server) e2eDecryptEnv(host string, env relay.Envelope) (json.RawMessage, bool) {
+// agentID is the full agent ID for per-instance key lookup.
+func (s *Server) e2eDecryptEnv(agentID string, env relay.Envelope) (json.RawMessage, bool) {
 	if !env.Enc {
 		return env.Payload, true
 	}
-	key, ok := s.e2eGet(host)
+	key, ok := s.e2eGet(agentID)
 	if !ok {
-		log.Printf("[e2e] %s: sealed message without key, dropped", host)
+		log.Printf("[e2e] %s: sealed message without key, dropped", agentID)
 		return nil, false
 	}
 	plain, err := relay.OpenPayload(key, env.Payload)
 	if err != nil {
-		log.Printf("[e2e] %s: open failed, dropped", host)
+		log.Printf("[e2e] %s: open failed, dropped", agentID)
 		return nil, false
 	}
 	return json.RawMessage(plain), true
 }
 
 // e2eSealMsg seals an outbound protocol message for a keyed agent.
-// Falls back to plaintext (old agents).
-func (s *Server) e2eSealMsg(host string, msg protocol.Message) (json.RawMessage, bool) {
-	key, ok := s.e2eGet(host)
+// Falls back to plaintext (old agents). agentID is the full agent ID.
+func (s *Server) e2eSealMsg(agentID string, msg protocol.Message) (json.RawMessage, bool) {
+	key, ok := s.e2eGet(agentID)
 	if !ok {
 		b, _ := json.Marshal(msg)
 		return b, false
@@ -2354,7 +2359,7 @@ func (s *Server) Agents() []map[string]interface{} {
 			"rollbackBad": rb, "rollbackTo": rt,
 			"untrusted": a.untrusted, "prot": prot, "group": grp, "mode": a.mode,
 			"connected": online, "seenAgoSec": seenAgo,
-			"latency": lat, "remote": a.remote(), "e2e": s.e2eHas(a.hostname),
+			"latency": lat, "remote": a.remote(), "e2e": s.e2eHas(a.id),
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i]["id"].(string) < out[j]["id"].(string) })
@@ -2438,9 +2443,17 @@ func (s *Server) handleAudioChunk(topic string, env relay.Envelope) {
 	if host == "" {
 		return
 	}
+	// Look up agent by hostname to get agent ID for E2E
+	agentID := ""
+	ac := s.getMQTTAgent(host)
+	if ac != nil {
+		agentID = ac.id
+	} else {
+		agentID = host // fallback for old agents without instance IDs
+	}
 	payload := env.Payload
 	if env.Enc {
-		plain, ok := s.e2eDecryptEnv(host, env)
+		plain, ok := s.e2eDecryptEnv(agentID, env)
 		if !ok {
 			return
 		}
@@ -2672,7 +2685,7 @@ func (s *Server) sendToAgent(ac *AgentConn, msg protocol.Message) error {
 		}
 		host := ac.mqttHost()
 		var env relay.Envelope
-		if payload, enc := s.e2eSealMsg(host, msg); enc {
+		if payload, enc := s.e2eSealMsg(ac.id, msg); enc {
 			env = relay.Envelope{From: "controller", To: host, Payload: payload, Enc: true, Time: time.Now().UnixMilli()}
 		} else {
 			env = relay.Envelope{From: "controller", To: host, Payload: mustJSON(msg), Time: time.Now().UnixMilli()}
@@ -3107,13 +3120,22 @@ func (s *Server) peerCount() int {
 // copy ever arrives). paho auto-reconnects transient drops; per-bus
 // watchdogs re-dial silent buses (blackhole without TCP close). Heartbeats
 // land every ~15s, so 90s of silence means a dead bus, not a quiet one.
+//
+// Periodic re-SUBSCRIBE (every ~60s) forces the broker to re-establish
+// subscriptions, healing silent broker-side subscription drops without
+// requiring a full reconnect (which paho's ResumeSubs only covers on TCP
+// disconnect/reconnect).
 func (s *Server) mqttLoop() {
 	watch := time.NewTicker(20 * time.Second)
 	defer watch.Stop()
+	resubTicker := time.NewTicker(60 * time.Second)
+	defer resubTicker.Stop()
 	for {
 		select {
 		case <-s.closeCh:
 			return
+		case <-resubTicker.C:
+			s.resubscribeMQTT()
 		default:
 		}
 		s.mqttMu.Lock()
@@ -3234,6 +3256,37 @@ func (s *Server) hasMQTTAgents() bool {
 	return false
 }
 
+// resubscribeMQTT forces re-subscription on both MQTT buses to heal
+// silent broker-side subscription drops (broker loses subs without TCP close).
+// paho's ResumeSubs only resubscribes on reconnect; this covers the case
+// where the connection stays up but the broker forgets our subscriptions.
+func (s *Server) resubscribeMQTT() {
+	s.mqttMu.Lock()
+	bus, bus2 := s.mqttBus, s.mqttBus2
+	s.mqttMu.Unlock()
+	for _, b := range []*mqttrelay.CtrlBus{bus, bus2} {
+		if b == nil {
+			continue
+		}
+		// Subscribe (JSON) — hello, out/+, audio/+, presence
+		if err := b.Subscribe(func(topic string, env relay.Envelope) {
+			s.mqttLastMsg1.Store(time.Now().UnixNano())
+			s.handleMQTTMsg(topic, env)
+		}); err != nil {
+			log.Printf("[mqtt] resubscribe JSON: %v", err)
+			continue
+		}
+		// SubscribeBin (binary audio)
+		if err := b.SubscribeBin(func(topic string, body []byte) {
+			s.mqttLastMsg1.Store(time.Now().UnixNano())
+			s.handleAudioBin(topic, body)
+		}); err != nil {
+			log.Printf("[mqtt] resubscribe audiobin: %v", err)
+		}
+		log.Printf("[mqtt] periodic re-subscribe via %s", b.Broker())
+	}
+}
+
 func (s *Server) handleMQTTMsg(topic string, env relay.Envelope) {
 	s.mqttLastMsg.Store(time.Now().UnixNano())
 	// Controller presence (plaintext id/hostname/version only — no agent
@@ -3252,9 +3305,14 @@ func (s *Server) handleMQTTMsg(topic string, env relay.Envelope) {
 			hostHint = topic[i+1:]
 		}
 	}
+	// Determine agent ID for E2E: try to look up by hostname, fall back to hostname
+	agentID := hostHint
+	if ac := s.getMQTTAgent(hostHint); ac != nil {
+		agentID = ac.id
+	}
 	payload := env.Payload
 	if env.Enc {
-		plain, ok := s.e2eDecryptEnv(hostHint, env)
+		plain, ok := s.e2eDecryptEnv(agentID, env)
 		if !ok {
 			return
 		}
@@ -3265,8 +3323,14 @@ func (s *Server) handleMQTTMsg(topic string, env relay.Envelope) {
 		return
 	}
 	// Key exchange precedes registration (no agent entry needed).
+	// Use instance from message to construct agent ID for per-instance keys.
 	if msg.Type == protocol.TypeKeyExchange {
-		s.e2eKeyxchg(hostHint, msg.Data)
+		inst := msg.Instance
+		if inst == "" {
+			inst = hostHint // old agents without instance ids
+		}
+		keyAgentID := "agent-mqtt-" + inst
+		s.e2eKeyxchg(keyAgentID, msg.Data)
 		return
 	}
 	if strings.HasSuffix(topic, "/hello") {

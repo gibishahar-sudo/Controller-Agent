@@ -165,3 +165,30 @@ func TestAssembleCamFragOrder(t *testing.T) {
 		t.Fatalf("assembled = %q, %v", url, ok)
 	}
 }
+
+// E2E keys are per agent instance (agent-mqtt-host-pid), not per hostname,
+// so duplicate same-hostname agents never flap each other's channel.
+func TestE2EKeysPerInstance(t *testing.T) {
+	s := &Server{e2eKeys: map[string][32]byte{}}
+	var k1, k2 [32]byte
+	k1[0], k2[0] = 1, 2
+	a := "agent-mqtt-yigel-111"
+	b := "agent-mqtt-yigel-222"
+	s.e2eSet(a, k1)
+	s.e2eSet(b, k2)
+	if got, ok := s.e2eGet(a); !ok || got != k1 {
+		t.Fatal("instance A key not isolated")
+	}
+	if got, ok := s.e2eGet(b); !ok || got != k2 {
+		t.Fatal("instance B key not isolated")
+	}
+	if !s.e2eHas(a) || !s.e2eHas(b) {
+		t.Fatal("e2eHas should be true for both instances")
+	}
+	if s.e2eHas("agent-mqtt-yigel-333") {
+		t.Fatal("e2eHas should be false for unknown instance")
+	}
+	if _, ok := s.e2eGet("yigel"); ok {
+		t.Fatal("bare hostname must not resolve a key (prevents cross-instance flap)")
+	}
+}
