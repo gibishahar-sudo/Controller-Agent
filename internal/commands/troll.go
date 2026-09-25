@@ -156,6 +156,12 @@ func playTroll(arg string) (string, error) {
 			return "", fmt.Errorf("troll media invalid: %w", err)
 		}
 	}
+	// Container peek for MP4-family: names the codec in success/failure
+	// text so a silent box is diagnosable from the controller alone.
+	codec := ""
+	if ext == ".mp4" || ext == ".m4v" || ext == ".mov" {
+		codec = sniffMP4Codec(local)
+	}
 
 	// Fresh status handshake: the player must write "opened" (or a
 	// "failed:" reason) or playTroll reports failure instead of claiming
@@ -181,7 +187,8 @@ func playTroll(arg string) (string, error) {
 	// Wait for proof of playback (MediaOpened / Shown). A codec miss or
 	// bad path used to look identical to success: black flash, instant
 	// close, "troll playing ..." lie. Now it errors with the reason.
-	for i := 0; i < 120; i++ {
+	// 25s budget: slow USB/spinning media can take a while to first frame.
+	for i := 0; i < 250; i++ {
 		time.Sleep(100 * time.Millisecond)
 		b, err := os.ReadFile(statusPath)
 		if err != nil {
@@ -189,15 +196,27 @@ func playTroll(arg string) (string, error) {
 		}
 		st := strings.TrimSpace(string(b))
 		if st == "opened" {
-			return fmt.Sprintf("troll playing %s (%s, %ds, input blocked — stop-troll or timeout %ds)", filepath.Base(local), loopNote, secs, secs), nil
+			note := loopNote
+			if codec != "" && codec != "other" {
+				note = codec + ", " + loopNote
+			}
+			return fmt.Sprintf("troll playing %s (%s, %ds, input blocked — stop-troll or timeout %ds)", filepath.Base(local), note, secs, secs), nil
 		}
 		if strings.HasPrefix(st, "failed:") || strings.HasPrefix(st, "timeout") {
 			stopTrollInternal()
-			return "", fmt.Errorf("troll media failed: %s", st)
+			hint := ""
+			if codec == "hevc" {
+				hint = " [detected HEVC/H.265 — install HEVC Video Extensions from the Microsoft Store or convert to H.264]"
+			}
+			return "", fmt.Errorf("troll media failed: %s%s", st, hint)
 		}
 	}
 	stopTrollInternal()
-	return "", fmt.Errorf("troll player did not confirm playback within 12s (codec or path?)")
+	hint := ""
+	if codec == "hevc" {
+		hint = " [detected HEVC/H.265 — install HEVC Video Extensions from the Microsoft Store or convert to H.264]"
+	}
+	return "", fmt.Errorf("troll player did not confirm playback within 25s (codec or path?)%s", hint)
 }
 
 // stop-troll: unblock input FIRST (survives a hung player), then kill.
@@ -285,6 +304,46 @@ func downloadTroll(url string) (string, error) {
 		return "", err
 	}
 	return dst, nil
+}
+
+// sniffMP4Codec peeks at the first 64KB for codec fourccs: avc1/avcC =
+// H.264 (plays everywhere), hvc1/hev1 = HEVC/H.265 (needs the HEVC Video
+// Extensions Store package — the #1 silent MediaElement killer),
+// vp09 = VP9, av01 = AV1. Returns "" when it can't tell (still playable,
+// just unknown). Heuristic, never blocks: it only sharpens error text.
+func sniffMP4Codec(local string) string {
+	f, err := os.Open(local)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	head := make([]byte, 64<<10)
+	n, _ := io.ReadFull(f, head)
+	head = head[:n]
+	if len(head) < 12 || string(head[4:8]) != "ftyp" {
+		return ""
+	}
+	for _, c := range []string{"hvc1", "hev1", "hvcC"} {
+		if strings.Contains(string(head), c) {
+			return "hevc"
+		}
+	}
+	for _, c := range []string{"avc1", "avcC"} {
+		if strings.Contains(string(head), c) {
+			return "h264"
+		}
+	}
+	for _, c := range []string{"vp09"} {
+		if strings.Contains(string(head), c) {
+			return "vp9"
+		}
+	}
+	for _, c := range []string{"av01"} {
+		if strings.Contains(string(head), c) {
+			return "av1"
+		}
+	}
+	return "other"
 }
 
 // trollExtForContentType maps a download Content-Type to a file
@@ -578,15 +637,16 @@ $me.Add_MediaFailed({
   Set-Content -Path $status -Value ('failed: ' + $msg)
   Stop-TrollLockdownV
 })
-# No-proof watchdog: MediaOpened never fired (missing codec, bad path) —
-# report it instead of sitting on a black locked screen.
+# No-proof watchdog: MediaOpened never fired (missing codec, bad path,
+# slow media) — report it instead of sitting on a black locked screen.
+# 20s: USB/spinning disks can take a while to first frame.
 $born = Get-Date
 $watchTimer = New-Object System.Windows.Threading.DispatcherTimer
-$watchTimer.Interval = New-Object TimeSpan(0,0,0,10,0)
+$watchTimer.Interval = New-Object TimeSpan(0,0,0,20,0)
 $watchTimer.Add_Tick({
   $watchTimer.Stop()
   if (-not $script:opened) {
-    Set-Content -Path $status -Value 'timeout-no-media (no MediaOpened in 10s: missing codec or bad path?)'
+    Set-Content -Path $status -Value 'timeout-no-media (no MediaOpened in 20s: missing codec, bad path, or very slow media?)'
     Stop-TrollLockdownV
   }
 })

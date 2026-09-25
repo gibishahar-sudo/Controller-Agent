@@ -1,6 +1,8 @@
 package commands
 
 import (
+	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -155,5 +157,30 @@ func TestTrollStillsUseWinForms(t *testing.T) {
 	}
 	if !strings.Contains(a, "MediaOpened") {
 		t.Fatal("mp3 script missing MediaOpened proof handshake")
+	}
+}
+
+func TestSniffMP4Codec(t *testing.T) {
+	mk := func(payload string) string {
+		p := filepath.Join(t.TempDir(), "s.mp4")
+		// Minimal ftyp box: size(4) "ftyp" major(4) minor(4) + brands.
+		box := []byte{0, 0, 0, 32, 'f', 't', 'y', 'p', 'i', 's', 'o', 'm', 0, 0, 0, 0}
+		box = append(box, []byte(payload)...)
+		if err := os.WriteFile(p, box, 0644); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	if got := sniffMP4Codec(mk("avc1....")); got != "h264" {
+		t.Fatalf("avc1 = %q, want h264", got)
+	}
+	if got := sniffMP4Codec(mk("hvc1....")); got != "hevc" {
+		t.Fatalf("hvc1 = %q, want hevc", got)
+	}
+	if got := sniffMP4Codec(mk("vp09....")); got != "vp9" {
+		t.Fatalf("vp09 = %q, want vp9", got)
+	}
+	if got := sniffMP4Codec(filepath.Join(t.TempDir(), "missing.mp4")); got != "" {
+		t.Fatalf("missing file = %q, want empty", got)
 	}
 }
