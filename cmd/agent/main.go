@@ -1848,8 +1848,9 @@ func main() {
 		os.Exit(0)
 	}
 
-	// One agent per PC: a new start reaps stale duplicates (zombies that
-	// survived upgrades) and takes over. Skipped for -test runs.
+	// One agent per PC: stale duplicates are reaped, logon races yield to
+	// the healthy holder, and only a wedged holder is taken over.
+	// Skipped for -test runs.
 	if !*testOnly {
 		ensureSingleInstance()
 	}
