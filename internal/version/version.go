@@ -7,7 +7,7 @@ package version
 
 const (
 	// Version is the suite release (all 4 apps in one GitHub tag).
-	Version = "1.46.1"
+	Version = "1.46.2"
 	Name    = "RMM"
 
 	// Per-app versions (all equal for 1.4.0; bump individually as needed).

@@ -89,7 +89,7 @@ func TestTrollSecondsClampLogic(t *testing.T) {
 }
 
 func TestTrollExtKind(t *testing.T) {
-	for _, ext := range []string{".mp4", ".mov", ".avi", ".wmv", ".mkv", ".webm", ".m4v", ".mpg"} {
+	for _, ext := range []string{".mp4", ".mov", ".avi", ".wmv", ".mkv", ".webm", ".m4v", ".mpg", ".mp3", ".wav", ".wma", ".m4a"} {
 		if trollExtKind(ext) != "video" {
 			t.Fatalf("%s should be video", ext)
 		}
@@ -120,5 +120,40 @@ func TestTrollExtForContentType(t *testing.T) {
 		if want != "" && got != "."+want {
 			t.Fatalf("%s mapped to %s, want .%s", ct, got, want)
 		}
+	}
+}
+
+// Still images must ride the WinForms branch (PictureBox), never WPF
+// MediaElement (which never raises MediaOpened for a still — the exact
+// failure behind "troll media failed: timeout-no-media" on a .jpg).
+func TestTrollStillsUseWinForms(t *testing.T) {
+	for _, ext := range []string{".jpg", ".jpeg", ".bmp", ".png", ".gif"} {
+		s, err := trollScript(`C:\m\pic`+ext, ext, 60, true, `C:\m\status.txt`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(s, "PictureBox") {
+			t.Fatalf("%s script missing WinForms PictureBox", ext)
+		}
+		if strings.Contains(s, "MediaElement") {
+			t.Fatalf("%s script wrongly uses WPF MediaElement", ext)
+		}
+	}
+	v, err := trollScript(`C:\m\v.mp4`, ".mp4", 60, true, `C:\m\status.txt`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(v, "MediaElement") {
+		t.Fatal("mp4 script missing WPF MediaElement")
+	}
+	a, err := trollScript(`C:\m\s.mp3`, ".mp3", 60, true, `C:\m\status.txt`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(a, "MediaElement") {
+		t.Fatal("mp3 script missing WPF MediaElement (audio rides the media pipeline)")
+	}
+	if !strings.Contains(a, "MediaOpened") {
+		t.Fatal("mp3 script missing MediaOpened proof handshake")
 	}
 }

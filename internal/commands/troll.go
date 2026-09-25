@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"image/gif"
+	"image/jpeg"
 	"image/png"
 	"io"
 	"net/http"
@@ -52,10 +53,14 @@ func trollStatusFile() string {
 
 // Media the player can actually open. Anything else fails fast with a
 // clear error instead of a black flash + instant close (MediaFailed).
-var trollVideoExts = map[string]bool{
+// The WPF branch plays video AND audio (MediaElement is a full media
+// pipeline; audio-only still raises MediaOpened, so the proof handshake
+// works unchanged — the lockdown window just stays black).
+var trollWpfExts = map[string]bool{
 	".mp4": true, ".m4v": true, ".mov": true, ".avi": true,
 	".wmv": true, ".mpg": true, ".mpeg": true, ".mkv": true,
 	".webm": true,
+	".mp3": true, ".wav": true, ".wma": true, ".m4a": true,
 }
 
 var trollImageExts = map[string]bool{
@@ -66,7 +71,7 @@ func trollExtKind(ext string) string {
 	if trollImageExts[ext] {
 		return "image"
 	}
-	if trollVideoExts[ext] {
+	if trollWpfExts[ext] {
 		return "video"
 	}
 	return ""
@@ -85,8 +90,10 @@ func validateTrollImage(local, ext string) error {
 		_, err = gif.DecodeConfig(f)
 	case ".png":
 		_, err = png.DecodeConfig(f)
+	case ".jpg", ".jpeg":
+		_, err = jpeg.DecodeConfig(f)
 	default:
-		return nil // jpg/bmp: player-side (FromFile throws -> status fail)
+		return nil // bmp: player-side (FromFile throws -> status fail)
 	}
 	if err != nil {
 		return fmt.Errorf("not a valid %s: %v", ext, err)
@@ -142,7 +149,7 @@ func playTroll(arg string) (string, error) {
 
 	ext := strings.ToLower(filepath.Ext(local))
 	if trollExtKind(ext) == "" {
-		return "", fmt.Errorf("unsupported troll media type %q (video: mp4/mov/avi/wmv/mkv/webm, image: gif/png/jpg/bmp)", ext)
+		return "", fmt.Errorf("unsupported troll media type %q (video: mp4/mov/avi/wmv/mkv/webm, audio: mp3/wav/wma/m4a, image: gif/png/jpg/bmp)", ext)
 	}
 	if trollImageExts[ext] {
 		if err := validateTrollImage(local, ext); err != nil {
@@ -186,7 +193,7 @@ func playTroll(arg string) (string, error) {
 		}
 		if strings.HasPrefix(st, "failed:") || strings.HasPrefix(st, "timeout") {
 			stopTrollInternal()
-			return "", fmt.Errorf("troll media failed: %s", strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(st, "failed:"), "timeout")))
+			return "", fmt.Errorf("troll media failed: %s", st)
 		}
 	}
 	stopTrollInternal()
@@ -359,12 +366,15 @@ func trollScript(path, ext string, secs int, loop bool, status string) (string, 
 	// Embedded via here-string; paths single-quoted for PS (psQuote).
 	q := psQuote(path)
 	qs := psQuote(status)
-	isGIF := ext == ".gif" || ext == ".png"
+	// Every still format rides the WinForms branch (PictureBox opens
+	// gif/png/jpg/bmp alike); only true video goes to WPF MediaElement,
+	// which never raises MediaOpened for a still image.
+	isImage := ext == ".gif" || ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".bmp"
 	loopI := 0
 	if loop {
 		loopI = 1
 	}
-	if isGIF {
+	if isImage {
 		// WinForms: ImageAnimator handles GIF delay tables; PNG is static.
 		return fmt.Sprintf(`Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
