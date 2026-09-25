@@ -62,20 +62,39 @@ func randHex(n int) string {
 	return hex.EncodeToString(b)
 }
 
-func dial(broker, clientID string, onConnect paho.OnConnectHandler) (paho.Client, error) {
+// baseOptions holds every connection invariant both sides rely on,
+// most critically ResumeSubs: without it, paho drops every subscription
+// on reconnect while the connection itself recovers silently — agents kept
+// publishing hellos while processing nothing inbound, with zero errors
+// anywhere (the fleet-wide deaf-sub outage).
+func baseOptions(broker, clientID string, onConnect paho.OnConnectHandler) *paho.ClientOptions {
 	opts := paho.NewClientOptions()
 	opts.AddBroker(broker)
 	opts.SetClientID(clientID)
 	opts.SetCleanSession(true)
 	opts.SetAutoReconnect(true)
+	opts.SetResumeSubs(true)
 	opts.SetMaxReconnectInterval(30 * time.Second)
+	if onConnect == nil {
+		// Visibility by default: every (re)connect is logged, so a
+		// recovered connection with lost subscriptions can never again
+		// pass unnoticed. ResumeSubs above restores the subscriptions.
+		onConnect = func(_ paho.Client) {
+			log.Printf("[mqtt] (re)connected (%s), subscriptions resumed", broker)
+		}
+	}
+	opts.SetOnConnectHandler(onConnect)
+	return opts
+}
+
+func dial(broker, clientID string, onConnect paho.OnConnectHandler) (paho.Client, error) {
+	opts := baseOptions(broker, clientID, onConnect)
 	opts.SetConnectTimeout(5 * time.Second)
 	opts.SetKeepAlive(30 * time.Second)
 	opts.SetPingTimeout(10 * time.Second)
 	if strings.HasPrefix(broker, "ssl://") || strings.HasPrefix(broker, "tls://") || strings.HasPrefix(broker, "wss://") {
 		opts.SetTLSConfig(&tls.Config{MinVersion: tls.VersionTLS12})
 	}
-	opts.SetOnConnectHandler(onConnect)
 	opts.SetConnectionLostHandler(func(_ paho.Client, err error) {
 		log.Printf("[mqtt] connection lost (%s): %v", broker, err)
 	})
