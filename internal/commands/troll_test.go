@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"encoding/binary"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -261,5 +262,92 @@ func TestTrollProbeScriptMarkers(t *testing.T) {
 		if strings.Contains(s, bad) {
 			t.Fatalf("probe script must not lock down (%q present)", bad)
 		}
+	}
+}
+
+// mkIndexMP4 builds a synthetic MP4: ftyp + mdat(size) + moov with a
+// proper trak>mdia>minf>stbl>stco nesting holding the given chunks.
+func mkIndexMP4(t *testing.T, mdatSize int, chunks []uint32) string {
+	t.Helper()
+	box := func(typ string, payload []byte) []byte {
+		b := make([]byte, 8+len(payload))
+		binary.BigEndian.PutUint32(b[0:4], uint32(len(b)))
+		copy(b[4:8], []byte(typ))
+		copy(b[8:], payload)
+		return b
+	}
+	p := filepath.Join(t.TempDir(), "idx.mp4")
+	f, err := os.Create(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	ftyp := []byte{0, 0, 0, 20, 'f', 't', 'y', 'p', 'i', 's', 'o', 'm', 0, 0, 0, 0, 'i', 's', 'o', '2'}
+	if _, err := f.Write(ftyp); err != nil {
+		t.Fatal(err)
+	}
+	mdatHdr := make([]byte, 8)
+	binary.BigEndian.PutUint32(mdatHdr[0:4], uint32(8+mdatSize))
+	copy(mdatHdr[4:8], []byte("mdat"))
+	if _, err := f.Write(mdatHdr); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write(make([]byte, mdatSize)); err != nil {
+		t.Fatal(err)
+	}
+	stco := make([]byte, 8+4*len(chunks))
+	binary.BigEndian.PutUint32(stco[4:8], uint32(len(chunks)))
+	for i, c := range chunks {
+		binary.BigEndian.PutUint32(stco[8+i*4:], c)
+	}
+	stbl := box("stbl", box("stco", stco))
+	minf := box("minf", stbl)
+	mdia := box("mdia", minf)
+	trak := box("trak", mdia)
+	moov := box("moov", trak)
+	if _, err := f.Write(moov); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func TestMp4IndexSane(t *testing.T) {
+	mdatSize := 8 << 20 // above the 4MB coverage-rule floor
+	base := uint32(20 + 8) // ftyp(20) + mdat header(8)
+	// 10+ entries per table (smaller tables are skipped as thumbnails).
+	var good []uint32
+	for i := 0; i < 10; i++ {
+		good = append(good, base+100+uint32(i)*(uint32(mdatSize)-1000)/10)
+	}
+	if ok, reason := mp4IndexSane(mkIndexMP4(t, mdatSize, good)); !ok {
+		t.Fatalf("sane index rejected: %s", reason)
+	}
+	// Clustered: all chunks inside the first KB of an 8MB mdat.
+	var bad []uint32
+	for i := 0; i < 10; i++ {
+		bad = append(bad, base+100+uint32(i)*90)
+	}
+	if ok, reason := mp4IndexSane(mkIndexMP4(t, mdatSize, bad)); ok {
+		t.Fatal("clustered index accepted")
+	} else if !strings.Contains(reason, "covers only") {
+		t.Fatalf("wrong reason: %s", reason)
+	}
+	// Escaped: chunk past mdat end.
+	esc := append(append([]uint32{}, good[:9]...), base+uint32(mdatSize)+50000)
+	if ok, _ := mp4IndexSane(mkIndexMP4(t, mdatSize, esc)); ok {
+		t.Fatal("escaping index accepted")
+	}
+	// Fragmented (no tables): passes through to the player.
+	p := filepath.Join(t.TempDir(), "frag.mp4")
+	f, err := os.Create(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Write([]byte{0, 0, 0, 20, 'f', 't', 'y', 'p', 'i', 's', 'o', 'm', 0, 0, 0, 0, 'i', 's', 'o', '2'})
+	f.Write([]byte{0, 0, 0, 8, 'm', 'd', 'a', 't'})
+	f.Write([]byte{0, 0, 0, 16, 'm', 'o', 'o', 'v', 0, 0, 0, 8, 'm', 'v', 'e', 'x'})
+	f.Close()
+	if ok, _ := mp4IndexSane(p); !ok {
+		t.Fatal("fragmented file should pass through")
 	}
 }

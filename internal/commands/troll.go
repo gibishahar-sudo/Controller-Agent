@@ -2,6 +2,7 @@ package commands
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"image/gif"
 	"image/jpeg"
@@ -177,6 +178,9 @@ func playTroll(arg string) (string, error) {
 		if codec == "other" && !mp4HasMoov(local) {
 			return "", fmt.Errorf("troll media looks truncated (MP4 has no moov index) — re-download the file")
 		}
+		if ok, reason := mp4IndexSane(local); !ok {
+			return "", fmt.Errorf("troll media has a broken sample index (%s) — re-mux (ffmpeg -c copy) or re-encode the file", reason)
+		}
 	}
 
 	// Fresh status handshake: the player must write "opened" (or a
@@ -189,13 +193,15 @@ func playTroll(arg string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	cmd := hideWindow(exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-command", script))
-	if err := cmd.Start(); err != nil {
+	// Pinned to the interactive desktop (see guispawn): children of an
+	// off-station agent inherit invisibility otherwise.
+	gp, err := spawnGUI("powershell", []string{"-NoProfile", "-ExecutionPolicy", "Bypass", "-command", script}, nil, nil)
+	if err != nil {
 		return "", err
 	}
 	_ = os.MkdirAll(filepath.Dir(trollPIDFile()), 0755)
-	_ = os.WriteFile(trollPIDFile(), []byte(strconv.Itoa(cmd.Process.Pid)), 0644)
-	go cmd.Wait()
+	_ = os.WriteFile(trollPIDFile(), []byte(strconv.Itoa(gp.Pid())), 0644)
+	go gp.Wait()
 	loopNote := "looping"
 	if !loop {
 		loopNote = "once"
@@ -418,6 +424,219 @@ func mp4HasMoov(local string) bool {
 		}
 	}
 	return false
+}
+
+// mp4TopBoxes walks top-level boxes: returns mdat ranges and the moov
+// range (offset+size). Handles 32-bit sizes, 64-bit largesize and
+// size-0-to-EOF. Stops at the first inconsistency.
+func mp4TopBoxes(f *os.File, fileSize int64) (mdats [][2]int64, moov [2]int64, ok bool) {
+	var off int64
+	for i := 0; i < 64 && off+8 <= fileSize; i++ {
+		hdr := make([]byte, 8)
+		if _, err := f.ReadAt(hdr, off); err != nil {
+			return mdats, moov, false
+		}
+		sz := int64(binary.BigEndian.Uint32(hdr[0:4]))
+		typ := string(hdr[4:8])
+		boxEnd := off + sz
+		if sz == 1 {
+			lb := make([]byte, 8)
+			if _, err := f.ReadAt(lb, off+8); err != nil {
+				return mdats, moov, false
+			}
+			sz = int64(binary.BigEndian.Uint64(lb))
+			boxEnd = off + sz
+		} else if sz == 0 {
+			boxEnd = fileSize
+			sz = boxEnd - off
+		}
+		if sz < 8 || boxEnd > fileSize || boxEnd <= off {
+			return mdats, moov, false
+		}
+		switch typ {
+		case "mdat":
+			mdats = append(mdats, [2]int64{off + 8, boxEnd})
+		case "moov":
+			moov = [2]int64{off + 8, boxEnd}
+		}
+		off = boxEnd
+	}
+	return mdats, moov, true
+}
+
+// mp4WalkChildren validates every child box of a container and returns
+// their content ranges. Strict: sizes <8, overflow past the parent end,
+// or truncated headers all report corrupt. Opaque leaves (udta, covr,
+// free, …) are size-checked but never descended into — their binary
+// payload may contain anything, including fourccs that merely look like
+// tables (string-searching moov for "stco" false-positives on cover art).
+func mp4WalkChildren(f *os.File, start, end int64, depth int) ([]mp4Box, bool) {
+	if depth > 8 || start < 0 || end < start {
+		return nil, false
+	}
+	var out []mp4Box
+	for pos := start; pos+8 <= end; {
+		hdr := make([]byte, 8)
+		if _, err := f.ReadAt(hdr, pos); err != nil {
+			return nil, false
+		}
+		sz := int64(binary.BigEndian.Uint32(hdr[0:4]))
+		typ := string(hdr[4:8])
+		hdrLen := int64(8)
+		if sz == 1 {
+			lb := make([]byte, 8)
+			if _, err := f.ReadAt(lb, pos+8); err != nil {
+				return nil, false
+			}
+			sz = int64(binary.BigEndian.Uint64(lb))
+			hdrLen = 16
+		} else if sz == 0 {
+			sz = end - pos
+		}
+		if sz < hdrLen || pos+sz > end {
+			return nil, false
+		}
+		out = append(out, mp4Box{typ: typ, start: pos + hdrLen, end: pos + sz})
+		pos += sz
+	}
+	return out, true
+}
+
+type mp4Box struct {
+	typ        string
+	start, end int64 // content range
+}
+
+// mp4ChunkTables structurally walks moov > trak > mdia > minf > stbl and
+// returns every stco/co64 table found, with entry slices. A table whose
+// count disagrees with its own box size is corrupt (not merely absent).
+func mp4ChunkTables(f *os.File, moov [2]int64) (tabs [][]uint64, corrupt bool, found bool) {
+	kids, ok := mp4WalkChildren(f, moov[0], moov[1], 0)
+	if !ok {
+		return nil, true, false
+	}
+	var dive func(boxes []mp4Box, depth int) bool
+	dive = func(boxes []mp4Box, depth int) bool {
+		for _, b := range boxes {
+			switch b.typ {
+			case "stco", "co64":
+				wide := b.typ == "co64"
+				bodyLen := b.end - b.start
+				if bodyLen < 12 {
+					corrupt = true
+					continue
+				}
+				body := make([]byte, bodyLen)
+				if _, err := f.ReadAt(body, b.start); err != nil {
+					corrupt = true
+					continue
+				}
+				n := int64(binary.BigEndian.Uint32(body[4:8]))
+				var need int64
+				if wide {
+					need = 8 + n*8
+				} else {
+					need = 8 + n*4
+				}
+				if n < 0 || n > 50<<20 || need != bodyLen {
+					corrupt = true // count disagrees with its own box
+					continue
+				}
+				var tab []uint64
+				for k := int64(0); k < n; k++ {
+					if wide {
+						tab = append(tab, binary.BigEndian.Uint64(body[8+int(k)*8:]))
+					} else {
+						tab = append(tab, uint64(binary.BigEndian.Uint32(body[8+int(k)*4:])))
+					}
+				}
+				tabs = append(tabs, tab)
+				found = true
+			case "trak", "mdia", "minf", "stbl", "edts", "dinf":
+				sub, ok := mp4WalkChildren(f, b.start, b.end, depth+1)
+				if !ok {
+					corrupt = true
+					continue
+				}
+				if !dive(sub, depth+1) {
+					return false
+				}
+			}
+		}
+		return true
+	}
+	if !dive(kids, 0) {
+		return nil, true, false
+	}
+	return tabs, corrupt, found
+}
+
+// mp4IndexSane verifies the sample index actually covers the media data.
+// A structurally complete MP4 can still carry a broken moov: chunk
+// offsets clustered in a fraction of mdat (jackpot2.mp4), or tables
+// whose own size disagrees with their entry count (misaligned moov
+// children). Players seek the rest forever — black screen, no error,
+// eternal TIMEOUT. Fail-closed only on proven inconsistency; unknown
+// layouts pass through to the player, whose handshake still reports.
+func mp4IndexSane(local string) (bool, string) {
+	f, err := os.Open(local)
+	if err != nil {
+		return true, ""
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return true, ""
+	}
+	mdats, moov, ok := mp4TopBoxes(f, st.Size())
+	if !ok || len(mdats) == 0 || moov[1] <= moov[0] {
+		return true, "" // fragmented or unreadable layout: let the player try
+	}
+	entries, corrupt, found := mp4ChunkTables(f, moov)
+	if corrupt {
+		return false, "sample index is structurally corrupt (table size disagrees with its entry count)"
+	}
+	if !found || len(entries) == 0 {
+		return true, "" // moof-indexed: nothing to check
+	}
+	var lo, hi int64 = mdats[0][0], mdats[0][1]
+	var big int64
+	for _, m := range mdats {
+		if m[0] < lo {
+			lo = m[0]
+		}
+		if m[1] > hi {
+			hi = m[1]
+		}
+		if m[1]-m[0] > big {
+			big = m[1] - m[0]
+		}
+	}
+	// Per-table verdicts: a healthy track's chunks span the media (an
+	// audio table spanning the file must not mask a video table
+	// clustered in its first megabyte). Tiny tables (<8 entries:
+	// thumbnails, chapters) are skipped.
+	for _, tab := range entries {
+		if len(tab) < 8 {
+			continue
+		}
+		emin, emax := tab[0], tab[0]
+		for _, e := range tab[1:] {
+			if e < emin {
+				emin = e
+			}
+			if e > emax {
+				emax = e
+			}
+		}
+		if emin < uint64(lo) || emax >= uint64(hi) {
+			return false, fmt.Sprintf("chunk offsets [%d..%d] escape media data [%d..%d]", emin, emax, lo, hi)
+		}
+		if big > 4<<20 && emax < uint64(lo)+uint64(big)/2 {
+			return false, fmt.Sprintf("index covers only %.1fMB of %.1fMB media data", float64(emax-uint64(lo))/1048576, float64(big)/1048576)
+		}
+	}
+	return true, ""
 }
 
 // trollExtForContentType maps a download Content-Type to a file

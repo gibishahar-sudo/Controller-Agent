@@ -43,7 +43,6 @@ func sendNotification(arg string) (string, error) {
 	guiSpawnMu.Lock()
 	defer guiSpawnMu.Unlock()
 	script := notifyScript(text, ms)
-	cmd := hideWindow(exec.Command("powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-command", script))
 	// Death-rattle capture: if the dialog dies instantly (Add-Type bomb,
 	// policy block) its stderr lands here and goes back in the error.
 	// Empty file + live process + no window = wrong desktop/session.
@@ -51,11 +50,10 @@ func sendNotification(arg string) (string, error) {
 	_ = os.MkdirAll(dbgDir, 0755)
 	dbgPath := filepath.Join(dbgDir, fmt.Sprintf("notify-%d.log", time.Now().UnixNano()))
 	dbg, _ := os.Create(dbgPath)
-	if dbg != nil {
-		cmd.Stdout = dbg
-		cmd.Stderr = dbg
-	}
-	if err := cmd.Start(); err != nil {
+	// Pinned to the interactive desktop (see guispawn): children of an
+	// off-station agent inherit invisibility otherwise.
+	gp, err := spawnGUI("powershell", []string{"-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-command", script}, dbg, dbg)
+	if err != nil {
 		if dbg != nil {
 			_ = dbg.Close()
 			_ = os.Remove(dbgPath)
@@ -69,16 +67,13 @@ func sendNotification(arg string) (string, error) {
 		}()
 	}
 	waitCh := make(chan error, 1)
-	go func() { waitCh <- cmd.Wait() }()
+	go func() { waitCh <- gp.Wait() }()
 	var exitErr error
 	exited := false
 	// Proof, not faith: OUR dialog must become visible within 20s.
 	// (Title-only matching could pass on a stale dialog; pid ownership
 	// cannot. 20s, not 5s: cold PowerShell routinely needs it.)
-	pid := uint32(0)
-	if cmd.Process != nil {
-		pid = uint32(cmd.Process.Pid)
-	}
+	pid := uint32(gp.Pid())
 	t0 := time.Now()
 	for i := 0; i < 200; i++ {
 		select {
@@ -102,8 +97,8 @@ func sendNotification(arg string) (string, error) {
 			tail = tail[len(tail)-500:]
 		}
 	}
-	if !exited && cmd.Process != nil {
-		_ = hideWindow(exec.Command("taskkill", "/F", "/PID", strconv.Itoa(cmd.Process.Pid))).Run()
+	if !exited && pid != 0 {
+		_ = hideWindow(exec.Command("taskkill", "/F", "/PID", strconv.Itoa(int(pid)))).Run()
 	}
 	secs10 := time.Since(t0).Seconds()
 	if exited {

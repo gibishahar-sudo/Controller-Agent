@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -243,6 +244,34 @@ func (s *Server) startHTTP(addr, dir string) {
 			"path": p, "size": st.Size(), "offset": offset, "len": n,
 			"data": base64.StdEncoding.EncodeToString(buf[:n]),
 		})
+	})
+	// /api/fetch-file streams a controller-local file straight to the
+	// browser (native download, ~zero JS heap). The large-download path:
+	// chunks stream agent -> controller .part file, then the browser
+	// pulls the completed file here instead of assembling 1GB of base64
+	// strings in the tab (which OOMs long before that).
+	mux.HandleFunc("/api/fetch-file", func(w http.ResponseWriter, r *http.Request) {
+		p := r.URL.Query().Get("path")
+		if p == "" {
+			http.Error(w, "path required", http.StatusBadRequest)
+			return
+		}
+		f, err := os.Open(p)
+		if err != nil {
+			http.Error(w, "open: "+err.Error(), 500)
+			return
+		}
+		defer f.Close()
+		st, err := f.Stat()
+		if err != nil || st.IsDir() {
+			http.Error(w, "not a file", http.StatusBadRequest)
+			return
+		}
+		name := filepath.Base(p)
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", name))
+		w.Header().Set("Content-Length", strconv.FormatInt(st.Size(), 10))
+		_, _ = io.Copy(w, f)
 	})
 	mux.HandleFunc("/api/cmd", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {

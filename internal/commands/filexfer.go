@@ -110,8 +110,9 @@ func MakeThumb(path string) ([]byte, error) {
 // off disk (no whole-file memory); uploads reassemble in a .part file and
 // rename into place only after size+sha verify.
 
-// MaxFileXfer caps single transfers (matches the update path's 256MB).
-const MaxFileXfer = 256 << 20
+// MaxFileXfer caps single transfers at 1GB (reliability over speed:
+// chunked, resumable, disk-backed both ends — RAM stays flat).
+const MaxFileXfer = 1 << 30
 
 // FileManifest describes a download source.
 type FileManifest struct {
@@ -267,19 +268,20 @@ var fileUlMu sync.Mutex
 var fileUlState *fileUlSession
 
 type fileUlSession struct {
-	path    string
-	size    int64
-	sha     string
-	total   int
-	part    string
-	have    map[int]bool
-	started time.Time
+	path      string
+	size      int64
+	sha       string
+	total     int
+	part      string
+	have      map[int]bool
+	started   time.Time
+	lastChunk time.Time // sliding activity: slow-but-moving 1GB uploads survive
 }
 
-// maxUlAge abandons uploads stalled this long (source deleted mid-upload,
-// UI closed, agent restarted): the next begin starts clean instead of
-// wedging on a zombie session.
-const maxUlAge = 30 * time.Minute
+// maxUlIdle abandons uploads idle this long (source deleted mid-upload,
+// UI closed, agent restarted). Sliding, not from-start: a moving transfer
+// never trips it no matter how slow the link.
+const maxUlIdle = 2 * time.Hour
 
 // StartFileUl begins an upload: creates the .part file (parents included).
 func StartFileUl(path string, size int64, sha string, total int) (string, error) {
@@ -305,7 +307,7 @@ func StartFileUl(path string, size int64, sha string, total int) (string, error)
 		return "", err
 	}
 	f.Close()
-	fileUlState = &fileUlSession{path: path, size: size, sha: sha, total: total, part: part, have: map[int]bool{}, started: time.Now()}
+	fileUlState = &fileUlSession{path: path, size: size, sha: sha, total: total, part: part, have: map[int]bool{}, started: time.Now(), lastChunk: time.Now()}
 	return fmt.Sprintf("upload %s accepted (%d bytes in %d chunks)", filepath.Base(path), size, total), nil
 }
 
@@ -322,11 +324,11 @@ func WriteFileUlChunk(seq int, b64 string, chunkRaw int) (string, error) {
 		fileUlMu.Unlock()
 		return "", fmt.Errorf("no upload in progress")
 	}
-	if time.Since(st.started) > maxUlAge {
+	if time.Since(st.lastChunk) > maxUlIdle {
 		_ = os.Remove(st.part)
 		fileUlState = nil
 		fileUlMu.Unlock()
-		return "", fmt.Errorf("upload session expired (stalled over 30min) — restart the upload")
+		return "", fmt.Errorf("upload session idle over 2h — restart the upload")
 	}
 	if seq < 0 || seq >= st.total {
 		fileUlMu.Unlock()
@@ -347,6 +349,7 @@ func WriteFileUlChunk(seq int, b64 string, chunkRaw int) (string, error) {
 		return "", err
 	}
 	st.have[seq] = true
+	st.lastChunk = time.Now()
 	n := len(st.have)
 	done := n == st.total
 	fileUlMu.Unlock()

@@ -882,7 +882,7 @@ func (s *Server) dlToGapLoop(key, remote string) {
 		total, haveN := sess.total, len(sess.have)
 		idle := time.Since(sess.lastChunk)
 		var missing []int
-		if total > 0 && haveN < total && idle >= 5*time.Second && reqs < 8 {
+		if total > 0 && haveN < total && idle >= 5*time.Second && reqs < 40 {
 			for i := 0; i < total; i++ {
 				if !sess.have[i] {
 					missing = append(missing, i)
@@ -944,16 +944,16 @@ func (s *Server) feedDlTo(id string, sess *dlToSession, msg protocol.Message) {
 		s.dlToFail(id, sess, msg.FilePath, msg.Error)
 		return
 	}
-	if time.Since(sess.started) > 30*time.Minute {
-		s.dlToFail(id, sess, msg.FilePath, "save stalled over 30min — retry the download")
+	if time.Since(sess.lastChunk) > 2*time.Hour {
+		s.dlToFail(id, sess, msg.FilePath, "save idle over 2h — retry the download")
 		return
 	}
 	if sess.total == 0 && msg.FileTotal > 0 {
 		sess.total = msg.FileTotal
 		sess.size = msg.FileSize
 		sess.sha = msg.FileSHA
-		if int64(sess.total)*int64(sess.chunkRaw) > 300<<20 {
-			s.dlToFail(id, sess, msg.FilePath, "file too large")
+		if int64(sess.total)*int64(sess.chunkRaw) > 1<<30 {
+			s.dlToFail(id, sess, msg.FilePath, "file too large (1GB cap)")
 			return
 		}
 	}

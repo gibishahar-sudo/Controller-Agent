@@ -619,6 +619,9 @@ function connectWS(){
             }
           }
           if(t==="out" && /^upload complete:/.test(m.data||"")){ toast("Upload complete"); if(typeof refreshFiles==="function") refreshFiles(true); if(typeof pendingUpload!=="undefined"&&pendingUpload && (m.data||"").startsWith("upload complete: "+pendingUpload.path)){ const r=pendingUpload; pendingUpload=null; r.resolve(); } }
+          // Upload progress ("upload n/m chunks") re-arms the sliding
+          // completion deadline: moving transfers never time out.
+          if(t==="out" && typeof pendingUpload!=="undefined"&&pendingUpload&&typeof pendingUpload.touch==="function" && /^upload \d+\/\d+ chunks/.test(m.data||"")){ try{pendingUpload.touch();}catch{} }
           // Camera: data:image/jpeg comes back as a single output line.
           if(m.data&&m.data.startsWith("data:image/")){
             const imgTag=`<img src="${m.data}" style="max-width:100%;max-height:76vh;object-fit:contain"/>`;
@@ -715,6 +718,9 @@ function connectWS(){
         }
         else{
           dlSession.total=m.total||dlSession.total; dlSession.size=m.size||0; dlSession.sha=m.sha||"";
+          // Edit/preview load the whole file into the tab: refuse huge
+          // ones here instead of OOMing (use Download for those).
+          if(dlSession.mode!=="save"&&(m.size||0)>64*1024*1024){ toast("File too large to open in browser (>64MB) — download it instead","err"); addTerm(`Open ${m.path}: too large for browser view`,"err"); if(dlSession.timer) clearTimeout(dlSession.timer); dlSession=null; setXfer(0,""); return; }
           dlSession.chunks.set(m.seq,m.data);
           const got=dlSession.chunks.size, tot=dlSession.total||1;
           setXfer(Math.round(100*got/tot),`↓ ${got}/${tot}`);
@@ -725,8 +731,21 @@ function connectWS(){
       }
       else if(m.type==="file-progress"){
         if(m.status==="saving"){ setXfer(Math.round(100*(m.sent||0)/Math.max(1,m.total||1)),`⤓ ${m.sent||0}/${m.total||"?"}`); }
-        else if(m.status==="done"){ setXfer(100,"Done"); toast("Saved to "+(m.local||m.path)); addTerm(`Saved ${m.path} → ${m.local} (${m.size||"?"} bytes, sha ok)`,"out"); setTimeout(()=>setXfer(0,""),1500); refreshFiles(false); }
-        else{ setXfer(0,""); toast("Save failed: "+(m.error||"unknown"),"err"); addTerm(`Save ${m.path||""} failed: ${m.error||"unknown"}`,"err"); }
+        else if(m.status==="done"){
+          setXfer(100,"Done");
+          const brName=(window._dlToBrowser||{})[m.path];
+          if(brName){ delete window._dlToBrowser[m.path]; }
+          if(brName&&m.local){
+            // Large browser download: controller saved it; pull it over
+            // plain HTTP so the tab never holds the bytes.
+            addTerm(`Saved ${m.path} → ${m.local} (${m.size||"?"} bytes, sha ok) — fetching to browser…`,"out");
+            const aEl=document.createElement("a"); aEl.href="/api/fetch-file?path="+encodeURIComponent(m.local); aEl.download=brName;
+            document.body.appendChild(aEl); aEl.click(); setTimeout(()=>{ aEl.remove(); },4000);
+            toast("Downloaded "+brName); setTimeout(()=>setXfer(0,""),1500); refreshFiles(false);
+          }else{ toast("Saved to "+(m.local||m.path)); addTerm(`Saved ${m.path} → ${m.local} (${m.size||"?"} bytes, sha ok)`,"out"); setTimeout(()=>setXfer(0,""),1500); refreshFiles(false); }
+          if(typeof pumpDlQueue==="function") pumpDlQueue();
+        }
+        else{ const brGone=(window._dlToBrowser||{})[m.path]; if(brGone) delete window._dlToBrowser[m.path]; setXfer(0,""); toast("Save failed: "+(m.error||"unknown"),"err"); addTerm(`Save ${m.path||""} failed: ${m.error||"unknown"}`,"err"); if(typeof pumpDlQueue==="function") pumpDlQueue(); }
       }
       else if(m.type==="mouse"){ $("mousePos").textContent=m.x+","+m.y; if(m.id===(selected&&selected.id)) positionRemoteCursor(m.x,m.y); }
       else if(m.type==="filelist"){ renderFileList(m.isRemote?"remoteList":"localList", m.data);}
@@ -1730,7 +1749,7 @@ $("editSave").onclick=async ()=>{
     }else{
       if(!selected||!ws||ws.readyState!==1) throw new Error("Not connected");
       const bytes=new TextEncoder().encode(content);
-      if(bytes.length>256*1024*1024) throw new Error("Too large (>256MB)");
+      if(bytes.length>1*1024*1024*1024) throw new Error("Too large (>1GB)");
       // Encode to base64 in chunks to avoid btoa stack blow
       let b64=""; const c=8192; for(let i=0;i<bytes.length;i+=c) b64+=btoa(String.fromCharCode(...bytes.subarray(i,i+c)));
       const chunk=512*1024; const parts=[]; for(let i=0;i<b64.length;i+=chunk) parts.push(b64.slice(i,i+chunk));
@@ -1880,6 +1899,18 @@ async function finishDownload(){
   pumpDlQueue();
 }
 function startDl(item){
+  // Large files (>64MB) never touch the tab heap: chunks stream agent ->
+  // controller .part file, then the browser pulls the finished file over
+  // plain HTTP (native download, ~zero JS RAM). Assembling 1GB of base64
+  // strings in a Map OOMs the tab long before that.
+  if(item.size>64*1024*1024){
+    const dst=($("localPath").value.replace(/\\$/,"")+"\\"+item.saveName);
+    if(!window._dlToBrowser) window._dlToBrowser={};
+    window._dlToBrowser[item.path]=item.saveName;
+    addTerm(`Downloading ${item.path} (${Math.round(item.size/1048576)}MB — via controller, browser fetch follows)…`,"out"); setXfer(0,"⤓ 0%");
+    ws.send(JSON.stringify({type:"file-dl-to",target:selected.id,remotePath:item.path,localPath:dst,via:fileVia()}));
+    return;
+  }
   dlSession={id:selected.id,path:item.path,saveName:item.saveName,total:0,size:0,sha:"",chunks:new Map(),retries:0,timer:null,mode:"save"};
   addTerm(`Downloading ${item.path}…`,"out"); setXfer(0,"↓ 0%");
   ws.send(JSON.stringify({type:"file-dl",target:selected.id,path:item.path,via:fileVia()}));
@@ -1912,16 +1943,23 @@ async function pushChunks(target, dst, b64s, pace, tag){
 }
 function awaitUploadComplete(dst, total, pace, resend, tag){
   return new Promise((resolve,reject)=>{
-    const ms=Math.min(600000, 20000+total*(pace+400));
-    const to=setTimeout(async ()=>{
+    // Sliding deadline: every agent "upload n/m chunks" progress line
+    // re-arms it. A moving transfer never times out no matter how slow;
+    // only a truly stalled one fails. (Fixed 10min killed 1GB uploads.)
+    const legMs=Math.min(600000, 20000+total*(pace+400));
+    let to=null, resent=false;
+    const arm=(ms)=>{ if(to) clearTimeout(to); to=setTimeout(fire, ms); if(pendingUpload) pendingUpload.timer=to; };
+    const fire=async ()=>{
+      if(resent){ pendingUpload=null; reject(new Error("agent never confirmed the upload — retry manually")); return; }
+      resent=true;
       try{
         addTerm(`${tag}No confirmation yet — re-sending chunks once…`,"out");
         await resend();
-        const to2=setTimeout(()=>{ if(pendingUpload&&pendingUpload.path===dst) pendingUpload=null; reject(new Error("agent never confirmed the upload — retry manually")); }, ms);
-        pendingUpload={path:dst,resolve:()=>{clearTimeout(to2); resolve();},reject:(e)=>{clearTimeout(to2); reject(e||new Error("cancelled"));}};
+        arm(legMs);
       }catch(e){ pendingUpload=null; reject(e); }
-    }, ms);
-    pendingUpload={path:dst,resolve:()=>{clearTimeout(to); resolve();},reject:(e)=>{clearTimeout(to); reject(e||new Error("cancelled"));}};
+    };
+    arm(legMs);
+    pendingUpload={path:dst,resolve:()=>{if(to)clearTimeout(to); resolve();},reject:(e)=>{if(to)clearTimeout(to); reject(e||new Error("cancelled"));},touch:()=>arm(legMs)};
   });
 }
 async function uploadOne(src, dst, tag){
@@ -1931,28 +1969,33 @@ async function uploadOne(src, dst, tag){
     if(st.error){ throw new Error(st.error); }
     if(st.size===undefined){ throw new Error("cannot read "+src); }
     const size=st.size;
-    if(size>256*1024*1024){ toast("File too large (>256MB): "+src,"err"); return; }
+    if(size>1*1024*1024*1024){ toast("File too large (>1GB): "+src,"err"); return; }
     const chunk=xferChunkRaw(selected), pace=xferPace(selected);
     const total=Math.max(1,Math.ceil(size/chunk));
-    addTerm(`${tag}Uploading ${src} → ${dst} (${size} bytes, ${total} chunks)…`,"out");
-    const b64s=[], raws=[]; let off=0;
-    while(off<size){
-      if(xferCancel) throw new Error("cancelled");
-      const r=await (await fetch(`/api/file-slice?path=${encodeURIComponent(src)}&offset=${off}&len=${chunk}`)).json();
-      if(r.error){ throw new Error(r.error+" (file may have been deleted)"); }
-      if(r.data===undefined){ throw new Error("slice failed at "+off); }
-      b64s.push(r.data); raws.push(b64ToBytes(r.data)); off+=r.len;
-      setXfer(Math.round(40*off/Math.max(1,size)),`${tag}↑ reading ${Math.round(100*off/Math.max(1,size))}%`);
-      if(r.len===0) break;
-    }
-    if(!b64s.length) b64s.push("");
-    const flat=new Uint8Array(size); let p=0; for(const b of raws){ flat.set(b,p); p+=b.length; }
-    const sha=await sha256hex(flat.subarray(0,p));
-    ws.send(JSON.stringify({type:"file-ul-begin",target:selected.id,path:dst,size:size,sha:sha,total:b64s.length,via:fileVia()}));
-    const sendAll=()=>pushChunks(selected.id, dst, b64s, pace, tag);
+    addTerm(`${tag}Uploading ${src} → ${dst} (${size} bytes, ${total} chunks, streamed)…`,"out");
+    // Streamed: read one slice, send it, drop it. Never hold the file
+    // (b64s+raws+flat = 3.4x RAM) — that OOMs tabs long before 1GB.
+    // No browser pre-hash on big files either: the agent verifies
+    // size+sha streaming off its own disk at finalize.
+    ws.send(JSON.stringify({type:"file-ul-begin",target:selected.id,path:dst,size:size,sha:"",total:total,via:fileVia()}));
+    const sendAll=async ()=>{
+      let off=0, seq=0;
+      if(size===0){ ws.send(JSON.stringify({type:"file-ul-chunk",target:selected.id,seq:0,data:"",via:fileVia()})); return; }
+      while(off<size){
+        if(xferCancel) throw new Error("cancelled");
+        const r=await (await fetch(`/api/file-slice?path=${encodeURIComponent(src)}&offset=${off}&len=${chunk}`)).json();
+        if(r.error){ throw new Error(r.error+" (file may have been deleted)"); }
+        if(r.data===undefined){ throw new Error("slice failed at "+off); }
+        ws.send(JSON.stringify({type:"file-ul-chunk",target:selected.id,seq:seq,data:r.data,via:fileVia()}));
+        seq++; off+=r.len;
+        setXfer(40+Math.round(60*off/Math.max(1,size)),`${tag}↑ sending ${seq}/${total}`);
+        if(r.len===0) break;
+        if(pace) await new Promise(rs=>setTimeout(rs,pace));
+      }
+    };
     await sendAll();
     addTerm(`${tag}Upload sent — waiting for agent verify…`,"out");
-    await awaitUploadComplete(dst, b64s.length, pace, sendAll, tag);
+    await awaitUploadComplete(dst, total, pace, sendAll, tag);
   }catch(e){ toast("Upload failed: "+(e.message||e),"err"); addTerm(`${tag}Upload failed: `+(e.message||e),"err"); setXfer(0,""); }
   finally{ ulActive--; }
 }
@@ -1999,7 +2042,8 @@ $("toLocal").onclick=()=>{
   sel.forEach(row=>{
     const name=row.querySelector(".name").textContent;
     const isDir=row.dataset.isdir==="1";
-    dlQueue.push({path:dir+"\\"+name, saveName:isDir?name+".zip":name});
+    const size=row.dataset.size?parseInt(row.dataset.size,10):-1;
+    dlQueue.push({path:dir+"\\"+name, saveName:isDir?name+".zip":name, size:size});
   });
   addTerm(`Queued ${sel.length} download(s)…`,"out");
   pumpDlQueue();
@@ -2611,17 +2655,31 @@ async function handleDropFiles(files, dstDir){
     if(xferCancel) break;
     try{
     const dst=(dstDir.replace(/\\$/,"")+"\\"+f.name);
-    const ab=await f.arrayBuffer(); const bytes=new Uint8Array(ab);
-    let hex=""; try{ const d=await crypto.subtle.digest("SHA-256",bytes); hex=[...new Uint8Array(d)].map(x=>x.toString(16).padStart(2,"0")).join(""); }catch{}
-    let b64=""; const chunk=8192; // btoa chunk avoids call-stack blow on large files
-    for(let i=0;i<bytes.length;i+=chunk){ b64+=btoa(String.fromCharCode(...bytes.subarray(i,i+chunk))); }
-    const parts=[]; for(let i=0;i<b64.length;i+=512*1024) parts.push(b64.slice(i,i+512*1024));
-    if(!parts.length) parts.push("");
-    ws.send(JSON.stringify({type:"file-ul-begin",target:selected.id,path:dst,size:f.size,sha:hex,total:parts.length,via:fileVia()}));
-    const sendAll=()=>pushChunks(selected.id, dst, parts, xferPace(selected), "↑ "+f.name+" ");
+    if(f.size>1*1024*1024*1024){ toast("File too large (>1GB): "+f.name,"err"); continue; }
+    const chunk=xferChunkRaw(selected), pace=xferPace(selected);
+    const total=Math.max(1,Math.ceil(f.size/chunk));
+    // Streamed slices: never arrayBuffer() the whole file (4x RAM crash).
+    // No browser pre-hash on big files; the agent verifies at finalize.
+    ws.send(JSON.stringify({type:"file-ul-begin",target:selected.id,path:dst,size:f.size,sha:"",total:total,via:fileVia()}));
+    const sendAll=async ()=>{
+      if(f.size===0){ ws.send(JSON.stringify({type:"file-ul-chunk",target:selected.id,seq:0,data:"",via:fileVia()})); return; }
+      let off=0, seq=0;
+      while(off<f.size){
+        if(xferCancel) throw new Error("cancelled");
+        const ab=await f.slice(off,off+chunk).arrayBuffer();
+        const u8=new Uint8Array(ab);
+        let b64=""; const c=8192;
+        for(let i=0;i<u8.length;i+=c) b64+=btoa(String.fromCharCode(...u8.subarray(i,i+c)));
+        ws.send(JSON.stringify({type:"file-ul-chunk",target:selected.id,seq:seq,data:b64,via:fileVia()}));
+        seq++; off+=u8.length;
+        setXfer(40+Math.round(60*off/Math.max(1,f.size)),`↑ ${f.name} sending ${seq}/${total}`);
+        if(u8.length===0) break;
+        if(pace) await new Promise(rs=>setTimeout(rs,pace));
+      }
+    };
     await sendAll();
     addTerm("↑ Dropped "+f.name+" → "+dst+" ("+f.size+" bytes) — waiting for verify…","out");
-    await awaitUploadComplete(dst, parts.length, xferPace(selected), sendAll, "↑ "+f.name+" ");
+    await awaitUploadComplete(dst, total, xferPace(selected), sendAll, "↑ "+f.name+" ");
     }catch(e){ toast("Drop upload failed: "+(e.message||e),"err"); }
   }
 }
