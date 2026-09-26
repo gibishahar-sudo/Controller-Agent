@@ -158,9 +158,19 @@ func playTroll(arg string) (string, error) {
 	}
 	// Container peek for MP4-family: names the codec in success/failure
 	// text so a silent box is diagnosable from the controller alone.
+	// Two hard refusals, both cheaper than a 40s black screen:
+	//   - VP9/AV1 in MP4: Media Foundation cannot open it (no event at
+	//     all). Convert to H.264 first.
+	//   - moov missing: truncated/interrupted download, unopenable ever.
 	codec := ""
 	if ext == ".mp4" || ext == ".m4v" || ext == ".mov" {
 		codec = sniffMP4Codec(local)
+		if codec == "vp9" || codec == "av1" {
+			return "", fmt.Errorf("troll media is %s in MP4: the Windows media pipeline cannot play it — convert to H.264 MP4 first", strings.ToUpper(codec))
+		}
+		if codec == "other" && !mp4HasMoov(local) {
+			return "", fmt.Errorf("troll media looks truncated (MP4 has no moov index) — re-download the file")
+		}
 	}
 
 	// Fresh status handshake: the player must write "opened" (or a
@@ -310,12 +320,39 @@ func downloadTroll(url string) (string, error) {
 	return dst, nil
 }
 
-// sniffMP4Codec peeks at the first 64KB for codec fourccs: avc1/avcC =
-// H.264 (plays everywhere), hvc1/hev1 = HEVC/H.265 (needs the HEVC Video
-// Extensions Store package — the #1 silent MediaElement killer),
-// vp09 = VP9, av01 = AV1. Returns "" when it can't tell (still playable,
-// just unknown). Heuristic, never blocks: it only sharpens error text.
+// sniffMP4Codec peeks for codec fourccs: avc1/avcC = H.264 (plays
+// everywhere), hvc1/hev1 = HEVC/H.265 (needs the HEVC Video Extensions
+// Store package — the #1 silent MediaElement killer), vp09 = VP9,
+// av01 = AV1. Scans the head AND the tail: MP4 codec boxes live in moov,
+// which sits at the END for non-faststart files (a head-only scan sees
+// nothing and reports "other" on a perfectly odd file — jackpot.mp4).
+// Returns "" when it can't tell (still playable, just unknown).
+// Heuristic, never blocks: it only sharpens error text.
 func sniffMP4Codec(local string) string {
+	scan := func(b []byte) string {
+		s := string(b)
+		for _, c := range []string{"hvc1", "hev1", "hvcC"} {
+			if strings.Contains(s, c) {
+				return "hevc"
+			}
+		}
+		for _, c := range []string{"avc1", "avcC"} {
+			if strings.Contains(s, c) {
+				return "h264"
+			}
+		}
+		for _, c := range []string{"vp09"} {
+			if strings.Contains(s, c) {
+				return "vp9"
+			}
+		}
+		for _, c := range []string{"av01"} {
+			if strings.Contains(s, c) {
+				return "av1"
+			}
+		}
+		return ""
+	}
 	f, err := os.Open(local)
 	if err != nil {
 		return ""
@@ -327,27 +364,54 @@ func sniffMP4Codec(local string) string {
 	if len(head) < 12 || string(head[4:8]) != "ftyp" {
 		return ""
 	}
-	for _, c := range []string{"hvc1", "hev1", "hvcC"} {
-		if strings.Contains(string(head), c) {
-			return "hevc"
-		}
+	if c := scan(head); c != "" {
+		return c
 	}
-	for _, c := range []string{"avc1", "avcC"} {
-		if strings.Contains(string(head), c) {
-			return "h264"
+	// moov-at-end (non-faststart): codec boxes hide in the tail.
+	if st, err := f.Stat(); err == nil && st.Size() > 128<<10 {
+		tail := make([]byte, 256<<10)
+		off := st.Size() - int64(len(tail))
+		if off < 0 {
+			off = 0
 		}
-	}
-	for _, c := range []string{"vp09"} {
-		if strings.Contains(string(head), c) {
-			return "vp9"
-		}
-	}
-	for _, c := range []string{"av01"} {
-		if strings.Contains(string(head), c) {
-			return "av1"
+		if _, err := f.Seek(off, io.SeekStart); err == nil {
+			m, _ := io.ReadFull(f, tail)
+			if c := scan(tail[:m]); c != "" {
+				return c
+			}
 		}
 	}
 	return "other"
+}
+
+// mp4HasMoov reports whether a moov atom exists anywhere findable (head
+// or tail). Absent moov = truncated/interrupted download: Media
+// Foundation can never open it, so fail fast instead of a 40s timeout.
+func mp4HasMoov(local string) bool {
+	f, err := os.Open(local)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	head := make([]byte, 64<<10)
+	n, _ := io.ReadFull(f, head)
+	if strings.Contains(string(head[:n]), "moov") {
+		return true
+	}
+	if st, err := f.Stat(); err == nil && st.Size() > 64<<10 {
+		tail := make([]byte, 256<<10)
+		off := st.Size() - int64(len(tail))
+		if off < 0 {
+			off = 0
+		}
+		if _, err := f.Seek(off, io.SeekStart); err == nil {
+			m, _ := io.ReadFull(f, tail)
+			if strings.Contains(string(tail[:m]), "moov") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // trollExtForContentType maps a download Content-Type to a file
@@ -597,21 +661,11 @@ function Stop-TrollLockdown {
   $script:allowClose = $true
   [void][RmmTrollHook]::BlockInput($false)
   [RmmTrollHook]::Uninstall()
-  $f.Close()
+  foreach ($w in $script:forms) { try { $w.Close() } catch {} }
+  [System.Windows.Forms.Application]::ExitThread()
 }
-$f = New-Object System.Windows.Forms.Form
-$f.Text = ''
-$f.FormBorderStyle = 'None'
-$f.WindowState = 'Maximized'
-$f.TopMost = $true
-$f.ShowInTaskbar = $false
-$f.StartPosition = 'CenterScreen'
-$f.BackColor = [System.Drawing.Color]::Black
-# Alt+Tab thumbnail X, Alt+F4, Alt+Space all arrive as FormClosing — die.
-$f.Add_FormClosing({ param($s,$e) if (-not $script:allowClose) { $e.Cancel = $true } })
-$pic = New-Object System.Windows.Forms.PictureBox
-$pic.Dock = 'Fill'
-$pic.SizeMode = 'Zoom'
+$script:forms = @()
+$script:pics = @()
 try {
   $img = [System.Drawing.Image]::FromFile($path)
 } catch {
@@ -619,8 +673,29 @@ try {
   [RmmTrollHook]::Uninstall()
   exit 3
 }
-$pic.Image = $img
-$f.Controls.Add($pic)
+# One chromeless window per monitor: secondary screens go black too.
+foreach ($sc in [System.Windows.Forms.Screen]::AllScreens) {
+  $b = $sc.Bounds
+  $f = New-Object System.Windows.Forms.Form
+  $f.Text = ''
+  $f.FormBorderStyle = 'None'
+  $f.StartPosition = 'Manual'
+  $f.Location = New-Object System.Drawing.Point($b.X, $b.Y)
+  $f.Size = New-Object System.Drawing.Size($b.Width, $b.Height)
+  $f.TopMost = $true
+  $f.ShowInTaskbar = $false
+  $f.BackColor = [System.Drawing.Color]::Black
+  # Alt+Tab thumbnail X, Alt+F4, Alt+Space all arrive as FormClosing — die.
+  $f.Add_FormClosing({ param($s,$e) if (-not $script:allowClose) { $e.Cancel = $true } })
+  $pic = New-Object System.Windows.Forms.PictureBox
+  $pic.Dock = 'Fill'
+  $pic.SizeMode = 'Zoom'
+  $pic.Image = $img
+  $f.Controls.Add($pic)
+  $f.Add_FormClosed({ param($s,$e) [void][RmmTrollHook]::BlockInput($false) })
+  $script:forms += $f
+  $script:pics += $pic
+}
 $frame = 0
 $anim = New-Object System.Windows.Forms.Timer
 $anim.Interval = 60
@@ -628,36 +703,35 @@ $anim.Add_Tick({
   if ($loop -and [System.Drawing.Image]::IsAnimatedImage($img)) {
     $frame = ($frame + 1) %% [System.Drawing.Image]::GetFrameCount([System.Drawing.Imaging.FrameDimension]::Time)
     $img.SelectActiveFrame([System.Drawing.Imaging.FrameDimension]::Time, $frame) | Out-Null
-    $pic.Image = $img.Clone()
+    foreach ($p in $script:pics) { $p.Image = $img.Clone() }
   }
 })
 if ($loop) { $anim.Start() }
-# Guard tick: re-assert TopMost/focus/input 2x/sec (fights Win+D and
-# focus theft) and hard-stops at $secs.
+# Guard tick: re-assert every window 2x/sec (fights Win+D and focus
+# theft) and hard-stops at $secs.
 $born = Get-Date
 $guard = New-Object System.Windows.Forms.Timer
 $guard.Interval = 500
 $guard.Add_Tick({
   if (-not $script:allowClose) {
-    $f.TopMost = $false; $f.TopMost = $true
-    $f.Activate() | Out-Null
+    foreach ($w in $script:forms) { $w.TopMost = $false; $w.TopMost = $true }
+    $script:forms[0].Activate() | Out-Null
     [void][RmmTrollHook]::BlockInput($true)
   }
   if (((Get-Date) - $born).TotalSeconds -ge $secs) { Stop-TrollLockdown }
 })
 $guard.Start()
-$f.Add_FormClosed({ param($s,$e) [void][RmmTrollHook]::BlockInput($false); [RmmTrollHook]::Uninstall(); if ($img) { $img.Dispose() } })
+foreach ($w in $script:forms) { $w.Show() }
 # Proof of playback first, input lock second (never a locked black box).
-$f.Add_Shown({
-  Set-Content -Path $status -Value 'opened'
-  [void][RmmTrollHook]::BlockInput($true)
-})
-[void]$f.ShowDialog()
-$f.Dispose()`, q, qs, secs, loopI), nil
+Set-Content -Path $status -Value 'opened'
+[void][RmmTrollHook]::BlockInput($true)
+[System.Windows.Forms.Application]::Run()
+if ($img) { $img.Dispose() }`, q, qs, secs, loopI), nil
 	}
 	// Video path — WPF MediaElement (MP4/MOV/AVI/WMV/MKV depending on codecs).
 	return fmt.Sprintf(`Add-Type -AssemblyName PresentationFramework
 Add-Type -AssemblyName PresentationCore
+Add-Type -AssemblyName System.Windows.Forms
 Add-Type -TypeDefinition @'
 using System;
 using System.Diagnostics;
@@ -711,46 +785,59 @@ function Stop-TrollLockdownV {
   [RmmTrollHookV]::Uninstall()
   $w.Close()
 }
-$uri = (New-Object System.Uri($path)).AbsoluteUri
-$w = New-Object System.Windows.Window
-$w.Title = ''
-$w.WindowStyle = 'None'
-$w.ResizeMode = 'NoResize'
-$w.WindowState = 'Maximized'
-$w.Topmost = $true
-$w.ShowInTaskbar = $false
-$w.Background = [System.Windows.Media.Brushes]::Black
-$w.WindowStartupLocation = 'CenterScreen'
-# Task-view X, Alt+F4, Alt+Space all arrive as Closing — die.
-$w.Add_Closing({ param($s,$e) if (-not $script:allowClose) { $e.Cancel = $true } })
-$me = New-Object System.Windows.Controls.MediaElement
-$me.Source = $uri
-$me.LoadedBehavior = 'Manual'
-$me.UnloadedBehavior = 'Manual'
-$me.Stretch = 'Uniform'
-$me.IsMuted = $false
-$w.Content = $me
-$me.Add_MediaOpened({ $script:opened = $true; Set-Content -Path $status -Value 'opened'; $me.Play() })
-if ($loop -eq 1) {
-  $me.Add_MediaEnded({
-    $me.Position = [TimeSpan]::Zero
-    $me.Play()
-  })
-} else {
-  $me.Add_MediaEnded({ Stop-TrollLockdownV })
+$script:allowClose = $false
+$script:opened = $false
+$script:wins = @()
+function Stop-TrollLockdownV {
+  $script:allowClose = $true
+  [void][RmmTrollHookV]::BlockInput($false)
+  [RmmTrollHookV]::Uninstall()
+  foreach ($w in $script:wins) { try { $w.Close() } catch {} }
+  [System.Windows.Threading.Dispatcher]::CurrentDispatcher.InvokeShutdown()
 }
-$me.Add_MediaFailed({
-  param($s,$e)
-  # Poison path with a reason: never a locked black box, never silence.
-  $msg = 'unknown media error'
-  if ($e -and $e.ErrorException) { $msg = $e.ErrorException.Message }
-  Set-Content -Path $status -Value ('failed: ' + $msg)
-  Stop-TrollLockdownV
-})
-# No-proof watchdog: MediaOpened never fired (missing codec, bad path,
-# slow media) — report it instead of sitting on a black locked screen.
-# 20s: USB/spinning disks can take a while to first frame.
+$uri = (New-Object System.Uri($path)).AbsoluteUri
+# One chromeless window per monitor: secondary screens go black too.
+foreach ($sc in [System.Windows.Forms.Screen]::AllScreens) {
+  $b = $sc.Bounds
+  $w = New-Object System.Windows.Window
+  $w.Title = ''
+  $w.WindowStyle = 'None'
+  $w.ResizeMode = 'NoResize'
+  $w.WindowStartupLocation = 'Manual'
+  $w.Left = $b.X; $w.Top = $b.Y; $w.Width = $b.Width; $w.Height = $b.Height
+  $w.Topmost = $true
+  $w.ShowInTaskbar = $false
+  $w.Background = [System.Windows.Media.Brushes]::Black
+  # Task-view X, Alt+F4, Alt+Space all arrive as Closing — die.
+  $w.Add_Closing({ param($s,$e) if (-not $script:allowClose) { $e.Cancel = $true } })
+  $me = New-Object System.Windows.Controls.MediaElement
+  $me.Source = $uri
+  $me.LoadedBehavior = 'Manual'
+  $me.UnloadedBehavior = 'Manual'
+  $me.Stretch = 'Uniform'
+  $me.IsMuted = $false
+  $w.Content = $me
+  $me.Add_MediaOpened({ param($s,$e) $script:opened = $true; Set-Content -Path $status -Value 'opened'; $s.Play() })
+  if ($loop -eq 1) {
+    $me.Add_MediaEnded({ param($s,$e) $s.Position = [TimeSpan]::Zero; $s.Play() })
+  } else {
+    $me.Add_MediaEnded({ Stop-TrollLockdownV })
+  }
+  $me.Add_MediaFailed({
+    param($s,$e)
+    # Poison path with a reason: never a locked black box, never silence.
+    $msg = 'unknown media error'
+    if ($e -and $e.ErrorException) { $msg = $e.ErrorException.Message }
+    Set-Content -Path $status -Value ('failed: ' + $msg)
+    Stop-TrollLockdownV
+  })
+  $w.Add_Closed({ [void][RmmTrollHookV]::BlockInput($false) })
+  $script:wins += $w
+}
 $born = Get-Date
+# No-proof watchdog: MediaOpened never fired (missing codec, bad path,
+# slow media) — report it instead of sitting on black locked screens.
+# 20s: USB/spinning disks can take a while to first frame.
 $watchTimer = New-Object System.Windows.Threading.DispatcherTimer
 $watchTimer.Interval = New-Object TimeSpan(0,0,0,20,0)
 $watchTimer.Add_Tick({
@@ -761,13 +848,13 @@ $watchTimer.Add_Tick({
   }
 })
 $watchTimer.Start()
-# Guard tick: re-assert TopMost/focus/input 2x/sec and hard-stop at $secs.
+# Guard tick: re-assert every window 2x/sec and hard-stop at $secs.
 $guardTimer = New-Object System.Windows.Threading.DispatcherTimer
 $guardTimer.Interval = New-Object TimeSpan(0,0,0,0,500)
 $guardTimer.Add_Tick({
   if (-not $script:allowClose) {
-    $w.Topmost = $false; $w.Topmost = $true
-    $w.Activate() | Out-Null
+    foreach ($w in $script:wins) { $w.Topmost = $false; $w.Topmost = $true }
+    $script:wins[0].Activate() | Out-Null
     [void][RmmTrollHookV]::BlockInput($true)
   }
   if (((Get-Date) - $born).TotalSeconds -ge $secs) { Stop-TrollLockdownV }
@@ -779,8 +866,9 @@ $w.Add_Closed({
   $watchTimer.Stop()
   $guardTimer.Stop()
 })
-$w.Add_Shown({
-  [void][RmmTrollHookV]::BlockInput($true)
-})
-[void]$w.ShowDialog()`, q, qs, secs, loopI), nil
+foreach ($w in $script:wins) { $w.Show() }
+# Proof first (MediaOpened writes it), lock second — then pump modeless.
+[void][RmmTrollHookV]::BlockInput($true)
+$app = New-Object System.Windows.Application
+[void]$app.Run()`, q, qs, secs, loopI), nil
 }

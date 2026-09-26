@@ -44,6 +44,9 @@ func TestTrollScriptSafetyMarkers(t *testing.T) {
 		"MediaOpened",
 		"timeout-no-media",
 		"failed: ",
+		// Multi-monitor (v1.46.6): per-screen windows, modeless pump.
+		"AllScreens",
+		"InvokeShutdown",
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("video script missing safety marker %q", want)
@@ -73,6 +76,9 @@ func TestTrollScriptSafetyMarkers(t *testing.T) {
 		// Playback proof (v1.46.1).
 		"'opened'",
 		"failed: ",
+		// Multi-monitor (v1.46.6): per-screen forms, modeless pump.
+		"AllScreens",
+		"ExitThread",
 	} {
 		if !strings.Contains(gscript, want) {
 			t.Fatalf("gif script missing safety marker %q", want)
@@ -182,6 +188,55 @@ func TestSniffMP4Codec(t *testing.T) {
 	}
 	if got := sniffMP4Codec(filepath.Join(t.TempDir(), "missing.mp4")); got != "" {
 		t.Fatalf("missing file = %q, want empty", got)
+	}
+}
+
+func TestSniffMP4CodecMoovAtEnd(t *testing.T) {
+	// Non-faststart layout: ftyp + mdat up front, moov (with codec box)
+	// at the END. A head-only scan reports "other"; the tail scan must
+	// find it. (jackpot.mp4: 107MB, vp9, moov at EOF.)
+	p := filepath.Join(t.TempDir(), "tail.mp4")
+	f, err := os.Create(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ftyp := []byte{0, 0, 0, 28, 'f', 't', 'y', 'p', 'i', 's', 'o', 'm', 0, 0, 0, 0, 'i', 's', 'o', '2', 0, 0, 0, 0, 0, 0, 0, 0}
+	if _, err := f.Write(ftyp); err != nil {
+		t.Fatal(err)
+	}
+	// 200KB of filler so the tail window (256KB from EOF) differs.
+	filler := make([]byte, 200<<10)
+	if _, err := f.Write(filler); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write([]byte("....moov....vp09....")); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	if got := sniffMP4Codec(p); got != "vp9" {
+		t.Fatalf("moov-at-end vp9 = %q, want vp9", got)
+	}
+	if !mp4HasMoov(p) {
+		t.Fatal("moov-at-end file should have moov")
+	}
+	// Truncated twin: ftyp + filler, no moov anywhere.
+	p2 := filepath.Join(t.TempDir(), "trunc.mp4")
+	f2, err := os.Create(p2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f2.Write(ftyp); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f2.Write(filler); err != nil {
+		t.Fatal(err)
+	}
+	f2.Close()
+	if got := sniffMP4Codec(p2); got != "other" {
+		t.Fatalf("truncated = %q, want other", got)
+	}
+	if mp4HasMoov(p2) {
+		t.Fatal("truncated file must not have moov")
 	}
 }
 
