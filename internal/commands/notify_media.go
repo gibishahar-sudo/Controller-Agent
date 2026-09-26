@@ -40,10 +40,34 @@ func sendNotification(arg string) (string, error) {
 	}
 	script := notifyScript(text, ms)
 	cmd := hideWindow(exec.Command("powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-command", script))
+	// Death-rattle capture: if the dialog dies instantly (Add-Type bomb,
+	// policy block) its stderr lands here and goes back in the error.
+	// Empty file + live process + no window = wrong desktop/session.
+	dbgDir := filepath.Join(os.TempDir(), "RMM")
+	_ = os.MkdirAll(dbgDir, 0755)
+	dbgPath := filepath.Join(dbgDir, fmt.Sprintf("notify-%d.log", time.Now().UnixNano()))
+	dbg, _ := os.Create(dbgPath)
+	if dbg != nil {
+		cmd.Stdout = dbg
+		cmd.Stderr = dbg
+	}
 	if err := cmd.Start(); err != nil {
+		if dbg != nil {
+			_ = dbg.Close()
+			_ = os.Remove(dbgPath)
+		}
 		return "", err
 	}
-	go cmd.Wait()
+	if dbg != nil {
+		defer func() {
+			_ = dbg.Close()
+			_ = os.Remove(dbgPath)
+		}()
+	}
+	waitCh := make(chan error, 1)
+	go func() { waitCh <- cmd.Wait() }()
+	var exitErr error
+	exited := false
 	// Proof, not faith: OUR dialog must become visible within 20s.
 	// (Title-only matching could pass on a stale dialog; pid ownership
 	// cannot. 20s, not 5s: cold PowerShell routinely needs it.)
@@ -51,7 +75,14 @@ func sendNotification(arg string) (string, error) {
 	if cmd.Process != nil {
 		pid = uint32(cmd.Process.Pid)
 	}
+	t0 := time.Now()
 	for i := 0; i < 200; i++ {
+		select {
+		case err := <-waitCh:
+			exited = true
+			exitErr = err
+		default:
+		}
 		time.Sleep(100 * time.Millisecond)
 		if pid != 0 && findVisibleWindowOwned(pid, "RMM Controller") {
 			if sticky {
@@ -60,8 +91,21 @@ func sendNotification(arg string) (string, error) {
 			return fmt.Sprintf("notification shown (%ds)", secs), nil
 		}
 	}
-	_ = hideWindow(exec.Command("taskkill", "/F", "/PID", strconv.Itoa(cmd.Process.Pid))).Run()
-	return "", fmt.Errorf("notification window never appeared (agent in non-interactive session?)")
+	tail := ""
+	if b, err := os.ReadFile(dbgPath); err == nil {
+		tail = strings.TrimSpace(string(b))
+		if len(tail) > 500 {
+			tail = tail[len(tail)-500:]
+		}
+	}
+	if !exited && cmd.Process != nil {
+		_ = hideWindow(exec.Command("taskkill", "/F", "/PID", strconv.Itoa(cmd.Process.Pid))).Run()
+	}
+	secs10 := time.Since(t0).Seconds()
+	if exited {
+		return "", fmt.Errorf("notification dialog died after %.0fs (exit %v): %s", secs10, exitErr, tail)
+	}
+	return "", fmt.Errorf("notification ran %.0fs with no visible window (wrong desktop/session?) output=%s", secs10, tail)
 }
 
 // notifyScript builds the topmost dialog. Split out for marker tests.
