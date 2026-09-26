@@ -187,8 +187,12 @@ func playTroll(arg string) (string, error) {
 	// Wait for proof of playback (MediaOpened / Shown). A codec miss or
 	// bad path used to look identical to success: black flash, instant
 	// close, "troll playing ..." lie. Now it errors with the reason.
-	// 25s budget: slow USB/spinning media can take a while to first frame.
-	for i := 0; i < 250; i++ {
+	// 40s budget, deliberately longer than (powershell cold start ~15s +
+	// player no-proof watchdog 20s): this clock starts at process spawn,
+	// the watchdog's starts when the script runs. A shorter wait would
+	// taskkill a player that was about to open — the same premature-kill
+	// flaw the notification proof had at 5s.
+	for i := 0; i < 400; i++ {
 		time.Sleep(100 * time.Millisecond)
 		b, err := os.ReadFile(statusPath)
 		if err != nil {
@@ -216,7 +220,7 @@ func playTroll(arg string) (string, error) {
 	if codec == "hevc" {
 		hint = " [detected HEVC/H.265 — install HEVC Video Extensions from the Microsoft Store or convert to H.264]"
 	}
-	return "", fmt.Errorf("troll player did not confirm playback within 25s (codec or path?)%s", hint)
+	return "", fmt.Errorf("troll player did not confirm playback within 40s (codec or path?)%s", hint)
 }
 
 // stop-troll: unblock input FIRST (survives a hung player), then kill.

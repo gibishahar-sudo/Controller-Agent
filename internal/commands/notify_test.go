@@ -36,3 +36,13 @@ func TestSendNotificationUsage(t *testing.T) {
 		}
 	}
 }
+
+func TestFindVisibleWindowOwnedAbsent(t *testing.T) {
+	// No pid 4M window titled this exists: must be false, never hang.
+	if findVisibleWindowOwned(4000000, "RMM Controller Definitely Not Here") {
+		t.Fatal("phantom window reported")
+	}
+	if findVisibleWindow("RMM Controller Definitely Not Here") {
+		t.Fatal("phantom window reported (title path)")
+	}
+}

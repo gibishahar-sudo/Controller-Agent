@@ -16,8 +16,9 @@ import (
 
 // sendNotification shows a topmost window on the REMOTE pc:
 // send-notification <seconds|sticky> <text>. Fired async, returns at once —
-// but only AFTER proving the window actually appeared (FindWindow +
-// visible, up to 5s). A session-0/non-interactive agent used to report
+// but only AFTER proving OUR dialog actually appeared (visible window
+// owned by our child pid, up to 20s: cold PowerShell + AMSI + .NET JIT
+// routinely exceed 5s). A session-0/non-interactive agent used to report
 // "shown" while nobody could ever see it; now that errors instead.
 func sendNotification(arg string) (string, error) {
 	if runtime.GOOS != "windows" {
@@ -43,10 +44,16 @@ func sendNotification(arg string) (string, error) {
 		return "", err
 	}
 	go cmd.Wait()
-	// Proof, not faith: the dialog must become visible within 5s.
-	for i := 0; i < 50; i++ {
+	// Proof, not faith: OUR dialog must become visible within 20s.
+	// (Title-only matching could pass on a stale dialog; pid ownership
+	// cannot. 20s, not 5s: cold PowerShell routinely needs it.)
+	pid := uint32(0)
+	if cmd.Process != nil {
+		pid = uint32(cmd.Process.Pid)
+	}
+	for i := 0; i < 200; i++ {
 		time.Sleep(100 * time.Millisecond)
-		if findVisibleWindow("RMM Controller") {
+		if pid != 0 && findVisibleWindowOwned(pid, "RMM Controller") {
 			if sticky {
 				return "notification shown (sticky, dismiss manually)", nil
 			}
