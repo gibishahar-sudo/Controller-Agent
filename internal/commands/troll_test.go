@@ -184,3 +184,27 @@ func TestSniffMP4Codec(t *testing.T) {
 		t.Fatalf("missing file = %q, want empty", got)
 	}
 }
+
+func TestTrollProbeScriptMarkers(t *testing.T) {
+	s, err := trollProbeScript(`C:\m\v.mp4`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"Opacity",
+		"ShowActivated",
+		"MediaOpened",
+		"MediaFailed",
+		"NaturalVideoWidth",
+		"PROBE-RESULT: ",
+	} {
+		if !strings.Contains(s, want) {
+			t.Fatalf("probe script missing marker %q", want)
+		}
+	}
+	for _, bad := range []string{"BlockInput", "Topmost", "SetWindowsHookEx"} {
+		if strings.Contains(s, bad) {
+			t.Fatalf("probe script must not lock down (%q present)", bad)
+		}
+	}
+}

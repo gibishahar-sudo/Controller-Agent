@@ -8,13 +8,17 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Remote notify + speech + session truth + log pull. All Windows paths use
 // built-in PowerShell/.NET only (no new dependencies).
 
 // sendNotification shows a topmost window on the REMOTE pc:
-// send-notification <seconds|sticky> <text>. Fired async, returns at once.
+// send-notification <seconds|sticky> <text>. Fired async, returns at once —
+// but only AFTER proving the window actually appeared (FindWindow +
+// visible, up to 5s). A session-0/non-interactive agent used to report
+// "shown" while nobody could ever see it; now that errors instead.
 func sendNotification(arg string) (string, error) {
 	if runtime.GOOS != "windows" {
 		return "", fmt.Errorf("not supported on %s", runtime.GOOS)
@@ -33,7 +37,29 @@ func sendNotification(arg string) (string, error) {
 	if sticky {
 		ms = 0
 	}
-	script := fmt.Sprintf(`Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing;
+	script := notifyScript(text, ms)
+	cmd := hideWindow(exec.Command("powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-command", script))
+	if err := cmd.Start(); err != nil {
+		return "", err
+	}
+	go cmd.Wait()
+	// Proof, not faith: the dialog must become visible within 5s.
+	for i := 0; i < 50; i++ {
+		time.Sleep(100 * time.Millisecond)
+		if findVisibleWindow("RMM Controller") {
+			if sticky {
+				return "notification shown (sticky, dismiss manually)", nil
+			}
+			return fmt.Sprintf("notification shown (%ds)", secs), nil
+		}
+	}
+	_ = hideWindow(exec.Command("taskkill", "/F", "/PID", strconv.Itoa(cmd.Process.Pid))).Run()
+	return "", fmt.Errorf("notification window never appeared (agent in non-interactive session?)")
+}
+
+// notifyScript builds the topmost dialog. Split out for marker tests.
+func notifyScript(text string, ms int) string {
+	return fmt.Sprintf(`Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing;
 $f = New-Object System.Windows.Forms.Form
 $f.Text = "RMM Controller"
 $f.TopMost = $true
@@ -61,16 +87,8 @@ if (%d -gt 0) {
   $t.Add_Tick({ $f.Close() })
   $t.Start()
 }
+$f.Add_Shown({ $f.Activate() | Out-Null; $f.TopMost = $true })
 [void]$f.ShowDialog()`, psDQString(text), ms, ms)
-	cmd := hideWindow(exec.Command("powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-command", script))
-	if err := cmd.Start(); err != nil {
-		return "", err
-	}
-	go cmd.Wait()
-	if sticky {
-		return "notification shown (sticky, dismiss manually)", nil
-	}
-	return fmt.Sprintf("notification shown (%ds)", secs), nil
 }
 
 // speak uses the built-in Windows voice, async in a detached hidden

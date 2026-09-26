@@ -504,6 +504,8 @@ func Execute(cmd, args string) (string, error) {
 		return stopTroll()
 	case "troll-status":
 		return trollStatus()
+	case "troll-probe":
+		return trollProbe(args)
 	case "camera-shot":
 		return cameraShot(args)
 	case "keep-awake":
