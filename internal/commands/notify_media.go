@@ -38,6 +38,10 @@ func sendNotification(arg string) (string, error) {
 	if sticky {
 		ms = 0
 	}
+	// Serialize with other GUI spawns (see guiSpawnMu): concurrent cold
+	// PowerShells thrash past every proof budget together.
+	guiSpawnMu.Lock()
+	defer guiSpawnMu.Unlock()
 	script := notifyScript(text, ms)
 	cmd := hideWindow(exec.Command("powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-command", script))
 	// Death-rattle capture: if the dialog dies instantly (Add-Type bomb,

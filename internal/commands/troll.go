@@ -128,6 +128,12 @@ func playTroll(arg string) (string, error) {
 		loop = false
 	}
 
+	// Serialize with other GUI spawns (see guiSpawnMu): a previous
+	// player is killed first, so holding the lock across kill+spawn+prove
+	// keeps overlapping play-trolls from thrashing each other cold.
+	guiSpawnMu.Lock()
+	defer guiSpawnMu.Unlock()
+
 	// Kill any previous troll first (one at a time — lock, not a pile-up).
 	stopTrollInternal()
 
@@ -522,6 +528,10 @@ func trollProbe(arg string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// Serialize with other GUI spawns (see guiSpawnMu): the probe loads
+	// the same WPF assemblies cold and would otherwise join the thrash.
+	guiSpawnMu.Lock()
+	defer guiSpawnMu.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	out, err := runHidden(ctx, "powershell", []string{"-NoProfile", "-ExecutionPolicy", "Bypass", "-command", script}...)
