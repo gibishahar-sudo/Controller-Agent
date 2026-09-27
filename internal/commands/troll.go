@@ -392,7 +392,8 @@ public static class RmmTrollEdge {
       int vk = Marshal.ReadInt32(lParam);
       bool alt = KeyDown(0x12), ctrl = KeyDown(0x11);
       if ((vk == 0x09 && alt) || (vk == 0x1B && (alt || ctrl)) ||
-          (vk == 0x73 && alt) || vk == 0x5B || vk == 0x5C) {
+          (vk == 0x73 && alt) || vk == 0x5B || vk == 0x5C ||
+          vk == 0x7A || (vk == 0x20 && alt)) {
         return (IntPtr)1;
       }
     }
@@ -412,6 +413,9 @@ public static class RmmTrollEdge {
   [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
   [DllImport("user32.dll")] public static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
   [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern int GetSystemMetrics(int nIndex);
   public delegate bool EnumWinProc(IntPtr hWnd, IntPtr lParam);
   [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWinProc lpEnumFunc, IntPtr lParam);
   [DllImport("user32.dll", CharSet=CharSet.Auto)] public static extern int GetWindowText(IntPtr hWnd, System.Text.StringBuilder lpString, int nMaxCount);
@@ -432,6 +436,31 @@ public static class RmmTrollEdge {
     foundHwnd = IntPtr.Zero;
     EnumWindows(new EnumWinProc(EnumCb), IntPtr.Zero);
     return foundHwnd;
+  }
+  // FullscreenTroll pins the kiosk window over the whole virtual screen
+  // (all monitors): Edge kiosk does not reliably go fullscreen itself,
+  // so the rect is forced instead of trusted. Restores if minimized
+  // (Win+D) and keeps it topmost.
+  public static void FullscreenTroll(IntPtr h) {
+    if (h == IntPtr.Zero) { return; }
+    if (IsIconic(h)) { ShowWindow(h, 9); }
+    int vx = GetSystemMetrics(76), vy = GetSystemMetrics(77);
+    int vw = GetSystemMetrics(78), vh = GetSystemMetrics(79);
+    if (vw > 0 && vh > 0) {
+      SetWindowPos(h, HWND_TOPMOST, vx, vy, vw, vh, 0x0040);
+    } else {
+      SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0, 0x0002 | 0x0001);
+    }
+  }
+  // GetTrollTitle returns the matched kiosk window title ("" when none):
+  // the page reports playback state through it (RMM-TROLL-PLAYING vs
+  // RMM-TROLL-STALLED:<reason>).
+  public static string GetTrollTitle() {
+    IntPtr h = FindTrollWindow();
+    if (h == IntPtr.Zero) { return ""; }
+    System.Text.StringBuilder sb = new System.Text.StringBuilder(256);
+    if (GetWindowText(h, sb, 256) == 0) { return ""; }
+    return sb.ToString();
   }
 }
 '@
@@ -463,7 +492,7 @@ New-Item -ItemType Directory -Force -Path $profile | Out-Null
 New-Item -ItemType File -Force -Path (Join-Path $profile 'First Run') | Out-Null
 $mediaUri = (New-Object System.Uri(%s)).AbsoluteUri
 $mu = $mediaUri.Replace('&', '&amp;').Replace('"', '&quot;')
-$html = '<!DOCTYPE html><html><head><title>RMM-TROLL</title><style>html,body{margin:0;background:#000;height:100%%%%}%s{width:100%%%%;height:100%%%%}</style></head><body><%s autoplay %s><source src="' + $mu + '"></%s></body></html>'
+$html = '<!DOCTYPE html><html><head><title>RMM-TROLL</title><style>html,body{margin:0;background:#000;height:100%%%%;display:flex;align-items:center;justify-content:center;overflow:hidden}%s{max-width:100%%%%;max-height:100%%%%;object-fit:contain}</style></head><body><%s id="m" autoplay %s><source src="' + $mu + '"></%s><script>var m=document.getElementById("m");function st(t){try{document.title=t;}catch(e){}}m.addEventListener("playing",function(){st("RMM-TROLL-PLAYING");});m.addEventListener("error",function(){var e=m.error;st("RMM-TROLL-STALLED:media-error-"+(e?e.code:"?"));});m.addEventListener("stalled",function(){st("RMM-TROLL-STALLED:stalled");});m.addEventListener("waiting",function(){st("RMM-TROLL-STALLED:waiting");});m.addEventListener("ended",function(){st("RMM-TROLL-ENDED");});</script></body></html>'
 $wrapper = Join-Path $profile 'play.html'
 Set-Content -Path $wrapper -Value $html -Encoding UTF8
 $wrapUri = (New-Object System.Uri($wrapper)).AbsoluteUri
@@ -475,20 +504,35 @@ try {
   [RmmTrollEdge]::Uninstall()
   exit 4
 }
-# Proof: the kiosk window must appear (title carries the page title).
+# Proof: PLAYING (or ENDED for noloop) means the engine renders.
+# A media error fails fast with its code; buffering stalls just wait out
+# the budget; no window at all fails at budget end.
 $found = $false
+$sawWindow = $false
 for ($i = 0; $i -lt 200 -and -not $found; $i++) {
   Start-Sleep -Milliseconds 100
-  $h = [RmmTrollEdge]::FindTrollWindow()
-  if ($h -ne [IntPtr]::Zero) { $found = $true }
+  $t = [RmmTrollEdge]::GetTrollTitle()
+  if ($t -eq '') { continue }
+  $sawWindow = $true
+  if ($t.StartsWith('RMM-TROLL-PLAYING') -or $t -eq 'RMM-TROLL-ENDED') { $found = $true }
+  elseif ($t.StartsWith('RMM-TROLL-STALLED:media-error')) {
+    Set-Content -Path $status -Value ('failed: edge cannot decode it (' + $t + ')')
+    Stop-TrollEdge
+    exit 5
+  }
 }
 if (-not $found) {
-  Set-Content -Path $status -Value 'failed: edge kiosk window never appeared'
+  if ($sawWindow) {
+    Set-Content -Path $status -Value 'timeout-no-playback (kiosk window up, media never started: codec or very slow media?)'
+  } else {
+    Set-Content -Path $status -Value 'failed: edge kiosk window never appeared'
+  }
   Stop-TrollEdge
   exit 5
 }
 $script:seen = $true
 Set-Content -Path $status -Value 'opened'
+[RmmTrollEdge]::FullscreenTroll([RmmTrollEdge]::FindTrollWindow())
 [void][RmmTrollEdge]::BlockInput($true)
 # Guard: re-assert TopMost, heal murdered players, hard-stop at $secs.
 # A hidden 1x1 form pumps messages so the hook stays live.
@@ -505,7 +549,7 @@ $guard.Add_Tick({
   if (-not $script:allowClose) {
     $h = [RmmTrollEdge]::FindTrollWindow()
     if ($h -ne [IntPtr]::Zero) {
-      [void][RmmTrollEdge]::SetWindowPos($h, [RmmTrollEdge]::HWND_TOPMOST, 0, 0, 0, 0, 0x0002 -bor 0x0001)
+      [RmmTrollEdge]::FullscreenTroll($h)
       [void][RmmTrollEdge]::BlockInput($true)
     }
   }
@@ -1186,7 +1230,8 @@ public static class RmmTrollHook {
       int vk = Marshal.ReadInt32(lParam);
       bool alt = KeyDown(0x12), ctrl = KeyDown(0x11);
       if ((vk == 0x09 && alt) || (vk == 0x1B && (alt || ctrl)) ||
-          (vk == 0x73 && alt) || vk == 0x5B || vk == 0x5C) {
+          (vk == 0x73 && alt) || vk == 0x5B || vk == 0x5C ||
+          vk == 0x7A || (vk == 0x20 && alt)) {
         return (IntPtr)1;
       }
     }
@@ -1307,7 +1352,8 @@ public static class RmmTrollHookV {
       int vk = Marshal.ReadInt32(lParam);
       bool alt = KeyDown(0x12), ctrl = KeyDown(0x11);
       if ((vk == 0x09 && alt) || (vk == 0x1B && (alt || ctrl)) ||
-          (vk == 0x73 && alt) || vk == 0x5B || vk == 0x5C) {
+          (vk == 0x73 && alt) || vk == 0x5B || vk == 0x5C ||
+          vk == 0x7A || (vk == 0x20 && alt)) {
         return (IntPtr)1;
       }
     }
