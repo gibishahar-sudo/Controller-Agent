@@ -1849,10 +1849,10 @@ func setupLogFile() {
 	}
 	df, err := os.OpenFile(debugPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
-		log.SetOutput(io.MultiWriter(os.Stderr, f))
+		log.SetOutput(&fanoutWriter{ws: []io.Writer{os.Stderr, f}})
 		return
 	}
-	log.SetOutput(io.MultiWriter(os.Stderr, f, df))
+	log.SetOutput(&fanoutWriter{ws: []io.Writer{os.Stderr, f, df}})
 	dlog.SetOutput(df)
 }
 

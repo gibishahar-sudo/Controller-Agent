@@ -351,3 +351,56 @@ func TestMp4IndexSane(t *testing.T) {
 		t.Fatal("fragmented file should pass through")
 	}
 }
+
+func TestTrollEngine(t *testing.T) {
+	cases := []struct {
+		codec   string
+		indexOK bool
+		edgeOK  bool
+		want    string
+		wantErr bool
+	}{
+		{"h264", true, true, "wpf", false},
+		{"h264", true, false, "wpf", false},
+		{"h264", false, true, "edge", false},
+		{"h264", false, false, "", true},
+		{"vp9", true, true, "edge", false},
+		{"vp9", true, false, "", true},
+		{"av1", false, true, "edge", false},
+		{"", true, false, "wpf", false},
+		{"other", true, true, "wpf", false},
+	}
+	for _, c := range cases {
+		got, err := trollEngine(c.codec, c.indexOK, c.edgeOK)
+		if c.wantErr && err == nil {
+			t.Fatalf("engine(%q,%v,%v) should error", c.codec, c.indexOK, c.edgeOK)
+		}
+		if !c.wantErr && (err != nil || got != c.want) {
+			t.Fatalf("engine(%q,%v,%v) = %q,%v want %q", c.codec, c.indexOK, c.edgeOK, got, err, c.want)
+		}
+	}
+}
+
+func TestTrollEdgeScriptMarkers(t *testing.T) {
+	s, err := trollEdgeScript(`C:\e\msedge.exe`, `C:\m\v.mp4`, false, 300, true, `C:\m\status.txt`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"--kiosk",
+		"--user-data-dir=",
+		"--autoplay-policy=no-user-gesture-required",
+		"RMM-TROLL",
+		"SetWindowPos",
+		"HWND_TOPMOST",
+		"BlockInput($true)",
+		"BlockInput($false)",
+		"'opened'",
+		"failed: ",
+		"user-data-dir",
+	} {
+		if !strings.Contains(s, want) {
+			t.Fatalf("edge script missing marker %q", want)
+		}
+	}
+}

