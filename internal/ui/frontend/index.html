@@ -1836,7 +1836,7 @@ async function sha256hex(bytes){ const d=await crypto.subtle.digest("SHA-256",by
 function setXfer(pct,label){ $("transferBar").style.width=pct+"%"; $("transferLabel").textContent=label; }
 // Chunk sizes mirror the controller's fileChunkRaw table — keep in sync.
 function xferChunkRaw(a){ const r=(a&&a.remote)||""; if(r==="mqtt") return 128*1024; return 512*1024; }
-function xferPace(a){ const r=(a&&a.remote)||""; if(r==="mqtt") return 5; return 0; }
+function xferPace(a){ const r=(a&&a.remote)||""; if(r==="mqtt") return 100; return 0; }
 function fileVia(){ const el=$("fileViaSel"); return el?el.value:""; }
 let dlSession=null; // {id,path,saveName,total,size,sha,chunks:Map,retries,timer,mode,kind}
 let dlQueue=[]; // queued browser downloads {path,saveName}

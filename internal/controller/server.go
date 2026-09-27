@@ -2697,12 +2697,16 @@ func (s *Server) sendToAgent(ac *AgentConn, msg protocol.Message) error {
 		// worst-case command latency.
 		//
 		// Small interactive orders ride the 2s fast publish (a wedged hop
-		// fails over in 2s, not 10s); bulk chunks keep 10s.
+		// fails over in 2s, not 10s); bulk chunks keep 10s. Upload chunks
+		// are the exception: 800+ serial 10s blocks wedge the whole lane
+		// on a slow link, while gap recovery + idempotent WriteAt make a
+		// 2s failover strictly safer than head-of-line blocking.
 		pub := bus.PublishCmd
 		switch msg.Type {
 		case protocol.TypeScreenshotRequest, protocol.TypePing,
 			protocol.TypeCommand, protocol.TypeFileDlReq,
-			protocol.TypeUpdateBegin, protocol.TypeFileUlBegin:
+			protocol.TypeUpdateBegin, protocol.TypeFileUlBegin,
+			protocol.TypeFileUlChunk:
 			pub = bus.PublishCmdFast
 		}
 		s.trackCmd(msg, ac.id) // relay loss is real: retry if no output

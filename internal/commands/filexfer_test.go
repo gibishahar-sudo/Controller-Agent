@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -72,4 +73,43 @@ func TestFileDlManifestCap(t *testing.T) {
 	if _, err := FileDlManifest(p, 512*1024); err == nil {
 		t.Fatal("over-1GB download manifest accepted")
 	}
+}
+
+// Crash-resume: a re-begin with a matching manifest keeps received
+// chunks (sidecar); a mismatched manifest starts fresh.
+func TestFileUlResume(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "r.bin")
+	if _, err := StartFileUl(p, 100, "sha1", 2); err != nil {
+		t.Fatal(err)
+	}
+	chunk := base64.StdEncoding.EncodeToString([]byte("chunk0"))
+	if _, err := WriteFileUlChunk(0, chunk, 50); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a restart: drop memory state, keep disk.
+	fileUlMu.Lock()
+	fileUlState = nil
+	fileUlMu.Unlock()
+	res, err := StartFileUl(p, 100, "sha1", 2)
+	if err != nil {
+		t.Fatalf("resume refused: %v", err)
+	}
+	if !strings.Contains(res, "resumed 1/2") {
+		t.Fatalf("resume message = %q, want resumed 1/2", res)
+	}
+	// Mismatched manifest must NOT resume.
+	fileUlMu.Lock()
+	fileUlState = nil
+	fileUlMu.Unlock()
+	res, err = StartFileUl(p, 200, "sha2", 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(res, "resumed") {
+		t.Fatalf("mismatched manifest resumed: %q", res)
+	}
+	fileUlMu.Lock()
+	fileUlState = nil
+	fileUlMu.Unlock()
 }

@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"image"
 	"image/color"
@@ -284,6 +285,9 @@ type fileUlSession struct {
 const maxUlIdle = 2 * time.Hour
 
 // StartFileUl begins an upload: creates the .part file (parents included).
+// Crash-proof: a sidecar manifest (part + ".json") records have-chunks;
+// a re-begin with a matching manifest resumes the surviving .part
+// instead of wiping an hour of received chunks.
 func StartFileUl(path string, size int64, sha string, total int) (string, error) {
 	if path == "" {
 		return "", fmt.Errorf("path required")
@@ -301,7 +305,12 @@ func StartFileUl(path string, size int64, sha string, total int) (string, error)
 	defer fileUlMu.Unlock()
 	_ = os.MkdirAll(filepath.Dir(path), 0755)
 	part := path + ".part"
+	if have, ok := readUlSidecar(part, path, size, sha, total); ok {
+		fileUlState = &fileUlSession{path: path, size: size, sha: sha, total: total, part: part, have: have, started: time.Now(), lastChunk: time.Now()}
+		return fmt.Sprintf("upload %s accepted (%d bytes in %d chunks, resumed %d/%d)", filepath.Base(path), size, total, len(have), total), nil
+	}
 	_ = os.Remove(part)
+	_ = os.Remove(part + ".json")
 	f, err := os.OpenFile(part, os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return "", err
@@ -309,6 +318,59 @@ func StartFileUl(path string, size int64, sha string, total int) (string, error)
 	f.Close()
 	fileUlState = &fileUlSession{path: path, size: size, sha: sha, total: total, part: part, have: map[int]bool{}, started: time.Now(), lastChunk: time.Now()}
 	return fmt.Sprintf("upload %s accepted (%d bytes in %d chunks)", filepath.Base(path), size, total), nil
+}
+
+// ulSidecar is the crash-resume manifest beside the .part file.
+type ulSidecar struct {
+	Path  string `json:"path"`
+	Size  int64  `json:"size"`
+	SHA   string `json:"sha"`
+	Total int    `json:"total"`
+	Have  []int  `json:"have"`
+}
+
+// writeUlSidecar persists received-chunk progress (best effort: a lost
+// sidecar only costs re-transfer, never correctness).
+func writeUlSidecar(st *fileUlSession) {
+	have := make([]int, 0, len(st.have))
+	for s := range st.have {
+		have = append(have, s)
+	}
+	sort.Ints(have)
+	b, err := json.Marshal(ulSidecar{Path: st.path, Size: st.size, SHA: st.sha, Total: st.total, Have: have})
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(st.part+".json", b, 0600)
+}
+
+// readUlSidecar validates a surviving .part against the manifest and
+// returns its have-set. Anything mismatched (or unreadable) means fresh.
+func readUlSidecar(part, path string, size int64, sha string, total int) (map[int]bool, bool) {
+	b, err := os.ReadFile(part + ".json")
+	if err != nil {
+		return nil, false
+	}
+	var sc ulSidecar
+	if err := json.Unmarshal(b, &sc); err != nil {
+		return nil, false
+	}
+	if sc.Path != path || sc.Size != size || sc.SHA != sha || sc.Total != total {
+		return nil, false
+	}
+	if _, err := os.Stat(part); err != nil {
+		return nil, false
+	}
+	have := map[int]bool{}
+	for _, s := range sc.Have {
+		if s >= 0 && s < total {
+			have[s] = true
+		}
+	}
+	if len(have) == 0 {
+		return nil, false
+	}
+	return have, true
 }
 
 // WriteFileUlChunk stores one upload chunk at its offset; finalizes (verify
@@ -326,6 +388,7 @@ func WriteFileUlChunk(seq int, b64 string, chunkRaw int) (string, error) {
 	}
 	if time.Since(st.lastChunk) > maxUlIdle {
 		_ = os.Remove(st.part)
+		_ = os.Remove(st.part + ".json")
 		fileUlState = nil
 		fileUlMu.Unlock()
 		return "", fmt.Errorf("upload session idle over 2h — restart the upload")
@@ -350,6 +413,7 @@ func WriteFileUlChunk(seq int, b64 string, chunkRaw int) (string, error) {
 	}
 	st.have[seq] = true
 	st.lastChunk = time.Now()
+	writeUlSidecar(st)
 	n := len(st.have)
 	done := n == st.total
 	fileUlMu.Unlock()
@@ -376,6 +440,7 @@ func finalizeFileUl() (string, error) {
 	}
 	if info.Size() != st.size {
 		_ = os.Remove(st.part)
+		_ = os.Remove(st.part + ".json")
 		return "", fmt.Errorf("upload size mismatch (%d != %d)", info.Size(), st.size)
 	}
 	if st.sha != "" {
@@ -397,11 +462,13 @@ func finalizeFileUl() (string, error) {
 		f.Close()
 		if hex.EncodeToString(h.Sum(nil)) != st.sha {
 			_ = os.Remove(st.part)
+			_ = os.Remove(st.part + ".json")
 			return "", fmt.Errorf("upload hash mismatch, retry (nothing written)")
 		}
 	}
 	if err := os.Rename(st.part, st.path); err != nil {
 		return "", err
 	}
+	_ = os.Remove(st.part + ".json")
 	return fmt.Sprintf("upload complete: %s (%d bytes, sha ok)", st.path, st.size), nil
 }
