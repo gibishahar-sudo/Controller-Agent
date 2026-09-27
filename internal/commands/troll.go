@@ -52,6 +52,28 @@ func trollStatusFile() string {
 	return filepath.Join(trollMediaDir(), "status.txt")
 }
 
+// trollStopFlagPath is the stop sentinel: stop-troll plants it, every
+// guardian honors it (permanent stand-down, no relaunch), play-troll
+// clears it at start. This ends resurrection races where duplicate
+// players outlive a stop aimed at only the pid-file one.
+func trollStopFlagPath(dir string) string {
+	return filepath.Join(dir, "troll.stop")
+}
+
+func setTrollStopFlag(dir string) {
+	_ = os.MkdirAll(dir, 0755)
+	_ = os.WriteFile(trollStopFlagPath(dir), []byte("stop\n"), 0644)
+}
+
+func clearTrollStopFlag(dir string) {
+	_ = os.Remove(trollStopFlagPath(dir))
+}
+
+func trollStopFlagged(dir string) bool {
+	_, err := os.Stat(trollStopFlagPath(dir))
+	return err == nil
+}
+
 // Media the player can actually open. Anything else fails fast with a
 // clear error instead of a black flash + instant close (MediaFailed).
 // The WPF branch plays video AND audio (MediaElement is a full media
@@ -181,6 +203,9 @@ func playTroll(arg string) (string, error) {
 	defer guiSpawnMu.Unlock()
 
 	// Kill any previous troll first (one at a time — lock, not a pile-up).
+	// The stop flag is cleared here (not inside stopTrollInternal, which
+	// sets it): a new play means business, a stop means stand down.
+	clearTrollStopFlag(trollMediaDir())
 	stopTrollInternal()
 
 	local := src
@@ -359,6 +384,7 @@ func trollEdgeScript(edgeBin, local string, isAudio bool, secs int, loop bool, s
 	qe := psQuote(edgeBin)
 	qp := psQuote(trollEdgeProfile())
 	qs := psQuote(status)
+	qf := psQuote(trollStopFlagPath(trollMediaDir()))
 	tag := "video"
 	if isAudio {
 		tag = "audio"
@@ -469,6 +495,7 @@ public static class RmmTrollEdge {
 $edge = %s
 $profile = %s
 $status = %s
+$stopFlag = %s
 $secs = %d
 $loop = %d
 $script:allowClose = $false
@@ -529,6 +556,7 @@ $found = $false
 $sawWindow = $false
 for ($i = 0; $i -lt 200 -and -not $found; $i++) {
   Start-Sleep -Milliseconds 100
+  if (Test-Path $stopFlag) { Stop-TrollEdge; exit 6 }
   $t = [RmmTrollEdge]::GetTrollTitle()
   if ($t -eq '') { continue }
   $sawWindow = $true
@@ -564,6 +592,9 @@ $born = Get-Date
 $guard = New-Object System.Windows.Forms.Timer
 $guard.Interval = 500
 $guard.Add_Tick({
+  # Stop flag (planted by stop-troll) wins over everything, including a
+  # relaunch decision: stand down permanently, never resurrect.
+  if (Test-Path $stopFlag) { Stop-TrollEdge; $gf.Close(); return }
   if (-not $script:allowClose) {
     $h = [RmmTrollEdge]::FindTrollWindow()
     if ($h -ne [IntPtr]::Zero) {
@@ -585,7 +616,7 @@ $guard.Start()
 $gf.Add_FormClosed({ param($s,$e) [void][RmmTrollEdge]::BlockInput($false); [RmmTrollEdge]::Uninstall() })
 $gf.Show()
 [System.Windows.Forms.Application]::Run()
-`, qe, qp, qs, secs, loopI, qm, tag, tag, loopAttr, tag), nil
+`, qe, qp, qs, qf, secs, loopI, qm, tag, tag, loopAttr, tag), nil
 }
 
 // stop-troll: unblock input FIRST (survives a hung player), then kill.
@@ -601,6 +632,10 @@ func stopTroll() (string, error) {
 }
 
 // stopTrollInternal unblocks input + kills the player. Returns pid, found.
+// Order matters: the stop flag goes FIRST so duplicate guardians (beyond
+// the pid file) stand down instead of resurrecting the lockdown after
+// the kills land; unblock runs twice (shared shell, then one-shot) so a
+// wedged shell alone cannot leave input dead.
 func stopTrollInternal() (int, bool) {
 	// Unblock input even if the player is wedged — BlockInput(false) from
 	// any process with the right integrity level clears the desktop lock.
@@ -611,6 +646,7 @@ public static class RmmTrollBlk {
   [DllImport("user32.dll")] public static extern bool BlockInput(bool fBlock);
 }
 '@; [void][RmmTrollBlk]::BlockInput($false)`
+	setTrollStopFlag(trollMediaDir())
 	_, _ = execPS(unblock)
 
 	pid := 0
@@ -624,10 +660,18 @@ public static class RmmTrollBlk {
 	if pid > 0 {
 		_ = hideWindow(exec.Command("taskkill", "/F", "/PID", strconv.Itoa(pid))).Run()
 	}
+	// Orphan sweep: duplicate player shells beyond the pid file match by
+	// their embedded class names (never the agent: its command line has
+	// none of these). Self-match impossible: this code runs inside the
+	// agent, not a player shell. Excludes nothing else.
+	sweep := `Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like '*RmmTroll*' -and $_.ProcessId -ne $PID } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`
+	_, _ = execPS(sweep)
 	// Chromium fallback players carry no pid file of their own (the
 	// guardian holds it): sweep their kiosk windows by title. Scoped to
 	// RMM-TROLL so a user's own Edge windows are never touched.
 	_ = hideWindow(exec.Command("taskkill", "/F", "/FI", "WINDOWTITLE eq RMM-TROLL*")).Run()
+	// Second unblock, one-shot: survives a wedged shared shell.
+	_, _ = hideWindow(exec.Command("powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-command", unblock)).CombinedOutput()
 	return pid, pid > 0
 }
 

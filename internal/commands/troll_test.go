@@ -412,9 +412,29 @@ func TestTrollEdgeScriptMarkers(t *testing.T) {
 		"'opened'",
 		"failed: ",
 		"user-data-dir",
+		"stopFlag",
+		"troll.stop",
 	} {
 		if !strings.Contains(s, want) {
 			t.Fatalf("edge script missing marker %q", want)
 		}
+	}
+}
+
+func TestTrollStopFlag(t *testing.T) {
+	dir := t.TempDir()
+	if trollStopFlagged(dir) {
+		t.Fatal("fresh dir should not be flagged")
+	}
+	setTrollStopFlag(dir)
+	if !trollStopFlagged(dir) {
+		t.Fatal("flag should exist after set")
+	}
+	clearTrollStopFlag(dir)
+	if trollStopFlagged(dir) {
+		t.Fatal("flag should be gone after clear")
+	}
+	if trollStopFlagPath(dir) == "" {
+		t.Fatal("empty flag path")
 	}
 }
