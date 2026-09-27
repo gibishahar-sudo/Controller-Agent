@@ -388,8 +388,12 @@ func TestTrollEdgeScriptMarkers(t *testing.T) {
 	}
 	for _, want := range []string{
 		"--kiosk",
+		"--new-window",
 		"--user-data-dir=",
 		"--autoplay-policy=no-user-gesture-required",
+		"First Run",
+		"FindTrollWindow",
+		"EnumWindows",
 		"RMM-TROLL",
 		"SetWindowPos",
 		"HWND_TOPMOST",

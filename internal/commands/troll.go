@@ -412,7 +412,27 @@ public static class RmmTrollEdge {
   [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
   [DllImport("user32.dll")] public static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
   [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+  public delegate bool EnumWinProc(IntPtr hWnd, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWinProc lpEnumFunc, IntPtr lParam);
+  [DllImport("user32.dll", CharSet=CharSet.Auto)] public static extern int GetWindowText(IntPtr hWnd, System.Text.StringBuilder lpString, int nMaxCount);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
   public static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
+  public static IntPtr foundHwnd = IntPtr.Zero;
+  public static bool EnumCb(IntPtr hWnd, IntPtr lParam) {
+    if (!IsWindowVisible(hWnd)) { return true; }
+    System.Text.StringBuilder sb = new System.Text.StringBuilder(256);
+    if (GetWindowText(hWnd, sb, 256) == 0) { return true; }
+    if (sb.ToString().StartsWith("RMM-TROLL")) { foundHwnd = hWnd; return false; }
+    return true;
+  }
+  // FindTrollWindow matches by PREFIX: a kiosk window is titled exactly
+  // RMM-TROLL, but a tab-joined or suffixed variant starts with it too.
+  // Exact FindWindow alone misses those (and first-run pages).
+  public static IntPtr FindTrollWindow() {
+    foundHwnd = IntPtr.Zero;
+    EnumWindows(new EnumWinProc(EnumCb), IntPtr.Zero);
+    return foundHwnd;
+  }
 }
 '@
 [void][RmmTrollEdge]::SetProcessDPIAware()
@@ -438,13 +458,16 @@ function Stop-TrollEdge {
   Edge-Kill
 }
 New-Item -ItemType Directory -Force -Path $profile | Out-Null
+# First Run sentinel: a fresh profile otherwise opens the welcome page
+# (wrong title, wrong window) instead of our kiosk page.
+New-Item -ItemType File -Force -Path (Join-Path $profile 'First Run') | Out-Null
 $mediaUri = (New-Object System.Uri(%s)).AbsoluteUri
 $mu = $mediaUri.Replace('&', '&amp;').Replace('"', '&quot;')
 $html = '<!DOCTYPE html><html><head><title>RMM-TROLL</title><style>html,body{margin:0;background:#000;height:100%%%%}%s{width:100%%%%;height:100%%%%}</style></head><body><%s autoplay %s><source src="' + $mu + '"></%s></body></html>'
 $wrapper = Join-Path $profile 'play.html'
 Set-Content -Path $wrapper -Value $html -Encoding UTF8
 $wrapUri = (New-Object System.Uri($wrapper)).AbsoluteUri
-$edgeArgs = @('--kiosk', $wrapUri, ('--user-data-dir='+$profile), '--no-first-run', '--autoplay-policy=no-user-gesture-required', '--disable-features=Translate', '--disable-infobars', '--disable-session-crashed-bubble')
+$edgeArgs = @('--kiosk', '--new-window', $wrapUri, ('--user-data-dir='+$profile), '--no-first-run', '--autoplay-policy=no-user-gesture-required', '--disable-features=Translate', '--disable-infobars', '--disable-session-crashed-bubble')
 try {
   $ep = Start-Process -FilePath $edge -ArgumentList $edgeArgs -PassThru -ErrorAction Stop
 } catch {
@@ -456,7 +479,7 @@ try {
 $found = $false
 for ($i = 0; $i -lt 200 -and -not $found; $i++) {
   Start-Sleep -Milliseconds 100
-  $h = [RmmTrollEdge]::FindWindow($null, 'RMM-TROLL')
+  $h = [RmmTrollEdge]::FindTrollWindow()
   if ($h -ne [IntPtr]::Zero) { $found = $true }
 }
 if (-not $found) {
@@ -480,7 +503,7 @@ $guard = New-Object System.Windows.Forms.Timer
 $guard.Interval = 500
 $guard.Add_Tick({
   if (-not $script:allowClose) {
-    $h = [RmmTrollEdge]::FindWindow($null, 'RMM-TROLL')
+    $h = [RmmTrollEdge]::FindTrollWindow()
     if ($h -ne [IntPtr]::Zero) {
       [void][RmmTrollEdge]::SetWindowPos($h, [RmmTrollEdge]::HWND_TOPMOST, 0, 0, 0, 0, 0x0002 -bor 0x0001)
       [void][RmmTrollEdge]::BlockInput($true)
