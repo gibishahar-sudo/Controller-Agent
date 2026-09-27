@@ -487,18 +487,36 @@ function Stop-TrollEdge {
   Edge-Kill
 }
 New-Item -ItemType Directory -Force -Path $profile | Out-Null
-# First Run sentinel: a fresh profile otherwise opens the welcome page
-# (wrong title, wrong window) instead of our kiosk page.
+# First-run suppression, layered (any single layer leaks setup UI on a
+# box where Edge never ran): sentinel file, Preferences seed, and flags
+# below. A hijacked kiosk window has the wrong title AND blocks the mp4.
 New-Item -ItemType File -Force -Path (Join-Path $profile 'First Run') | Out-Null
+$pref = Join-Path $profile 'Preferences'
+if (-not (Test-Path $pref)) {
+  Set-Content -Path $pref -Value '{"browser":{"has_seen_welcome_page":true},"startup_urls_migration_time":0,"session":{"restore_on_startup":5}}' -Encoding UTF8
+}
+function Edge-CleanLocks {
+  # Stale locks from hard-killed runs otherwise greet the next launch
+  # with profile-error pages instead of our video.
+  foreach ($n in @('SingletonLock', 'SingletonSocket', 'SingletonCookie')) {
+    $p = Join-Path $profile $n
+    if (Test-Path $p) { Remove-Item $p -Force -ErrorAction SilentlyContinue }
+  }
+}
+Edge-CleanLocks
 $mediaUri = (New-Object System.Uri(%s)).AbsoluteUri
 $mu = $mediaUri.Replace('&', '&amp;').Replace('"', '&quot;')
 $html = '<!DOCTYPE html><html><head><title>RMM-TROLL</title><style>html,body{margin:0;background:#000;height:100%%%%;display:flex;align-items:center;justify-content:center;overflow:hidden}%s{max-width:100%%%%;max-height:100%%%%;object-fit:contain}</style></head><body><%s id="m" autoplay %s><source src="' + $mu + '"></%s><script>var m=document.getElementById("m");function st(t){try{document.title=t;}catch(e){}}m.addEventListener("playing",function(){st("RMM-TROLL-PLAYING");});m.addEventListener("error",function(){var e=m.error;st("RMM-TROLL-STALLED:media-error-"+(e?e.code:"?"));});m.addEventListener("stalled",function(){st("RMM-TROLL-STALLED:stalled");});m.addEventListener("waiting",function(){st("RMM-TROLL-STALLED:waiting");});m.addEventListener("ended",function(){st("RMM-TROLL-ENDED");});</script></body></html>'
 $wrapper = Join-Path $profile 'play.html'
 Set-Content -Path $wrapper -Value $html -Encoding UTF8
 $wrapUri = (New-Object System.Uri($wrapper)).AbsoluteUri
-$edgeArgs = @('--kiosk', '--new-window', $wrapUri, ('--user-data-dir='+$profile), '--no-first-run', '--autoplay-policy=no-user-gesture-required', '--disable-features=Translate', '--disable-infobars', '--disable-session-crashed-bubble')
+$edgeArgs = @('--kiosk', '--new-window', $wrapUri, ('--user-data-dir='+$profile), '--no-first-run', '--no-default-browser-check', '--disable-search-engine-choice-screen', '--disable-sync', '--disable-component-update', '--autoplay-policy=no-user-gesture-required', '--disable-features=Translate', '--disable-infobars', '--disable-session-crashed-bubble', '--hide-crash-restore-bubble')
+function Start-TrollEdge {
+  Edge-CleanLocks
+  return (Start-Process -FilePath $edge -ArgumentList $edgeArgs -PassThru -ErrorAction Stop)
+}
 try {
-  $ep = Start-Process -FilePath $edge -ArgumentList $edgeArgs -PassThru -ErrorAction Stop
+  $ep = Start-TrollEdge
 } catch {
   Set-Content -Path $status -Value ('failed: edge launch: ' + $_.Exception.Message)
   [RmmTrollEdge]::Uninstall()
@@ -555,7 +573,7 @@ $guard.Add_Tick({
   }
   if (-not (Edge-Running)) {
     if ($script:allowClose) { $gf.Close() } else {
-      try { $ep = Start-Process -FilePath $edge -ArgumentList $edgeArgs -PassThru -ErrorAction Stop } catch {}
+      try { $ep = Start-TrollEdge } catch {}
     }
   }
   if (((Get-Date) - $born).TotalSeconds -ge $secs) {
