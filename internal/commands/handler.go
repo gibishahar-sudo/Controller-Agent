@@ -355,6 +355,8 @@ func Execute(cmd, args string) (string, error) {
 		return renameItem(args)
 	case "get-file-info":
 		return fileInfo(args)
+	case "upload-status":
+		return uploadStatus(args)
 	case "get-file-hash":
 		return fileHash(args)
 	case "get-directory-size":

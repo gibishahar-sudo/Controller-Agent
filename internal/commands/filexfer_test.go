@@ -1,7 +1,9 @@
 package commands
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"strings"
@@ -112,4 +114,66 @@ func TestFileUlResume(t *testing.T) {
 	fileUlMu.Lock()
 	fileUlState = nil
 	fileUlMu.Unlock()
+}
+
+func TestCompressRanges(t *testing.T) {
+	if got := compressRanges(map[int]bool{}, 10); got != "none" {
+		t.Fatalf("empty = %q", got)
+	}
+	have := map[int]bool{0: true, 1: true, 2: true, 5: true, 7: true, 8: true, 9: true}
+	if got := compressRanges(have, 10); got != "0-2,5,7-9" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestUploadStatus(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "s.bin")
+	if out, _ := uploadStatus(""); out != "" {
+		t.Fatal("empty path should error")
+	}
+	if out, err := uploadStatus(p); err != nil || !strings.HasPrefix(out, "upload unknown ") {
+		t.Fatalf("no session = %q,%v", out, err)
+	}
+	if _, err := StartFileUl(p, 100, "", 2); err != nil {
+		t.Fatal(err)
+	}
+	out, err := uploadStatus(p)
+	if err != nil || out != "upload have 2 none "+p {
+		t.Fatalf("fresh session = %q,%v", out, err)
+	}
+	chunk := base64.StdEncoding.EncodeToString([]byte("chunk0"))
+	if _, err := WriteFileUlChunk(0, chunk, 50); err != nil {
+		t.Fatal(err)
+	}
+	out, err = uploadStatus(p)
+	if err != nil || out != "upload have 2 0 "+p {
+		t.Fatalf("partial session = %q,%v", out, err)
+	}
+	fileUlMu.Lock()
+	fileUlState = nil
+	fileUlMu.Unlock()
+}
+
+func TestStartFileUlAlreadyPresent(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "done.bin")
+	content := []byte("already-here-bytes")
+	if err := os.WriteFile(p, content, 0644); err != nil {
+		t.Fatal(err)
+	}
+	h := sha256.Sum256(content)
+	sha := hex.EncodeToString(h[:])
+	res, err := StartFileUl(p, int64(len(content)), sha, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(res, "upload complete: ") {
+		t.Fatalf("already-present not detected: %q", res)
+	}
+	fileUlMu.Lock()
+	fileUlState = nil
+	fileUlMu.Unlock()
+	_ = os.Remove(p + ".part")
+	_ = os.Remove(p + ".part.json")
 }

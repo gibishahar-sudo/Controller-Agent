@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -304,6 +305,14 @@ func StartFileUl(path string, size int64, sha string, total int) (string, error)
 	fileUlMu.Lock()
 	defer fileUlMu.Unlock()
 	_ = os.MkdirAll(filepath.Dir(path), 0755)
+	// Idempotent begin: if the final file already matches size+sha,
+	// a re-begin after a completed-but-unacked transfer is a no-op
+	// instead of a full re-upload.
+	if st, err := os.Stat(path); err == nil && st.Size() == size && size > 0 {
+		if sha == "" || fileSHA(path) == sha {
+			return fmt.Sprintf("upload complete: %s (already present, %d bytes)", path, size), nil
+		}
+	}
 	part := path + ".part"
 	if have, ok := readUlSidecar(part, path, size, sha, total); ok {
 		fileUlState = &fileUlSession{path: path, size: size, sha: sha, total: total, part: part, have: have, started: time.Now(), lastChunk: time.Now()}
@@ -342,6 +351,99 @@ func writeUlSidecar(st *fileUlSession) {
 		return
 	}
 	_ = os.WriteFile(st.part+".json", b, 0600)
+}
+
+// fileSHA streams a file's SHA-256 hex (1MB buffer, flat RAM).
+func fileSHA(path string) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	h := sha256.New()
+	buf := make([]byte, 1024*1024)
+	for {
+		n, err := f.Read(buf)
+		if n > 0 {
+			h.Write(buf[:n])
+		}
+		if err != nil {
+			break
+		}
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// compressRanges renders a have-set as "0-7,15-18" (inverse of
+// ParseRanges; mirrors the controller's haveRanges for the wire).
+func compressRanges(have map[int]bool, total int) string {
+	var parts []string
+	start := -1
+	for i := 0; i <= total; i++ {
+		if i < total && have[i] {
+			if start < 0 {
+				start = i
+			}
+			continue
+		}
+		if start >= 0 {
+			if i-1 == start {
+				parts = append(parts, strconv.Itoa(start))
+			} else {
+				parts = append(parts, strconv.Itoa(start)+"-"+strconv.Itoa(i-1))
+			}
+			start = -1
+		}
+	}
+	if len(parts) == 0 {
+		return "none"
+	}
+	return strings.Join(parts, ",")
+}
+
+// uploadStatus reports transfer state for the refill loop:
+// "upload have <total> <ranges|none> <path>" (path last: it may contain
+// spaces), or "upload unknown <path>". Reads the live session first,
+// then the crash sidecar on disk (agent restarts don't lose the answer).
+func uploadStatus(arg string) (string, error) {
+	path := strings.TrimSpace(arg)
+	if path == "" {
+		return "", fmt.Errorf("usage: upload-status <path>")
+	}
+	if !ModeCanFileUl(AgentMode()) {
+		return "", fmt.Errorf("%s", ModeDenied(AgentMode()))
+	}
+	fileUlMu.Lock()
+	st := fileUlState
+	if st != nil && st.path == path {
+		total := st.total
+		cp := make(map[int]bool, len(st.have))
+		for k, v := range st.have {
+			cp[k] = v
+		}
+		fileUlMu.Unlock()
+		return fmt.Sprintf("upload have %d %s %s", total, compressRanges(cp, total), path), nil
+	}
+	fileUlMu.Unlock()
+	part := path + ".part"
+	b, err := os.ReadFile(part + ".json")
+	if err != nil {
+		return fmt.Sprintf("upload unknown %s", path), nil
+	}
+	var sc ulSidecar
+	if err := json.Unmarshal(b, &sc); err != nil || sc.Path != path {
+		return fmt.Sprintf("upload unknown %s", path), nil
+	}
+	if _, err := os.Stat(part); err != nil {
+		return fmt.Sprintf("upload unknown %s", path), nil
+	}
+	have := map[int]bool{}
+	for _, s := range sc.Have {
+		if s >= 0 && s < sc.Total {
+			have[s] = true
+		}
+	}
+	return fmt.Sprintf("upload have %d %s %s", sc.Total, compressRanges(have, sc.Total), path), nil
 }
 
 // readUlSidecar validates a surviving .part against the manifest and

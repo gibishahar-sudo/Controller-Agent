@@ -619,6 +619,13 @@ function connectWS(){
             }
           }
           if(t==="out" && /^upload complete:/.test(m.data||"")){ toast("Upload complete"); if(typeof refreshFiles==="function") refreshFiles(true); if(typeof pendingUpload!=="undefined"&&pendingUpload && (m.data||"").startsWith("upload complete: "+pendingUpload.path)){ const r=pendingUpload; pendingUpload=null; r.resolve(); } }
+          // Upload gap refill: agent have-reports for the pending path
+          // trigger targeted resend; unknown triggers re-begin.
+          if(t==="out" && typeof pendingUpload!=="undefined"&&pendingUpload){
+            const hm=/^upload have (\d+) (\S+) ([\s\S]*)$/.exec(m.data||"");
+            if(hm&&typeof pendingUpload.onStatus==="function"){ try{pendingUpload.onStatus(parseInt(hm[1],10),hm[2],hm[3]);}catch{} }
+            else if(/^upload unknown /.test(m.data||"")&&typeof pendingUpload.onUnknown==="function"){ try{pendingUpload.onUnknown(m.data);}catch{} }
+          }
           // Upload progress ("upload n/m chunks") re-arms the sliding
           // completion deadline: moving transfers never time out.
           if(t==="out" && typeof pendingUpload!=="undefined"&&pendingUpload&&typeof pendingUpload.touch==="function" && /^upload \d+\/\d+ chunks/.test(m.data||"")){ try{pendingUpload.touch();}catch{} }
@@ -1946,25 +1953,82 @@ async function pushChunks(target, dst, b64s, pace, tag){
   }
   await Promise.all(Array.from({length:Math.min(lanes,Math.max(1,b64s.length))},lane));
 }
-function awaitUploadComplete(dst, total, pace, resend, tag){
-  return new Promise((resolve,reject)=>{
-    // Sliding deadline: every agent "upload n/m chunks" progress line
-    // re-arms it. A moving transfer never times out no matter how slow;
-    // only a truly stalled one fails. (Fixed 10min killed 1GB uploads.)
-    const legMs=Math.min(600000, 20000+total*(pace+400));
-    let to=null, resent=false;
-    const arm=(ms)=>{ if(to) clearTimeout(to); to=setTimeout(fire, ms); if(pendingUpload) pendingUpload.timer=to; };
-    const fire=async ()=>{
-      if(resent){ pendingUpload=null; reject(new Error("agent never confirmed the upload — retry manually")); return; }
-      resent=true;
-      try{
-        addTerm(`${tag}No confirmation yet — re-sending chunks once…`,"out");
-        await resend();
-        arm(legMs);
-      }catch(e){ pendingUpload=null; reject(e); }
+function parseHaveRanges(str,total){
+  const have=new Set();
+  if(!str||str==="none") return have;
+  for(const p of String(str).split(",")){
+    const t=p.trim(); if(!t) continue;
+    const dash=t.indexOf("-");
+    if(dash<0){ const n=parseInt(t,10); if(!isNaN(n)&&n>=0&&n<total) have.add(n); }
+    else{ const a=parseInt(t.slice(0,dash),10), b=parseInt(t.slice(dash+1),10);
+      if(!isNaN(a)&&!isNaN(b)) for(let i=Math.max(0,a);i<=Math.min(total-1,b);i++) have.add(i); }
+  }
+  return have;
+}
+async function sendMissingSeqs(o,seqs,label){
+  // Sequential paced refill: agent writes by offset, order free.
+  let done=0;
+  const what=label||"refill";
+  for(const seq of seqs){
+    if(xferCancel) throw new Error("cancelled");
+    const data=await o.getSlice(seq);
+    ws.send(JSON.stringify({type:"file-ul-chunk",target:o.target,seq:seq,data:data,via:fileVia()}));
+    done++;
+    setXfer(40+Math.round(60*done/Math.max(1,seqs.length)),`${o.tag}↑ ${what} ${done}/${seqs.length}`);
+    if(o.pace) await new Promise(rs=>setTimeout(rs,o.pace));
+  }
+}
+// uploadWithRefill: begin + full streamed pass, then poll agent status
+// every 20s and refill exactly the holes until "upload complete".
+// Only 30min of zero movement fails it — slow links just take longer.
+// o:{target,dst,size,total,chunk,pace,tag,getSlice(seq)->b64,begin()}
+function uploadWithRefill(o){
+  return new Promise(async (resolve,reject)=>{
+    let done=false, begins=0, lastHave=-1, lastProgress=Date.now(), refilling=false, pollTimer=null;
+    const cleanup=()=>{ if(pollTimer) clearTimeout(pollTimer); };
+    const fail=(e)=>{ if(done) return; done=true; cleanup(); pendingUpload=null; reject(e); };
+    const win=()=>{ if(done) return; done=true; cleanup(); pendingUpload=null; resolve(); };
+    pendingUpload={path:o.dst,
+      resolve:()=>win(),
+      reject:(e)=>fail(e||new Error("cancelled")),
+      touch:()=>{ lastProgress=Date.now(); },
+      touch:()=>{ lastProgress=Date.now(); },
+      onStatus:(total,ranges,path)=>{
+        if(done||path!==o.dst) return;
+        const have=parseHaveRanges(ranges,total);
+        if(have.size>lastHave){ lastHave=have.size; lastProgress=Date.now(); }
+        if(have.size>=total) return; // verify message imminent
+        if(refilling) return;
+        refilling=true;
+        const missing=[]; for(let i=0;i<total;i++) if(!have.has(i)) missing.push(i);
+        addTerm(`${o.tag}gap refill: ${missing.length} chunks…`,"out");
+        (async ()=>{
+          try{ await sendMissingSeqs(o,missing,"refill"); }
+          catch(e){ fail(e); return; }
+          refilling=false;
+        })();
+      },
+      onUnknown:()=>{
+        if(done) return;
+        begins++;
+        if(begins>5){ fail(new Error("agent lost the upload session repeatedly — retry manually")); return; }
+        addTerm(`${o.tag}agent lost session — re-beginning (resume ${begins}, sidecar keeps received chunks)…`,"out");
+        o.begin().catch(fail);
+      }};
+    const poll=async ()=>{
+      if(done) return;
+      if(Date.now()-lastProgress>30*60*1000){ fail(new Error("upload stalled 30min with no progress — retry manually")); return; }
+      if(ws&&ws.readyState===1){ try{ ws.send(JSON.stringify({type:"command",cmd:"upload-status "+o.dst,target:o.target,cmdId:mkCmdId()})); }catch{} }
+      pollTimer=setTimeout(poll,20000);
     };
-    arm(legMs);
-    pendingUpload={path:dst,resolve:()=>{if(to)clearTimeout(to); resolve();},reject:(e)=>{if(to)clearTimeout(to); reject(e||new Error("cancelled"));},touch:()=>arm(legMs)};
+    try{
+      await o.begin();
+      const all=[]; for(let i=0;i<o.total;i++) all.push(i);
+      await sendMissingSeqs(o,all,"sending");
+      addTerm(`${o.tag}Upload sent — watching for gaps…`,"out");
+      lastProgress=Date.now();
+      pollTimer=setTimeout(poll,20000);
+    }catch(e){ fail(e); }
   });
 }
 async function uploadOne(src, dst, tag){
@@ -1982,25 +2046,19 @@ async function uploadOne(src, dst, tag){
     // (b64s+raws+flat = 3.4x RAM) — that OOMs tabs long before 1GB.
     // No browser pre-hash on big files either: the agent verifies
     // size+sha streaming off its own disk at finalize.
-    ws.send(JSON.stringify({type:"file-ul-begin",target:selected.id,path:dst,size:size,sha:"",total:total,via:fileVia()}));
-    const sendAll=async ()=>{
-      let off=0, seq=0;
-      if(size===0){ ws.send(JSON.stringify({type:"file-ul-chunk",target:selected.id,seq:0,data:"",via:fileVia()})); return; }
-      while(off<size){
-        if(xferCancel) throw new Error("cancelled");
-        const r=await (await fetch(`/api/file-slice?path=${encodeURIComponent(src)}&offset=${off}&len=${chunk}`)).json();
-        if(r.error){ throw new Error(r.error+" (file may have been deleted)"); }
-        if(r.data===undefined){ throw new Error("slice failed at "+off); }
-        ws.send(JSON.stringify({type:"file-ul-chunk",target:selected.id,seq:seq,data:r.data,via:fileVia()}));
-        seq++; off+=r.len;
-        setXfer(40+Math.round(60*off/Math.max(1,size)),`${tag}↑ sending ${seq}/${total}`);
-        if(r.len===0) break;
-        if(pace) await new Promise(rs=>setTimeout(rs,pace));
-      }
+    const tid=selected.id;
+    const begin=async ()=>{
+      ws.send(JSON.stringify({type:"file-ul-begin",target:tid,path:dst,size:size,sha:"",total:total,via:fileVia()}));
     };
-    await sendAll();
-    addTerm(`${tag}Upload sent — waiting for agent verify…`,"out");
-    await awaitUploadComplete(dst, total, pace, sendAll, tag);
+    const getSlice=async (seq)=>{
+      if(size===0) return "";
+      const off=seq*chunk;
+      const r=await (await fetch(`/api/file-slice?path=${encodeURIComponent(src)}&offset=${off}&len=${chunk}`)).json();
+      if(r.error){ throw new Error(r.error+" (file may have been deleted)"); }
+      if(r.data===undefined){ throw new Error("slice failed at "+off); }
+      return r.data;
+    };
+    await uploadWithRefill({target:tid,dst:dst,size:size,total:total,chunk:chunk,pace:pace,tag:tag,getSlice:getSlice,begin:begin});
   }catch(e){ toast("Upload failed: "+(e.message||e),"err"); addTerm(`${tag}Upload failed: `+(e.message||e),"err"); setXfer(0,""); }
   finally{ ulActive--; }
 }
@@ -2663,28 +2721,23 @@ async function handleDropFiles(files, dstDir){
     if(f.size>1*1024*1024*1024){ toast("File too large (>1GB): "+f.name,"err"); continue; }
     const chunk=xferChunkRaw(selected), pace=xferPace(selected);
     const total=Math.max(1,Math.ceil(f.size/chunk));
+    const tid=selected.id, dtag="↑ "+f.name+" ";
     // Streamed slices: never arrayBuffer() the whole file (4x RAM crash).
-    // No browser pre-hash on big files; the agent verifies at finalize.
-    ws.send(JSON.stringify({type:"file-ul-begin",target:selected.id,path:dst,size:f.size,sha:"",total:total,via:fileVia()}));
-    const sendAll=async ()=>{
-      if(f.size===0){ ws.send(JSON.stringify({type:"file-ul-chunk",target:selected.id,seq:0,data:"",via:fileVia()})); return; }
-      let off=0, seq=0;
-      while(off<f.size){
-        if(xferCancel) throw new Error("cancelled");
-        const ab=await f.slice(off,off+chunk).arrayBuffer();
-        const u8=new Uint8Array(ab);
-        let b64=""; const c=8192;
-        for(let i=0;i<u8.length;i+=c) b64+=btoa(String.fromCharCode(...u8.subarray(i,i+c)));
-        ws.send(JSON.stringify({type:"file-ul-chunk",target:selected.id,seq:seq,data:b64,via:fileVia()}));
-        seq++; off+=u8.length;
-        setXfer(40+Math.round(60*off/Math.max(1,f.size)),`↑ ${f.name} sending ${seq}/${total}`);
-        if(u8.length===0) break;
-        if(pace) await new Promise(rs=>setTimeout(rs,pace));
-      }
+    // No browser pre-hash; the agent verifies at finalize.
+    const begin=async ()=>{
+      ws.send(JSON.stringify({type:"file-ul-begin",target:tid,path:dst,size:f.size,sha:"",total:total,via:fileVia()}));
     };
-    await sendAll();
-    addTerm("↑ Dropped "+f.name+" → "+dst+" ("+f.size+" bytes) — waiting for verify…","out");
-    await awaitUploadComplete(dst, total, xferPace(selected), sendAll, "↑ "+f.name+" ");
+    const getSlice=async (seq)=>{
+      if(f.size===0) return "";
+      const part=f.slice(seq*chunk,seq*chunk+chunk);
+      const ab=await part.arrayBuffer();
+      const u8=new Uint8Array(ab);
+      let b64=""; const c=8192;
+      for(let i=0;i<u8.length;i+=c) b64+=btoa(String.fromCharCode(...u8.subarray(i,i+c)));
+      return b64;
+    };
+    await uploadWithRefill({target:tid,dst:dst,size:f.size,total:total,chunk:chunk,pace:pace,tag:dtag,getSlice:getSlice,begin:begin});
+    addTerm("↑ Dropped "+f.name+" → "+dst+" ("+f.size+" bytes) done","out");
     }catch(e){ toast("Drop upload failed: "+(e.message||e),"err"); }
   }
 }

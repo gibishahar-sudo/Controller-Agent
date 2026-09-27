@@ -55,6 +55,7 @@ var Known = map[string]string{
 	"rename-item":             "Rename - rename-item <path>|<newName>",
 	"get-file-info":           "Get file info - get-file-info <path>",
 	"get-file-hash":           "Get file hash - get-file-hash <path>",
+	"upload-status":           "Upload transfer state - upload-status <path>",
 	"get-file-version":        "Get file version",
 	"get-directory-size":      "Get directory size - get-directory-size <path>",
 	"search-files":            "Search files - search-files <path>|<pattern>",
