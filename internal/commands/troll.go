@@ -220,6 +220,9 @@ func playTroll(arg string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("troll media not found: %s", local)
 	}
+	if st.IsDir() {
+		return "", fmt.Errorf("troll media is a directory, not a file — pass a media file path (e.g. play-troll C:\\vids\\clip.mp4 60)")
+	}
 	if st.Size() == 0 {
 		return "", fmt.Errorf("troll media is empty: %s", local)
 	}
@@ -313,6 +316,7 @@ func playTrollEdge(local, ext string, secs int, loop bool, loopNote, codec, why,
 		return "", err
 	}
 	_ = os.Remove(statusPath)
+	_ = os.Remove(trollTraceFile())
 	gp, err := spawnGUI("powershell", []string{"-NoProfile", "-ExecutionPolicy", "Bypass", "-command", script}, nil, nil)
 	if err != nil {
 		return "", err
@@ -320,8 +324,26 @@ func playTrollEdge(local, ext string, secs int, loop bool, loopNote, codec, why,
 	_ = os.MkdirAll(filepath.Dir(trollPIDFile()), 0755)
 	_ = os.WriteFile(trollPIDFile(), []byte(strconv.Itoa(gp.Pid())), 0644)
 	go gp.Wait()
-	res, err := waitTrollProof(statusPath, filepath.Base(local), loopNote+" via Chromium ("+why+")", codec, secs, 250)
+	res, err := waitTrollProof(statusPath, filepath.Base(local), loopNote+" via Chromium ("+why+")", codec, secs, 350)
+	if err != nil {
+		// Attach the guardian's dying words: stage trace shows exactly
+		// how far launch/proof got (launch vs window vs playback).
+		if b, rerr := os.ReadFile(trollTraceFile()); rerr == nil {
+			tr := strings.TrimSpace(string(b))
+			if len(tr) > 600 {
+				tr = tr[len(tr)-600:]
+			}
+			if tr != "" {
+				return res, fmt.Errorf("%w | edge trace: %s", err, tr)
+			}
+		}
+	}
 	return res, err
+}
+
+// trollTraceFile is the guardian's stage log (fresh per Edge attempt).
+func trollTraceFile() string {
+	return filepath.Join(trollMediaDir(), "edge-trace.txt")
 }
 
 // waitTrollProof polls statusPath for up to polls*100ms for the player's
@@ -385,6 +407,7 @@ func trollEdgeScript(edgeBin, local string, isAudio bool, secs int, loop bool, s
 	qp := psQuote(trollEdgeProfile())
 	qs := psQuote(status)
 	qf := psQuote(trollStopFlagPath(trollMediaDir()))
+	qt := psQuote(trollTraceFile())
 	tag := "video"
 	if isAudio {
 		tag = "audio"
@@ -496,10 +519,15 @@ $edge = %s
 $profile = %s
 $status = %s
 $stopFlag = %s
+$trace = %s
 $secs = %d
 $loop = %d
 $script:allowClose = $false
 $script:seen = $false
+function Trace($m) {
+  try { Add-Content -Path $trace -Value ((Get-Date).ToString('HH:mm:ss.fff') + ' ' + $m) -ErrorAction SilentlyContinue } catch {}
+}
+Trace('guardian start')
 function Edge-Running {
   $p = Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like ('*'+$profile+'*') }
   return ($null -ne $p)
@@ -544,8 +572,10 @@ function Start-TrollEdge {
 }
 try {
   $ep = Start-TrollEdge
+  Trace('edge launched')
 } catch {
   Set-Content -Path $status -Value ('failed: edge launch: ' + $_.Exception.Message)
+  Trace('edge launch failed')
   [RmmTrollEdge]::Uninstall()
   exit 4
 }
@@ -559,6 +589,7 @@ for ($i = 0; $i -lt 200 -and -not $found; $i++) {
   if (Test-Path $stopFlag) { Stop-TrollEdge; exit 6 }
   $t = [RmmTrollEdge]::GetTrollTitle()
   if ($t -eq '') { continue }
+  if (-not $sawWindow) { Trace('window seen: ' + $t) }
   $sawWindow = $true
   if ($t.StartsWith('RMM-TROLL-PLAYING') -or $t -eq 'RMM-TROLL-ENDED') { $found = $true }
   elseif ($t.StartsWith('RMM-TROLL-STALLED:media-error')) {
@@ -571,8 +602,10 @@ if (-not $found) {
   if ($sawWindow) {
     Set-Content -Path $status -Value 'timeout-no-playback (kiosk window up, media never started: codec or very slow media?)'
   } else {
-    Set-Content -Path $status -Value 'failed: edge kiosk window never appeared'
+    $alive = Edge-Running
+    Set-Content -Path $status -Value ('failed: edge kiosk window never appeared (edge alive: ' + $alive + ')')
   }
+  Trace('proof failed')
   Stop-TrollEdge
   exit 5
 }
@@ -616,7 +649,7 @@ $guard.Start()
 $gf.Add_FormClosed({ param($s,$e) [void][RmmTrollEdge]::BlockInput($false); [RmmTrollEdge]::Uninstall() })
 $gf.Show()
 [System.Windows.Forms.Application]::Run()
-`, qe, qp, qs, qf, secs, loopI, qm, tag, tag, loopAttr, tag), nil
+`, qe, qp, qs, qf, qt, secs, loopI, qm, tag, tag, loopAttr, tag), nil
 }
 
 // stop-troll: unblock input FIRST (survives a hung player), then kill.
@@ -1151,6 +1184,9 @@ func trollProbe(arg string) (string, error) {
 	st, err := os.Stat(local)
 	if err != nil {
 		return "", fmt.Errorf("troll media not found: %s", local)
+	}
+	if st.IsDir() {
+		return "", fmt.Errorf("troll media is a directory, not a file — pass a media file path")
 	}
 	ext := strings.ToLower(filepath.Ext(local))
 	if trollExtKind(ext) == "" {

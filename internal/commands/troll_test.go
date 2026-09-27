@@ -438,3 +438,12 @@ func TestTrollStopFlag(t *testing.T) {
 		t.Fatal("empty flag path")
 	}
 }
+
+func TestPlayTrollDir(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("windows paths only")
+	}
+	if _, err := playTroll(t.TempDir() + " 10"); err == nil || !strings.Contains(err.Error(), "directory") {
+		t.Fatalf("directory should error clearly, got %v", err)
+	}
+}
