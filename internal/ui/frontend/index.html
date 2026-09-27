@@ -1011,9 +1011,13 @@ function sendCmd(){
   if(sendAllOn){ sendCmdAll(v); return; }
   addTerm("❯ "+v, "prompt");
   lastCmdAt=Date.now();
-  if(ws && ws.readyState===1) ws.send(JSON.stringify({type:"command", cmd:v, target:selected?.id}));
-  else fetch("/api/cmd",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({cmd:v})});
+  if(ws && ws.readyState===1) ws.send(JSON.stringify({type:"command", cmd:v, target:selected?.id, cmdId:mkCmdId()}));
+  else fetch("/api/cmd",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({cmd:v, cmdId:mkCmdId()})});
 }
+// mkCmdId mints one id per user send, end to end: dual-bus copies, the
+// controller 10s retry and multi-controller delivers all share it, so
+// agent dedupe collapses every duplicate instead of re-executing.
+function mkCmdId(){ return "u"+Date.now().toString(36)+Math.random().toString(36).slice(2,8); }
 $("cmdSend").onclick=sendCmd;
 function sendAllCount(){ return agents.filter(a=>!a.id.startsWith("manual-")&&!a.id.startsWith("conn-")&&a.connected).length; }
 function refreshSendAllBtn(){ const b=$("sendAllBtn"); if(b&&sendAllOn) b.textContent=`All: ON (${sendAllCount()})`; }
@@ -1496,14 +1500,15 @@ $("muteBtn").onclick=()=>{ if(!selected) return; sendCmdVal("set-mic-mute on"); 
 $("volSlider").oninput=e=>{ $("volLabel").textContent=e.target.value+"%"; };
 $("volSlider").onchange=e=>{ if(selected) sendCmdVal("set-volume "+e.target.value); };
 let lastCmdAt=0, sendAllOn=false, pendingVersionCheck=false;
-function sendCmdVal(v){ if(!selected) return; if(!/^(mouse-|get-position|get-audio-level)/.test(v)) lastCmdAt=Date.now(); if(ws && ws.readyState===1) ws.send(JSON.stringify({type:"command", cmd:v, target:selected.id})); else addTerm("Not connected", "err"); }
+function sendCmdVal(v){ if(!selected) return; if(!/^(mouse-|get-position|get-audio-level)/.test(v)) lastCmdAt=Date.now(); if(ws && ws.readyState===1) ws.send(JSON.stringify({type:"command", cmd:v, target:selected.id, cmdId:mkCmdId()})); else addTerm("Not connected", "err"); }
 // Send-to-all: fan out one command to every listed agent (commands tab
 // only; pointer keys, mouse and meters never fan out).
 function sendCmdAll(v){
   const list=agents.filter(a=>!a.id.startsWith("manual-")&&!a.id.startsWith("conn-"));
   if(!list.length){ toast("No agents", "err"); return; }
   if(!ws || ws.readyState!==1){ addTerm("Not connected", "err"); return; }
-  list.forEach(a=>ws.send(JSON.stringify({type:"command", cmd:v, target:a.id})));
+  const id=mkCmdId(); // one id for the whole broadcast: each agent runs it once, copies dedupe
+  list.forEach(a=>ws.send(JSON.stringify({type:"command", cmd:v, target:a.id, cmdId:id})));
   lastCmdAt=Date.now();
   addTerm(`→ all (${list.length} agents): ${v}`, "out");
 }

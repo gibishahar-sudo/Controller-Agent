@@ -247,8 +247,8 @@ func TestTrollProbeScriptMarkers(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
-		"Opacity",
-		"ShowActivated",
+		"SingleBorderWindow",
+		"CenterScreen",
 		"MediaOpened",
 		"MediaFailed",
 		"NaturalVideoWidth",
@@ -258,9 +258,9 @@ func TestTrollProbeScriptMarkers(t *testing.T) {
 			t.Fatalf("probe script missing marker %q", want)
 		}
 	}
-	for _, bad := range []string{"BlockInput", "Topmost", "SetWindowsHookEx"} {
+	for _, bad := range []string{"BlockInput", "Topmost", "SetWindowsHookEx", "Opacity = 0"} {
 		if strings.Contains(s, bad) {
-			t.Fatalf("probe script must not lock down (%q present)", bad)
+			t.Fatalf("probe script must not lock down or hide (%q present)", bad)
 		}
 	}
 }

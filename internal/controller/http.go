@@ -282,6 +282,7 @@ func (s *Server) startHTTP(addr, dir string) {
 			Cmd         string `json:"cmd"`
 			Type        string `json:"type"`
 			Target      string `json:"target"`
+			CmdID       string `json:"cmdId"`
 			Quality     int    `json:"quality"`
 			Monitor     int    `json:"monitor"`
 			AllMonitors bool   `json:"allMonitors"`
@@ -304,7 +305,7 @@ func (s *Server) startHTTP(addr, dir string) {
 		case req.Type == protocol.TypeScreenshotRequest || req.Cmd == "screenshot":
 			msg = protocol.Message{Type: protocol.TypeScreenshotRequest, Quality: req.Quality, Monitor: req.Monitor, AllMonitors: req.AllMonitors}
 		case req.Cmd != "":
-			msg = protocol.Message{Type: protocol.TypeCommand, Cmd: req.Cmd}
+			msg = protocol.Message{Type: protocol.TypeCommand, Cmd: req.Cmd, CmdID: req.CmdID}
 		case req.Type != "":
 			msg = protocol.Message{Type: req.Type}
 		default:
@@ -936,6 +937,11 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		t, _ := msg["type"].(string)
 		target, _ := msg["target"].(string)
 		cmd, _ := msg["cmd"].(string)
+		// End-to-end command id, minted by the UI per send: dual-bus
+		// copies, 10s retries and multi-controller delivers all share
+		// it, so agent dedupe collapses every duplicate. Empty (old UI,
+		// scripts) falls back to per-send minting in sendToAgent.
+		cmdID, _ := msg["cmdId"].(string)
 		quality := 0
 		if q, ok := msg["quality"].(float64); ok {
 			quality = int(q)
@@ -959,7 +965,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 					s.setDesiredMode(ac.id, want)
 				}
 			}
-			_ = s.sendToAgent(ac, protocol.Message{Type: protocol.TypeCommand, Cmd: cmd})
+			_ = s.sendToAgent(ac, protocol.Message{Type: protocol.TypeCommand, Cmd: cmd, CmdID: cmdID})
 		case "screenshot_request":
 			ac := s.getAgentByID(target)
 			if ac == nil {

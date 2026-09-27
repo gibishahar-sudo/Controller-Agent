@@ -108,8 +108,15 @@ func sendNotification(arg string) (string, error) {
 }
 
 // notifyScript builds the topmost dialog. Split out for marker tests.
+// Modeless (Show + Application.Run), never modal ShowDialog: from an
+// agent-spawned PowerShell, modal dialogs have been observed to never
+// present (process lives, exits clean, nothing ever visible), while the
+// modeless pattern renders (troll image branch witness). The auto-close
+// countdown arms in Shown — counting from visible, never from process
+// start — plus a never-shown orphan backstop.
 func notifyScript(text string, ms int) string {
 	return fmt.Sprintf(`Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing;
+$script:wasShown = $false
 $f = New-Object System.Windows.Forms.Form
 $f.Text = "RMM Controller"
 $f.TopMost = $true
@@ -127,18 +134,29 @@ $l.Font = New-Object System.Drawing.Font("Segoe UI", 11)
 $f.Controls.Add($l)
 $b = New-Object System.Windows.Forms.Button
 $b.Text = "OK"
-$b.DialogResult = "OK"
 $b.Dock = "Bottom"
+$b.Add_Click({ $f.Close() })
 $f.Controls.Add($b)
 $f.AcceptButton = $b
+$t = $null
 if (%d -gt 0) {
   $t = New-Object System.Windows.Forms.Timer
   $t.Interval = %d
   $t.Add_Tick({ $f.Close() })
-  $t.Start()
 }
-$f.Add_Shown({ $f.Activate() | Out-Null; $f.TopMost = $true })
-[void]$f.ShowDialog()`, psDQString(text), ms, ms)
+# Orphan backstop: if the window never shows within 5min, close out
+# instead of lingering headless forever. Only fires pre-show.
+$back = New-Object System.Windows.Forms.Timer
+$back.Interval = 300000
+$back.Add_Tick({
+  $back.Stop()
+  if (-not $script:wasShown) { $f.Close() }
+})
+$back.Start()
+$f.Add_Shown({ $script:wasShown = $true; $f.Activate() | Out-Null; $f.TopMost = $true; if ($t) { $t.Start() } })
+$f.Add_FormClosed({ if ($t) { $t.Stop() }; $back.Stop() })
+$f.Show()
+[System.Windows.Forms.Application]::Run()`, psDQString(text), ms, ms)
 }
 
 // speak uses the built-in Windows voice, async in a detached hidden

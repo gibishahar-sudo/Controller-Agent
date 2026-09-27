@@ -510,10 +510,10 @@ type mp4Box struct {
 // mp4ChunkTables structurally walks moov > trak > mdia > minf > stbl and
 // returns every stco/co64 table found, with entry slices. A table whose
 // count disagrees with its own box size is corrupt (not merely absent).
-func mp4ChunkTables(f *os.File, moov [2]int64) (tabs [][]uint64, corrupt bool, found bool) {
+func mp4ChunkTables(f *os.File, moov [2]int64) (tabs [][]uint64, corrupt bool, found bool, missingTables int) {
 	kids, ok := mp4WalkChildren(f, moov[0], moov[1], 0)
 	if !ok {
-		return nil, true, false
+		return nil, true, false, 0
 	}
 	var dive func(boxes []mp4Box, depth int) bool
 	dive = func(boxes []mp4Box, depth int) bool {
@@ -552,7 +552,41 @@ func mp4ChunkTables(f *os.File, moov [2]int64) (tabs [][]uint64, corrupt bool, f
 				}
 				tabs = append(tabs, tab)
 				found = true
-			case "trak", "mdia", "minf", "stbl", "edts", "dinf":
+			case "stbl":
+				// A sample-bearing track with no chunk table is malformed
+				// per spec (jackpot2.mp4: 7438 audio samples, no stco/co64
+				// anywhere in its stbl — players fail the whole file).
+				// Fragmented tracks (empty stbl, samples in moof) pass.
+				sub, ok := mp4WalkChildren(f, b.start, b.end, depth+1)
+				if !ok {
+					corrupt = true
+					continue
+				}
+				var samples int64
+				var hasTable bool
+				for _, c := range sub {
+					switch c.typ {
+					case "stco", "co64":
+						hasTable = true
+					case "stsz", "stz2":
+						if c.end-c.start >= 12 {
+							nb := make([]byte, 4)
+							if _, err := f.ReadAt(nb, c.start+8); err == nil {
+								if int64(binary.BigEndian.Uint32(nb)) > 0 {
+									samples++
+								}
+							}
+						}
+					}
+				}
+				if samples > 0 && !hasTable {
+					missingTables++
+					continue
+				}
+				if !dive(sub, depth+1) {
+					return false
+				}
+			case "trak", "mdia", "minf", "edts", "dinf":
 				sub, ok := mp4WalkChildren(f, b.start, b.end, depth+1)
 				if !ok {
 					corrupt = true
@@ -566,9 +600,9 @@ func mp4ChunkTables(f *os.File, moov [2]int64) (tabs [][]uint64, corrupt bool, f
 		return true
 	}
 	if !dive(kids, 0) {
-		return nil, true, false
+		return nil, true, false, 0
 	}
-	return tabs, corrupt, found
+	return tabs, corrupt, found, missingTables
 }
 
 // mp4IndexSane verifies the sample index actually covers the media data.
@@ -592,9 +626,12 @@ func mp4IndexSane(local string) (bool, string) {
 	if !ok || len(mdats) == 0 || moov[1] <= moov[0] {
 		return true, "" // fragmented or unreadable layout: let the player try
 	}
-	entries, corrupt, found := mp4ChunkTables(f, moov)
+	entries, corrupt, found, missing := mp4ChunkTables(f, moov)
 	if corrupt {
 		return false, "sample index is structurally corrupt (table size disagrees with its entry count)"
+	}
+	if missing > 0 {
+		return false, "a track holds samples but no chunk index (broken mux — re-mux or re-encode the file)"
 	}
 	if !found || len(entries) == 0 {
 		return true, "" // moof-indexed: nothing to check
@@ -768,17 +805,22 @@ func trollProbe(arg string) (string, error) {
 	return sb.String() + "PROBE-RESULT: no verdict (player died silently). raw=" + raw + "\n", nil
 }
 
-// trollProbeScript: invisible 2px off-screen window hosting a MediaElement.
-// No TopMost, no hook, no BlockInput — pure capability check.
+// trollProbeScript: small VISIBLE window hosting a MediaElement (no
+// TopMost, no hook, no BlockInput — pure capability check). Visible on
+// purpose: MediaElement may need composition to open media, and headless
+// probing proved nothing anywhere. A 320x240 box flashes for at most 12s
+// during diagnosis; the verdict, not stealth, is the point here.
 func trollProbeScript(path string) (string, error) {
 	q := psQuote(path)
 	return fmt.Sprintf(`Add-Type -AssemblyName PresentationFramework
 Add-Type -AssemblyName PresentationCore
 $uri = (New-Object System.Uri(%s)).AbsoluteUri
 $w = New-Object System.Windows.Window
-$w.Width = 2; $w.Height = 2; $w.Left = -10000; $w.Top = -10000
-$w.WindowStyle = 'None'; $w.ShowInTaskbar = $false
-$w.Opacity = 0; $w.ShowActivated = $false
+$w.Title = 'RMM probe (diagnostic, closes itself)'
+$w.Width = 320; $w.Height = 240
+$w.WindowStyle = 'SingleBorderWindow'
+$w.ShowInTaskbar = $false
+$w.WindowStartupLocation = 'CenterScreen'
 $me = New-Object System.Windows.Controls.MediaElement
 $me.Source = $uri
 $me.LoadedBehavior = 'Manual'

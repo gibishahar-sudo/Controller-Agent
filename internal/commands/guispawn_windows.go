@@ -4,6 +4,7 @@ package commands
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"strings"
@@ -51,7 +52,10 @@ func (p *sysProc) Wait() error { return <-p.done }
 // unavailable, so behavior never regresses vs today.
 func spawnGUI(name string, args []string, out, stderr *os.File) (guiProc, error) {
 	if gp, err := spawnOnDesktop(name, args, out, stderr); err == nil {
+		log.Printf("[guispawn] explicit winsta0\\default: %s", name)
 		return gp, nil
+	} else {
+		log.Printf("[guispawn] explicit desktop unavailable (%v), plain hidden spawn: %s", err, name)
 	}
 	cmd := hideWindow(exec.Command(name, args...))
 	if out != nil {

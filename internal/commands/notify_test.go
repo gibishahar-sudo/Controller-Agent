@@ -10,12 +10,19 @@ func TestNotifyScriptMarkers(t *testing.T) {
 	for _, want := range []string{
 		"RMM Controller",
 		"TopMost = $true",
-		"ShowDialog",
+		"Application]::Run",
 		"Add_Shown",
 		"Activate",
+		"Add_Click",
+		"wasShown",
 	} {
 		if !strings.Contains(s, want) {
 			t.Fatalf("notify script missing marker %q", want)
+		}
+	}
+	for _, bad := range []string{"ShowDialog"} {
+		if strings.Contains(s, bad) {
+			t.Fatalf("notify script must stay modeless (%q present)", bad)
 		}
 	}
 	if !strings.Contains(s, "hello") {
