@@ -391,6 +391,7 @@ func TestTrollEdgeScriptMarkers(t *testing.T) {
 		"--new-window",
 		"--user-data-dir=",
 		"--no-first-run",
+		"--disable-gpu",
 		"--no-default-browser-check",
 		"--disable-search-engine-choice-screen",
 		"--autoplay-policy=no-user-gesture-required",
@@ -401,6 +402,8 @@ func TestTrollEdgeScriptMarkers(t *testing.T) {
 		"UseShellExecute",
 		"edge launched pid=",
 		"FindTrollWindow",
+		"GetTopTitles",
+		"titles: ",
 		"EnumWindows",
 		"FullscreenTroll",
 		"GetSystemMetrics",
@@ -458,9 +461,17 @@ func TestTrollSelftest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"troll dir:", "powershell spawn:"} {
+	for _, want := range []string{"troll dir:", "agent ctx:", "powershell spawn:"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("selftest missing %q:\n%s", want, out)
+		}
+	}
+	// Version/engine lines only exist where Edge is installed.
+	if !strings.Contains(out, "edge: missing") {
+		for _, want := range []string{"edge version:", "edge engine:"} {
+			if !strings.Contains(out, want) {
+				t.Fatalf("selftest missing %q:\n%s", want, out)
+			}
 		}
 	}
 }

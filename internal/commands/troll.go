@@ -586,6 +586,26 @@ public static class RmmTrollEdge {
     EnumWindows(new EnumWinProc(EnumCb), IntPtr.Zero);
     return foundHwnd;
   }
+  // GetTopTitles snapshots up to ~400 chars of visible top-level window
+  // titles (any owner): when the kiosk window never appears, the trace
+  // names what DID (first-run page, profile error, crash dialog) instead
+  // of leaving "no window" as the whole story.
+  public static string topTitles = "";
+  public static bool TopCb(IntPtr hWnd, IntPtr lParam) {
+    if (!IsWindowVisible(hWnd)) { return true; }
+    System.Text.StringBuilder sb = new System.Text.StringBuilder(256);
+    if (GetWindowText(hWnd, sb, 256) == 0) { return true; }
+    string t = sb.ToString();
+    if (t == "") { return true; }
+    if (topTitles != "") { topTitles += "|"; }
+    topTitles += t;
+    return topTitles.Length < 400;
+  }
+  public static string GetTopTitles() {
+    topTitles = "";
+    EnumWindows(new EnumWinProc(TopCb), IntPtr.Zero);
+    return topTitles;
+  }
   // FullscreenTroll pins the kiosk window over the whole virtual screen
   // (all monitors): Edge kiosk does not reliably go fullscreen itself,
   // so the rect is forced instead of trusted. Restores if minimized
@@ -662,7 +682,7 @@ $wrapper = Join-Path $profile 'play.html'
 Set-Content -Path $wrapper -Value $html -Encoding UTF8
 Trace('wrapper written')
 $wrapUri = (New-Object System.Uri($wrapper)).AbsoluteUri
-$edgeArgs = @('--kiosk', '--new-window', $wrapUri, ('--user-data-dir='+$profile), '--no-first-run', '--no-default-browser-check', '--disable-search-engine-choice-screen', '--disable-sync', '--disable-component-update', '--autoplay-policy=no-user-gesture-required', '--disable-features=Translate', '--disable-infobars', '--disable-session-crashed-bubble', '--hide-crash-restore-bubble')
+$edgeArgs = @('--kiosk', '--new-window', $wrapUri, ('--user-data-dir='+$profile), '--no-first-run', '--no-default-browser-check', '--disable-search-engine-choice-screen', '--disable-sync', '--disable-component-update', '--disable-gpu', '--autoplay-policy=no-user-gesture-required', '--disable-features=Translate', '--disable-infobars', '--disable-session-crashed-bubble', '--hide-crash-restore-bubble')
 function Start-TrollEdge {
   Edge-CleanLocks
   # ProcessStartInfo with UseShellExecute=false (raw CreateProcess): the
@@ -698,6 +718,7 @@ for ($i = 0; $i -lt 200 -and -not $found; $i++) {
   Start-Sleep -Milliseconds 100
   if (Test-Path $stopFlag) { Stop-TrollEdge; exit 6 }
   $t = [RmmTrollEdge]::GetTrollTitle()
+  if ($i -eq 20) { Trace('titles: ' + [RmmTrollEdge]::GetTopTitles()) }
   if ($t -eq '') { continue }
   if (-not $sawWindow) { Trace('window seen: ' + $t) }
   $sawWindow = $true
@@ -1302,11 +1323,23 @@ func trollSelftest() (string, error) {
 		} else {
 			fmt.Fprintf(&sb, "edge: %s (stat failed: %v)\n", edge, err)
 		}
-		// 3. Engine check: headless DOM dump, no display touched.
+		// 3. Engine check: headless DOM dump, no display touched. The
+		// probe rides its OWN throwaway profile: without --user-data-dir
+		// it shares the default profile, and a running desktop Edge
+		// swallows the dump (singleton delegation: silent exit 0).
+		probeProf, _ := os.MkdirTemp("", "rmm-edgeprobe")
+		if probeProf != "" {
+			defer os.RemoveAll(probeProf)
+		}
+		probeArgs := []string{"--headless=new", "--no-first-run", "--disable-gpu"}
+		if probeProf != "" {
+			probeArgs = append(probeArgs, "--user-data-dir="+probeProf)
+		}
+		probeArgs = append(probeArgs, "--dump-dom", "data:text/html,<title>T</title>hi")
 		t0 := time.Now()
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		out, err := runHidden(ctx, edge, "--headless=new", "--no-first-run", "--disable-gpu", "--dump-dom", "data:text/html,<title>T</title>hi")
+		out, err := runHidden(ctx, edge, probeArgs...)
 		el := time.Since(t0).Round(time.Millisecond)
 		if err != nil {
 			fmt.Fprintf(&sb, "edge engine: FAILED in %v: %v\n", el, shortErr(fmt.Sprintf("%s", out)))
@@ -1315,8 +1348,19 @@ func trollSelftest() (string, error) {
 		} else {
 			fmt.Fprintf(&sb, "edge engine: ok (%v)\n", el)
 		}
+		// Companion version line: flag support (headless shape) moves
+		// with the Edge build, so the number travels with the verdict.
+		vctx, vcancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer vcancel()
+		if ver, verr := runHidden(vctx, edge, "--version"); verr != nil {
+			fmt.Fprintf(&sb, "edge version: FAILED: %v\n", verr)
+		} else {
+			fmt.Fprintf(&sb, "edge version: %s\n", strings.TrimSpace(string(ver)))
+		}
 	}
-	// 4. PowerShell cold-spawn gauge (lockdown players pay this on launch).
+	// 4. Agent world (user/session/station/elevation): GUI faults live here.
+	sb.WriteString(agentContextLine() + "\n")
+	// 5. PowerShell cold-spawn gauge (lockdown players pay this on launch).
 	t0 := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()

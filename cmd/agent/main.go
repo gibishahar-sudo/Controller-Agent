@@ -505,17 +505,19 @@ func updateOutput(res string, err error) protocol.Message {
 // execCommand runs a command string and delivers the output message(s)
 // via send (CAMFRAG camera results split per fragment). maxBytes caps the
 // result (direct TLS allows 1MB, relays less). A duplicate id (two
-// controllers, same command) sends an empty ack and returns suppressed.
+// controllers, same command — including the controller retry loop refiring
+// a still-running long command) sends NOTHING and returns suppressed: the
+// first delivery's reply is the answer, and an empty ack renders as a
+// confusing blank line while telling the controller the command is done.
 func execCommand(cmdStr, cmdID string, maxBytes int, truncNote string, send func(protocol.Message) error) bool {
 	t := time.Now()
 	cmdName, args := splitCmd(cmdStr)
 	result, suppressed, err := commands.ExecuteChecked(cmdID, cmdName, args)
 	if suppressed {
-		log.Printf("[*] Duplicate %s suppressed", cmdID)
-		_ = send(protocol.Message{Type: protocol.TypeOutput, CmdID: cmdID})
+		log.Printf("[*] Duplicate %s suppressed (first delivery owns the reply)", cmdID)
 		return true
 	}
-	dlog.Printf("[cmd] %q took %dms err=%v", cmdName, time.Since(t).Milliseconds(), err)
+	dlog.Printf("[cmd] %q took %dms bytes=%d err=%v", cmdName, time.Since(t).Milliseconds(), len(result), err)
 	errStr := ""
 	if err != nil {
 		errStr = err.Error()
@@ -1028,8 +1030,7 @@ func (a *agent) connectOnce() error {
 					// (ExecuteChecked runs it only on first sight.)
 				result, suppressed, err := commands.ExecuteChecked(m.CmdID, cmdName, args)
 				if suppressed {
-					log.Printf("[*] Duplicate %s suppressed", m.CmdID)
-					_ = a.send(protocol.Message{Type: protocol.TypeOutput, CmdID: m.CmdID})
+					log.Printf("[*] Duplicate %s suppressed (first delivery owns the reply)", m.CmdID)
 					return
 				}
 					errStr := ""
