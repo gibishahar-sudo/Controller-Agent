@@ -518,7 +518,7 @@ func trollEdgeScript(edgeBin, local string, isAudio bool, secs int, loop bool, s
 	qm := psQuote(local)
 	return fmt.Sprintf(`$trace = %s
 function Trace($m) {
-  try { Add-Content -Path $trace -Value ((Get-Date).ToString('HH:mm:ss.fff') + ' ' + $m) -ErrorAction SilentlyContinue } catch {}
+  try { Add-Content -LiteralPath $trace -Value ((Get-Date).ToString('HH:mm:ss.fff') + ' ' + $m) -ErrorAction SilentlyContinue } catch {}
 }
 Trace('guardian start')
 Add-Type -AssemblyName System.Windows.Forms
@@ -668,8 +668,9 @@ if (-not (Test-Path $pref)) {
 }
 function Edge-CleanLocks {
   # Stale locks from hard-killed runs otherwise greet the next launch
-  # with profile-error pages instead of our video.
-  foreach ($n in @('SingletonLock', 'SingletonSocket', 'SingletonCookie')) {
+  # with profile-error pages instead of our video. 'lockfile' is the
+  # modern Chromium singleton guard; the Singleton* trio is its elders.
+  foreach ($n in @('lockfile', 'SingletonLock', 'SingletonSocket', 'SingletonCookie')) {
     $p = Join-Path $profile $n
     if (Test-Path $p) { Remove-Item $p -Force -ErrorAction SilentlyContinue }
   }
@@ -703,8 +704,14 @@ function Start-TrollEdge {
 try {
   $ep = Start-TrollEdge
   Trace('edge launched pid=' + $ep.Id)
+  # Liveness tripwire: a Start() that "succeeds" while Edge dies
+  # instantly (GPU, sandbox, profile) otherwise burns the whole 20s
+  # proof budget staring at nothing. Name it in 3s instead.
+  Start-Sleep -Seconds 3
+  if (-not (Edge-Running)) { throw "edge process gone within 3s of launch (pid $($ep.Id))" }
 } catch {
-  Set-Content -Path $status -Value ('failed: edge launch: ' + $_.Exception.Message)
+  Trace('edge launch threw: ' + $_.Exception.Message)
+  Set-Content -LiteralPath $status -Value ('failed: edge launch: ' + $_.Exception.Message)
   Trace('edge launch failed')
   [RmmTrollEdge]::Uninstall()
   exit 4
@@ -724,24 +731,24 @@ for ($i = 0; $i -lt 200 -and -not $found; $i++) {
   $sawWindow = $true
   if ($t.StartsWith('RMM-TROLL-PLAYING') -or $t -eq 'RMM-TROLL-ENDED') { $found = $true }
   elseif ($t.StartsWith('RMM-TROLL-STALLED:media-error')) {
-    Set-Content -Path $status -Value ('failed: edge cannot decode it (' + $t + ')')
+    Set-Content -LiteralPath $status -Value ('failed: edge cannot decode it (' + $t + ')')
     Stop-TrollEdge
     exit 5
   }
 }
 if (-not $found) {
   if ($sawWindow) {
-    Set-Content -Path $status -Value 'timeout-no-playback (kiosk window up, media never started: codec or very slow media?)'
+    Set-Content -LiteralPath $status -Value 'timeout-no-playback (kiosk window up, media never started: codec or very slow media?)'
   } else {
     $alive = Edge-Running
-    Set-Content -Path $status -Value ('failed: edge kiosk window never appeared (edge alive: ' + $alive + ')')
+    Set-Content -LiteralPath $status -Value ('failed: edge kiosk window never appeared (edge alive: ' + $alive + ')')
   }
   Trace('proof failed')
   Stop-TrollEdge
   exit 5
 }
 $script:seen = $true
-Set-Content -Path $status -Value 'opened'
+Set-Content -LiteralPath $status -Value 'opened'
 [RmmTrollEdge]::FullscreenTroll([RmmTrollEdge]::FindTrollWindow())
 [void][RmmTrollEdge]::BlockInput($true)
 # Guard: re-assert TopMost, heal murdered players, hard-stop at $secs.
@@ -1592,7 +1599,7 @@ $script:pics = @()
 try {
   $img = [System.Drawing.Image]::FromFile($path)
 } catch {
-  Set-Content -Path $status -Value ('failed: ' + $_.Exception.Message)
+  Set-Content -LiteralPath $status -Value ('failed: ' + $_.Exception.Message)
   [RmmTrollHook]::Uninstall()
   exit 3
 }
@@ -1646,7 +1653,7 @@ $guard.Add_Tick({
 $guard.Start()
 foreach ($w in $script:forms) { $w.Show() }
 # Proof of playback first, input lock second (never a locked black box).
-Set-Content -Path $status -Value 'opened'
+Set-Content -LiteralPath $status -Value 'opened'
 [void][RmmTrollHook]::BlockInput($true)
 [System.Windows.Forms.Application]::Run()
 if ($img) { $img.Dispose() }`, q, qs, secs, loopI), nil
@@ -1741,7 +1748,7 @@ foreach ($sc in [System.Windows.Forms.Screen]::AllScreens) {
   $me.Stretch = 'Uniform'
   $me.IsMuted = $false
   $w.Content = $me
-  $me.Add_MediaOpened({ param($s,$e) $script:opened = $true; Set-Content -Path $status -Value 'opened'; $s.Play() })
+  $me.Add_MediaOpened({ param($s,$e) $script:opened = $true; Set-Content -LiteralPath $status -Value 'opened'; $s.Play() })
   if ($loop -eq 1) {
     $me.Add_MediaEnded({ param($s,$e) $s.Position = [TimeSpan]::Zero; $s.Play() })
   } else {
@@ -1752,7 +1759,7 @@ foreach ($sc in [System.Windows.Forms.Screen]::AllScreens) {
     # Poison path with a reason: never a locked black box, never silence.
     $msg = 'unknown media error'
     if ($e -and $e.ErrorException) { $msg = $e.ErrorException.Message }
-    Set-Content -Path $status -Value ('failed: ' + $msg)
+    Set-Content -LiteralPath $status -Value ('failed: ' + $msg)
     Stop-TrollLockdownV
   })
   $w.Add_Closed({ [void][RmmTrollHookV]::BlockInput($false) })
@@ -1767,7 +1774,7 @@ $watchTimer.Interval = New-Object TimeSpan(0,0,0,20,0)
 $watchTimer.Add_Tick({
   $watchTimer.Stop()
   if (-not $script:opened) {
-    Set-Content -Path $status -Value 'timeout-no-media (no MediaOpened in 20s: missing codec, bad path, or very slow media?)'
+    Set-Content -LiteralPath $status -Value 'timeout-no-media (no MediaOpened in 20s: missing codec, bad path, or very slow media?)'
     Stop-TrollLockdownV
   }
 })
