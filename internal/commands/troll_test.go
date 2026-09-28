@@ -449,3 +449,18 @@ func TestPlayTrollDir(t *testing.T) {
 		t.Fatalf("directory should error clearly, got %v", err)
 	}
 }
+
+func TestTrollSelftest(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("windows only")
+	}
+	out, err := trollSelftest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"troll dir:", "powershell spawn:"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("selftest missing %q:\n%s", want, out)
+		}
+	}
+}

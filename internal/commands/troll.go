@@ -1270,6 +1270,70 @@ func trollStatus() (string, error) {
 	return sb.String(), nil
 }
 
+// trollSelftest reports box readiness for lockdown playback in seconds:
+// directory writability (the silent-killer class: unwritable dirs blank
+// every status/trace/prefs write with zero evidence), Edge presence, and
+// a headless engine check (no display touched). Run it on any box where
+// play-troll misbehaves before guessing.
+func trollSelftest() (string, error) {
+	if runtime.GOOS != "windows" {
+		return "", fmt.Errorf("not supported on %s", runtime.GOOS)
+	}
+	var sb strings.Builder
+	// 1. Directory writability (status, trace, prefs, wrapper all live here).
+	probe := filepath.Join(trollMediaDir(), ".selftest")
+	if err := os.MkdirAll(trollMediaDir(), 0755); err != nil {
+		fmt.Fprintf(&sb, "troll dir: MKDIR FAILED: %v\n", err)
+	} else if err := os.WriteFile(probe, []byte("ok"), 0644); err != nil {
+		fmt.Fprintf(&sb, "troll dir: WRITE FAILED: %v\n", err)
+	} else {
+		_ = os.Remove(probe)
+		fmt.Fprintf(&sb, "troll dir: writable (%s)\n", trollMediaDir())
+	}
+	// 2. Edge presence.
+	edge := edgePath()
+	if edge == "" {
+		sb.WriteString("edge: missing (Chromium fallback unavailable)\n")
+	} else {
+		fmt.Fprintf(&sb, "edge: %s\n", edge)
+		// 3. Engine check: headless DOM dump, no display touched.
+		t0 := time.Now()
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		out, err := runHidden(ctx, edge, "--headless=new", "--no-first-run", "--disable-gpu", "--dump-dom", "data:text/html,<title>T</title>hi")
+		el := time.Since(t0).Round(time.Millisecond)
+		if err != nil {
+			fmt.Fprintf(&sb, "edge engine: FAILED in %v: %v\n", el, shortErr(fmt.Sprintf("%s", out)))
+		} else if !strings.Contains(string(out), "EDGE-PROBE") && !strings.Contains(string(out), ">hi") {
+			fmt.Fprintf(&sb, "edge engine: unexpected output in %v\n", el)
+		} else {
+			fmt.Fprintf(&sb, "edge engine: ok (%v)\n", el)
+		}
+	}
+	// 4. PowerShell cold-spawn gauge (lockdown players pay this on launch).
+	t0 := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	if _, err := runHidden(ctx, "powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-command", "Write-Output ps-ok"); err != nil {
+		fmt.Fprintf(&sb, "powershell spawn: FAILED: %v\n", err)
+	} else {
+		fmt.Fprintf(&sb, "powershell spawn: ok (%v)\n", time.Since(t0).Round(time.Millisecond))
+	}
+	return sb.String(), nil
+}
+
+// shortErr trims process output to one short line for reports.
+func shortErr(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) > 160 {
+		s = s[:160] + "..."
+	}
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		s = s[:i]
+	}
+	return s
+}
+
 // trollProbe opens media headless (invisible window, no input block, no
 // lockdown) and reports what Media Foundation thinks: dimensions,
 // duration, audio/video presence, or the exact failure. Diagnostic for

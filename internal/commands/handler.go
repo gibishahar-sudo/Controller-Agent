@@ -508,6 +508,8 @@ func Execute(cmd, args string) (string, error) {
 		return trollStatus()
 	case "troll-probe":
 		return trollProbe(args)
+	case "troll-selftest":
+		return trollSelftest()
 	case "camera-shot":
 		return cameraShot(args)
 	case "keep-awake":

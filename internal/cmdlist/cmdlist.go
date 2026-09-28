@@ -120,6 +120,7 @@ var Known = map[string]string{
 	"stop-troll":               "Stop troll player and unblock input",
 	"troll-status":             "Troll player state + last playback proof",
 	"troll-probe":              "Media open test, small visible window, no lockdown - troll-probe <path|url>",
+	"troll-selftest":           "Box playback readiness (dirs, Edge, engine, spawn timing)",
 	"keep-awake":               "Block sleep/lock on remote PC - keep-awake [on|off|status]",
 	"get-session-state":        "Locked/RDP state of remote session",
 	"get-foreground-window":    "Focused window on remote PC (where keys land)",
