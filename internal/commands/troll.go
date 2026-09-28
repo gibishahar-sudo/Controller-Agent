@@ -1290,12 +1290,18 @@ func trollSelftest() (string, error) {
 		_ = os.Remove(probe)
 		fmt.Fprintf(&sb, "troll dir: writable (%s)\n", trollMediaDir())
 	}
-	// 2. Edge presence.
+	// 2. Edge presence (plus binary size: a KB-sized stub launcher
+	// exits 0 doing nothing and looks healthy until you weigh it —
+	// real msedge.exe is several MB).
 	edge := edgePath()
 	if edge == "" {
 		sb.WriteString("edge: missing (Chromium fallback unavailable)\n")
 	} else {
-		fmt.Fprintf(&sb, "edge: %s\n", edge)
+		if st, err := os.Stat(edge); err == nil {
+			fmt.Fprintf(&sb, "edge: %s (%d bytes)\n", edge, st.Size())
+		} else {
+			fmt.Fprintf(&sb, "edge: %s (stat failed: %v)\n", edge, err)
+		}
 		// 3. Engine check: headless DOM dump, no display touched.
 		t0 := time.Now()
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -1304,8 +1310,8 @@ func trollSelftest() (string, error) {
 		el := time.Since(t0).Round(time.Millisecond)
 		if err != nil {
 			fmt.Fprintf(&sb, "edge engine: FAILED in %v: %v\n", el, shortErr(fmt.Sprintf("%s", out)))
-		} else if !strings.Contains(string(out), "EDGE-PROBE") && !strings.Contains(string(out), ">hi") {
-			fmt.Fprintf(&sb, "edge engine: unexpected output in %v\n", el)
+		} else if !strings.Contains(string(out), ">hi") {
+			fmt.Fprintf(&sb, "edge engine: unexpected output in %v: %v\n", el, shortErr(fmt.Sprintf("%s", out)))
 		} else {
 			fmt.Fprintf(&sb, "edge engine: ok (%v)\n", el)
 		}
