@@ -343,6 +343,11 @@ func playTrollEdge(local, ext string, secs int, loop bool, loopNote, codec, why,
 	}
 	_ = os.Remove(statusPath)
 	_ = os.Remove(trollTraceFile())
+	// The guardian writes status+trace+prefs under the troll dir; without
+	// this Mkdir a fresh box silences every one of them (DCHQHAK: 60s of
+	// nothing from a 2s launch failure). The WPF path has always done it;
+	// the Edge path never did.
+	_ = os.MkdirAll(trollMediaDir(), 0755)
 	// Death-rattle capture like notify: a guardian that dies before its
 	// first trace line otherwise leaves zero evidence behind.
 	dbgDir := filepath.Join(os.TempDir(), "RMM")
