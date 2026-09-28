@@ -787,8 +787,17 @@ $guard.Start()
 $gf.Add_FormClosed({ param($s,$e) [void][RmmTrollEdge]::BlockInput($false); [RmmTrollEdge]::Uninstall() })
 $gf.Show()
 [System.Windows.Forms.Application]::Run()
-`, qe, qp, qs, qf, qt, secs, loopI, qm, tag, tag, loopAttr, tag), nil
+`, qt, qe, qp, qs, qf, secs, loopI, qm, tag, tag, loopAttr, tag), nil
 }
+
+// NOTE (v1.46.27 post-mortem): the arg order above MUST mirror the
+// template's verb order ($trace, $edge, $profile, $status, $stopFlag).
+// It once read qe,qp,qs,qf,qt (alphabetical) — every path landed in the
+// wrong variable: Trace wrote to the Edge binary path (silent), $edge
+// held a directory (Start threw → exit 4), status went to the stop-flag
+// file (proof starved → 60s timeout). Counts still matched, so vet and
+// the marker tests stayed green while the kiosk could never work.
+// TestTrollScriptPathAlignment below pins VALUES, not markers.
 
 // stop-troll: unblock input FIRST (survives a hung player), then kill.
 func stopTroll() (string, error) {
@@ -1298,6 +1307,21 @@ func trollStatus() (string, error) {
 	return sb.String(), nil
 }
 
+// edgeMajorVersion parses "Microsoft Edge 120.0.2210.61" → 120.
+// Returns 0 when no dotted build token is found (mute engine,
+// delegation sentence, empty): the caller treats 0 as "unknown, probe
+// best-effort" rather than skipping.
+func edgeMajorVersion(ver string) int {
+	for _, f := range strings.Fields(ver) {
+		if i := strings.Index(f, "."); i > 0 {
+			if n, err := strconv.Atoi(f[:i]); err == nil {
+				return n
+			}
+		}
+	}
+	return 0
+}
+
 // trollSelftest reports box readiness for lockdown playback in seconds:
 // directory writability (the silent-killer class: unwritable dirs blank
 // every status/trace/prefs write with zero evidence), Edge presence, and
@@ -1330,44 +1354,56 @@ func trollSelftest() (string, error) {
 		} else {
 			fmt.Fprintf(&sb, "edge: %s (stat failed: %v)\n", edge, err)
 		}
-		// 3. Engine check: headless DOM dump, no display touched. The
-		// probe rides its OWN throwaway profile: without --user-data-dir
-		// it shares the default profile, and a running desktop Edge
-		// swallows the dump (singleton delegation: silent exit 0).
+		// 3. Version first, WITH the throwaway profile: a bare
+		// --version shares the default profile, and a resident
+		// background Edge (Startup Boost) answers for it — "Opening in
+		// existing browser session" plus a stolen-focus browser window.
+		// The build number also gates the DOM dump below (new headless
+		// needs build 112+; older builds would open a headed window).
 		probeProf, _ := os.MkdirTemp("", "rmm-edgeprobe")
 		if probeProf != "" {
 			defer os.RemoveAll(probeProf)
 		}
-		probeArgs := []string{"--headless=new", "--no-first-run", "--disable-gpu"}
+		profArgs := []string{}
 		if probeProf != "" {
-			probeArgs = append(probeArgs, "--user-data-dir="+probeProf)
+			profArgs = []string{"--user-data-dir=" + probeProf}
 		}
-		probeArgs = append(probeArgs, "--dump-dom", "data:text/html,<title>T</title>hi")
-		t0 := time.Now()
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		out, err := runHidden(ctx, edge, probeArgs...)
-		el := time.Since(t0).Round(time.Millisecond)
-		if err != nil {
-			fmt.Fprintf(&sb, "edge engine: FAILED in %v: %v\n", el, shortErr(fmt.Sprintf("%s", out)))
-		} else if !strings.Contains(string(out), ">hi") {
-			fmt.Fprintf(&sb, "edge engine: unexpected output in %v: %v\n", el, shortErr(fmt.Sprintf("%s", out)))
-		} else {
-			fmt.Fprintf(&sb, "edge engine: ok (%v)\n", el)
-		}
-		// Companion version line: flag support (headless shape) moves
-		// with the Edge build, so the number travels with the verdict.
 		vctx, vcancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer vcancel()
-		if ver, verr := runHidden(vctx, edge, "--version"); verr != nil {
+		verStr := ""
+		if ver, verr := runHidden(vctx, edge, append(append([]string{}, profArgs...), "--version")...); verr != nil {
 			fmt.Fprintf(&sb, "edge version: FAILED: %v\n", verr)
 		} else {
-			fmt.Fprintf(&sb, "edge version: %s\n", strings.TrimSpace(string(ver)))
+			verStr = strings.TrimSpace(string(ver))
+			fmt.Fprintf(&sb, "edge version: %s\n", verStr)
+		}
+		// 4. Engine check: headless DOM dump, no display touched. The
+		// probe rides its OWN throwaway profile: without --user-data-dir
+		// it shares the default profile, and a running desktop Edge
+		// swallows the dump (singleton delegation: silent exit 0).
+		// --headless (not --headless=new) stays valid on ancient and
+		// modern builds alike.
+		if major := edgeMajorVersion(verStr); verStr != "" && major > 0 && major < 112 {
+			fmt.Fprintf(&sb, "edge engine: skipped (Edge build %d < 112, no new headless; kiosk attempt is the proof)\n", major)
+		} else {
+			probeArgs := append(append([]string{}, profArgs...), "--headless", "--no-first-run", "--disable-gpu", "--dump-dom", "data:text/html,<title>T</title>hi")
+			t0 := time.Now()
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			out, err := runHidden(ctx, edge, probeArgs...)
+			el := time.Since(t0).Round(time.Millisecond)
+			if err != nil {
+				fmt.Fprintf(&sb, "edge engine: FAILED in %v: %v\n", el, shortErr(fmt.Sprintf("%s", out)))
+			} else if !strings.Contains(string(out), ">hi") {
+				fmt.Fprintf(&sb, "edge engine: unexpected output in %v: %v\n", el, shortErr(fmt.Sprintf("%s", out)))
+			} else {
+				fmt.Fprintf(&sb, "edge engine: ok (%v)\n", el)
+			}
 		}
 	}
-	// 4. Agent world (user/session/station/elevation): GUI faults live here.
+	// 5. Agent world (user/session/station/elevation): GUI faults live here.
 	sb.WriteString(agentContextLine() + "\n")
-	// 5. PowerShell cold-spawn gauge (lockdown players pay this on launch).
+	// 6. PowerShell cold-spawn gauge (lockdown players pay this on launch).
 	t0 := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()

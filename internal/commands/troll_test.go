@@ -429,8 +429,69 @@ func TestTrollEdgeScriptMarkers(t *testing.T) {
 	}
 }
 
-func TestTrollStopFlag(t *testing.T) {
-	dir := t.TempDir()
+// TestTrollScriptPathAlignment pins the RENDERED VALUES of the path
+// variables (v1.46.27 post-mortem). The Edge script once passed its five
+// quoted paths alphabetically (qe,qp,qs,qf,qt) while the template reads
+// them as ($trace,$edge,$profile,$status,$stopFlag): every path landed
+// wrong — Trace to the binary, $edge a directory (Start threw, exit 4),
+// status to the stop-flag file (proof starved, 60s timeout). Verb counts
+// still matched, so vet and the marker tests stayed green while the
+// kiosk could never work anywhere. Markers check presence; this checks
+// placement.
+func TestTrollScriptPathAlignment(t *testing.T) {
+	s, err := trollEdgeScript(`C:\E\EDGE.EXE`, `C:\M\V.MP4`, false, 300, true, `C:\S\STATUS.TXT`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"$trace = " + psQuote(trollTraceFile()),
+		"$edge = 'C:\\E\\EDGE.EXE'",
+		"$profile = " + psQuote(trollEdgeProfile()),
+		"$status = 'C:\\S\\STATUS.TXT'",
+		"$stopFlag = " + psQuote(trollStopFlagPath(trollMediaDir())),
+		"System.Uri('C:\\M\\V.MP4')",
+	} {
+		if !strings.Contains(s, want) {
+			t.Fatalf("edge script misplaces paths, missing %q", want)
+		}
+	}
+	// The WPF script uses the same pattern: same pin, both branches.
+	for _, ext := range []string{".mp4", ".gif"} {
+		ws, err := trollScript(`C:\P\V`+ext, ext, 300, true, `C:\S\ST.TXT`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, want := range []string{
+			"$path = 'C:\\P\\V" + ext + "'",
+			"$status = 'C:\\S\\ST.TXT'",
+		} {
+			if !strings.Contains(ws, want) {
+				t.Fatalf("wpf script (%s) misplaces paths, missing %q", ext, want)
+			}
+		}
+	}
+}
+
+func TestEdgeMajorVersion(t *testing.T) {
+	cases := []struct {
+		in   string
+		want int
+	}{
+		{"Microsoft Edge 120.0.2210.61", 120},
+		{"Microsoft Edge 109.0.1518.78", 109},
+		{"Chromium 132.0.6834.160", 132},
+		{"Opening in existing browser session.", 0},
+		{"", 0},
+		{"garbage", 0},
+	}
+	for _, c := range cases {
+		if got := edgeMajorVersion(c.in); got != c.want {
+			t.Errorf("edgeMajorVersion(%q) = %d want %d", c.in, got, c.want)
+		}
+	}
+}
+
+func TestTrollStopFlag(t *testing.T) {	dir := t.TempDir()
 	if trollStopFlagged(dir) {
 		t.Fatal("fresh dir should not be flagged")
 	}
