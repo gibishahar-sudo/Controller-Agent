@@ -317,25 +317,53 @@ func playTrollEdge(local, ext string, secs int, loop bool, loopNote, codec, why,
 	}
 	_ = os.Remove(statusPath)
 	_ = os.Remove(trollTraceFile())
-	gp, err := spawnGUI("powershell", []string{"-NoProfile", "-ExecutionPolicy", "Bypass", "-command", script}, nil, nil)
+	// Death-rattle capture like notify: a guardian that dies before its
+	// first trace line otherwise leaves zero evidence behind.
+	dbgDir := filepath.Join(os.TempDir(), "RMM")
+	_ = os.MkdirAll(dbgDir, 0755)
+	dbgPath := filepath.Join(dbgDir, fmt.Sprintf("trolledge-%d.log", time.Now().UnixNano()))
+	dbg, _ := os.Create(dbgPath)
+	if dbg != nil {
+		defer func() {
+			_ = dbg.Close()
+			_ = os.Remove(dbgPath)
+		}()
+	}
+	var gp guiProc
+	if dbg != nil {
+		gp, err = spawnGUI("powershell", []string{"-NoProfile", "-ExecutionPolicy", "Bypass", "-command", script}, dbg, dbg)
+	} else {
+		gp, err = spawnGUI("powershell", []string{"-NoProfile", "-ExecutionPolicy", "Bypass", "-command", script}, nil, nil)
+	}
 	if err != nil {
 		return "", err
 	}
 	_ = os.MkdirAll(filepath.Dir(trollPIDFile()), 0755)
 	_ = os.WriteFile(trollPIDFile(), []byte(strconv.Itoa(gp.Pid())), 0644)
 	go gp.Wait()
-	res, err := waitTrollProof(statusPath, filepath.Base(local), loopNote+" via Chromium ("+why+")", codec, secs, 350)
+	res, err := waitTrollProof(statusPath, filepath.Base(local), loopNote+" via Chromium ("+why+")", codec, secs, 600)
 	if err != nil {
 		// Attach the guardian's dying words: stage trace shows exactly
 		// how far launch/proof got (launch vs window vs playback).
+		var parts []string
 		if b, rerr := os.ReadFile(trollTraceFile()); rerr == nil {
-			tr := strings.TrimSpace(string(b))
-			if len(tr) > 600 {
-				tr = tr[len(tr)-600:]
+			if tr := strings.TrimSpace(string(b)); tr != "" {
+				if len(tr) > 400 {
+					tr = tr[len(tr)-400:]
+				}
+				parts = append(parts, "edge trace: "+tr)
 			}
-			if tr != "" {
-				return res, fmt.Errorf("%w | edge trace: %s", err, tr)
+		}
+		if b, rerr := os.ReadFile(dbgPath); rerr == nil {
+			if tail := strings.TrimSpace(string(b)); tail != "" {
+				if len(tail) > 400 {
+					tail = tail[len(tail)-400:]
+				}
+				parts = append(parts, "edge stderr: "+tail)
 			}
+		}
+		if len(parts) > 0 {
+			return res, fmt.Errorf("%w | %s", err, strings.Join(parts, " | "))
 		}
 	}
 	return res, err
@@ -421,7 +449,12 @@ func trollEdgeScript(edgeBin, local string, isAudio bool, secs int, loop bool, s
 		loopI = 1
 	}
 	qm := psQuote(local)
-	return fmt.Sprintf(`Add-Type -AssemblyName System.Windows.Forms
+	return fmt.Sprintf(`$trace = %s
+function Trace($m) {
+  try { Add-Content -Path $trace -Value ((Get-Date).ToString('HH:mm:ss.fff') + ' ' + $m) -ErrorAction SilentlyContinue } catch {}
+}
+Trace('guardian start')
+Add-Type -AssemblyName System.Windows.Forms
 Add-Type -TypeDefinition @'
 using System;
 using System.Diagnostics;
@@ -515,19 +548,15 @@ public static class RmmTrollEdge {
 '@
 [void][RmmTrollEdge]::SetProcessDPIAware()
 [RmmTrollEdge]::Install()
+Trace('hook installed')
 $edge = %s
 $profile = %s
 $status = %s
 $stopFlag = %s
-$trace = %s
 $secs = %d
 $loop = %d
 $script:allowClose = $false
 $script:seen = $false
-function Trace($m) {
-  try { Add-Content -Path $trace -Value ((Get-Date).ToString('HH:mm:ss.fff') + ' ' + $m) -ErrorAction SilentlyContinue } catch {}
-}
-Trace('guardian start')
 function Edge-Running {
   $p = Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like ('*'+$profile+'*') }
   return ($null -ne $p)
@@ -564,6 +593,7 @@ $mu = $mediaUri.Replace('&', '&amp;').Replace('"', '&quot;')
 $html = '<!DOCTYPE html><html><head><title>RMM-TROLL</title><style>html,body{margin:0;background:#000;height:100%%%%;display:flex;align-items:center;justify-content:center;overflow:hidden}%s{max-width:100%%%%;max-height:100%%%%;object-fit:contain}</style></head><body><%s id="m" autoplay %s><source src="' + $mu + '"></%s><script>var m=document.getElementById("m");function st(t){try{document.title=t;}catch(e){}}m.addEventListener("playing",function(){st("RMM-TROLL-PLAYING");});m.addEventListener("error",function(){var e=m.error;st("RMM-TROLL-STALLED:media-error-"+(e?e.code:"?"));});m.addEventListener("stalled",function(){st("RMM-TROLL-STALLED:stalled");});m.addEventListener("waiting",function(){st("RMM-TROLL-STALLED:waiting");});m.addEventListener("ended",function(){st("RMM-TROLL-ENDED");});</script></body></html>'
 $wrapper = Join-Path $profile 'play.html'
 Set-Content -Path $wrapper -Value $html -Encoding UTF8
+Trace('wrapper written')
 $wrapUri = (New-Object System.Uri($wrapper)).AbsoluteUri
 $edgeArgs = @('--kiosk', '--new-window', $wrapUri, ('--user-data-dir='+$profile), '--no-first-run', '--no-default-browser-check', '--disable-search-engine-choice-screen', '--disable-sync', '--disable-component-update', '--autoplay-policy=no-user-gesture-required', '--disable-features=Translate', '--disable-infobars', '--disable-session-crashed-bubble', '--hide-crash-restore-bubble')
 function Start-TrollEdge {
