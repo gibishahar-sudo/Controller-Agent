@@ -398,6 +398,8 @@ func TestTrollEdgeScriptMarkers(t *testing.T) {
 		"Edge-CleanLocks",
 		"SingletonLock",
 		"Start-TrollEdge",
+		"UseShellExecute",
+		"edge launched pid=",
 		"FindTrollWindow",
 		"EnumWindows",
 		"FullscreenTroll",

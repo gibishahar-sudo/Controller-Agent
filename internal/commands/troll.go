@@ -297,7 +297,7 @@ func playTroll(arg string) (string, error) {
 	_ = os.MkdirAll(filepath.Dir(trollPIDFile()), 0755)
 	_ = os.WriteFile(trollPIDFile(), []byte(strconv.Itoa(gp.Pid())), 0644)
 	go gp.Wait()
-	res, err := waitTrollProof(statusPath, filepath.Base(local), loopNote, codec, secs, 400)
+	res, err := waitTrollProof(statusPath, filepath.Base(local), loopNote, codec, secs, 400, gp.Pid())
 	if err != nil && edgeBin != "" && !trollImageExts[ext] {
 		// Native player couldn't open it — Chromium gets a turn under the
 		// same lockdown with a fresh proof. The wait above already
@@ -341,7 +341,7 @@ func playTrollEdge(local, ext string, secs int, loop bool, loopNote, codec, why,
 	_ = os.MkdirAll(filepath.Dir(trollPIDFile()), 0755)
 	_ = os.WriteFile(trollPIDFile(), []byte(strconv.Itoa(gp.Pid())), 0644)
 	go gp.Wait()
-	res, err := waitTrollProof(statusPath, filepath.Base(local), loopNote+" via Chromium ("+why+")", codec, secs, 600)
+	res, err := waitTrollProof(statusPath, filepath.Base(local), loopNote+" via Chromium ("+why+")", codec, secs, 600, gp.Pid())
 	if err != nil {
 		// Attach the guardian's dying words: stage trace shows exactly
 		// how far launch/proof got (launch vs window vs playback).
@@ -378,7 +378,7 @@ func trollTraceFile() string {
 // verdict: "opened" (success), "failed:…"/"timeout…" (reported failure),
 // or silence past budget (killed as a presumed hang, then reported).
 // Shared by the WPF and Chromium player paths.
-func waitTrollProof(statusPath, base, loopNote, codec string, secs, polls int) (string, error) {
+func waitTrollProof(statusPath, base, loopNote, codec string, secs, polls, pid int) (string, error) {
 	// Wait for proof of playback (MediaOpened / Shown). A codec miss or
 	// bad path used to look identical to success: black flash, instant
 	// close, "troll playing ..." lie. Now it errors with the reason.
@@ -387,8 +387,19 @@ func waitTrollProof(statusPath, base, loopNote, codec string, secs, polls int) (
 	// process spawn, the watchdog's starts when the script runs. A
 	// shorter wait would taskkill a player that was about to open — the
 	// same premature-kill flaw the notification proof had at 5s.
+	// Liveness is tracked alongside: a timeout with a live player means
+	// raise the budget; a timeout with an early death means spawn fault.
+	alive := true
+	diedAt := -1.0
+	t0 := time.Now()
 	for i := 0; i < polls; i++ {
 		time.Sleep(100 * time.Millisecond)
+		if alive && i%20 == 0 {
+			if !procAlive(pid) {
+				alive = false
+				diedAt = time.Since(t0).Seconds()
+			}
+		}
 		b, err := os.ReadFile(statusPath)
 		if err != nil {
 			continue
@@ -415,7 +426,11 @@ func waitTrollProof(statusPath, base, loopNote, codec string, secs, polls int) (
 	if codec == "hevc" {
 		hint = " [detected HEVC/H.265 — install HEVC Video Extensions from the Microsoft Store or convert to H.264]"
 	}
-	return "", fmt.Errorf("troll player did not confirm playback within %ds (codec or path?)%s", polls/10, hint)
+	live := "player alive at kill"
+	if !alive {
+		live = fmt.Sprintf("player died %.0fs in", diedAt)
+	}
+	return "", fmt.Errorf("troll player did not confirm playback within %ds (codec or path?)%s [%s]", polls/10, hint, live)
 }
 
 // trollEdgeProfile is the dedicated Edge profile dir for lockdown
@@ -598,11 +613,24 @@ $wrapUri = (New-Object System.Uri($wrapper)).AbsoluteUri
 $edgeArgs = @('--kiosk', '--new-window', $wrapUri, ('--user-data-dir='+$profile), '--no-first-run', '--no-default-browser-check', '--disable-search-engine-choice-screen', '--disable-sync', '--disable-component-update', '--autoplay-policy=no-user-gesture-required', '--disable-features=Translate', '--disable-infobars', '--disable-session-crashed-bubble', '--hide-crash-restore-bubble')
 function Start-TrollEdge {
   Edge-CleanLocks
-  return (Start-Process -FilePath $edge -ArgumentList $edgeArgs -PassThru -ErrorAction Stop)
+  # ProcessStartInfo with UseShellExecute=false (raw CreateProcess): the
+  # Start-Process cmdlet goes through ShellExecute, whose fallbacks can
+  # do surprising things (including opening Explorer views) when launch
+  # goes sideways. Raw process creation either starts Edge or errors.
+  $psi = New-Object System.Diagnostics.ProcessStartInfo
+  $psi.FileName = $edge
+  $psi.Arguments = (($edgeArgs | ForEach-Object { '"' + ($_ -replace '"','""') + '"' }) -join ' ')
+  $psi.UseShellExecute = $false
+  $psi.CreateNoWindow = $true
+  $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+  $p = New-Object System.Diagnostics.Process
+  $p.StartInfo = $psi
+  if (-not $p.Start()) { throw "Process.Start returned false" }
+  return $p
 }
 try {
   $ep = Start-TrollEdge
-  Trace('edge launched')
+  Trace('edge launched pid=' + $ep.Id)
 } catch {
   Set-Content -Path $status -Value ('failed: edge launch: ' + $_.Exception.Message)
   Trace('edge launch failed')

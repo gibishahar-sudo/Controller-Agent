@@ -46,6 +46,30 @@ type sysProc struct {
 func (p *sysProc) Pid() int { return p.pid }
 func (p *sysProc) Wait() error { return <-p.done }
 
+// procAliveExitActive is STILL_ACTIVE: GetExitCodeProcess returns it
+// for a process that has not exited.
+const procAliveExitActive = 259
+
+// procAlive reports whether pid is a live process right now. Used by
+// proof waits to distinguish a hung-but-alive player (budget too short,
+// keep waiting or raise it) from one that died silently mid-proof
+// (spawn/environment fault, budget irrelevant).
+func procAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	h, err := windows.OpenProcess(0x1000, false, uint32(pid))
+	if err != nil {
+		return false
+	}
+	defer windows.CloseHandle(h)
+	var code uint32
+	if err := windows.GetExitCodeProcess(h, &code); err != nil {
+		return false
+	}
+	return code == procAliveExitActive
+}
+
 // spawnGUI starts name+args with no console, pinned to the interactive
 // desktop. out/err may be nil (discarded).
 // Falls back to a plain hidden spawn when the explicit desktop is

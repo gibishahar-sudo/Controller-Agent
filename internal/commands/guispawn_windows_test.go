@@ -3,6 +3,7 @@
 package commands
 
 import (
+	"os"
 	"strings"
 	"testing"
 )
@@ -33,4 +34,16 @@ func TestSpawnGUIMissing(t *testing.T) {
 	if _, err := spawnGUI(`C:\definitely\not\here.exe`, nil, nil, nil); err == nil {
 		t.Fatal("missing binary should error")
 	}
+}
+
+func TestProcAlive(t *testing.T) {
+	if !procAlive(os.Getpid()) {
+		t.Fatal("own process should be alive")
+	}
+	if procAlive(0) || procAlive(-1) {
+		t.Fatal("non-pids must not be alive")
+	}
+	// Absurd pid: either absent (false) or, on true 64-bit overflow
+	// wraparound, still deterministic — just require no crash.
+	_ = procAlive(1 << 30)
 }
