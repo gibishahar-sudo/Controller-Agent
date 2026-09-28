@@ -296,8 +296,34 @@ func playTroll(arg string) (string, error) {
 	}
 	_ = os.MkdirAll(filepath.Dir(trollPIDFile()), 0755)
 	_ = os.WriteFile(trollPIDFile(), []byte(strconv.Itoa(gp.Pid())), 0644)
-	go gp.Wait()
+	// Exit timestamping: stopTrollInternal kills the player when the
+	// proof gives up, so a post-mortem exit code alone cannot tell
+	// suicide from our own kill. A death clearly before budget end is
+	// the player's own doing.
+	pxDone := make(chan struct{})
+	var pxErr error
+	var pxAt time.Time
+	go func() {
+		pxErr = gp.Wait()
+		pxAt = time.Now()
+		close(pxDone)
+	}()
+	waitStart := time.Now()
+	budget := time.Duration(400) * 100 * time.Millisecond
 	res, err := waitTrollProof(statusPath, filepath.Base(local), loopNote, codec, secs, 400, gp.Pid())
+	if err != nil {
+		select {
+		case <-pxDone:
+			if pxAt.Before(waitStart.Add(budget - 3*time.Second)) {
+				if pxErr != nil {
+					err = fmt.Errorf("%w [player died on its own: %v]", err, pxErr)
+				} else {
+					err = fmt.Errorf("%w [player exited 0 on its own]", err)
+				}
+			}
+		default:
+		}
+	}
 	if err != nil && edgeBin != "" && !trollImageExts[ext] {
 		// Native player couldn't open it — Chromium gets a turn under the
 		// same lockdown with a fresh proof. The wait above already
@@ -340,31 +366,52 @@ func playTrollEdge(local, ext string, secs int, loop bool, loopNote, codec, why,
 	}
 	_ = os.MkdirAll(filepath.Dir(trollPIDFile()), 0755)
 	_ = os.WriteFile(trollPIDFile(), []byte(strconv.Itoa(gp.Pid())), 0644)
-	go gp.Wait()
+	pxDone := make(chan struct{})
+	var pxErr error
+	var pxAt time.Time
+	go func() {
+		pxErr = gp.Wait()
+		pxAt = time.Now()
+		close(pxDone)
+	}()
+	waitStart := time.Now()
 	res, err := waitTrollProof(statusPath, filepath.Base(local), loopNote+" via Chromium ("+why+")", codec, secs, 600, gp.Pid())
-	if err != nil {
-		// Attach the guardian's dying words: stage trace shows exactly
-		// how far launch/proof got (launch vs window vs playback).
-		var parts []string
-		if b, rerr := os.ReadFile(trollTraceFile()); rerr == nil {
-			if tr := strings.TrimSpace(string(b)); tr != "" {
-				if len(tr) > 400 {
-					tr = tr[len(tr)-400:]
-				}
-				parts = append(parts, "edge trace: "+tr)
+	if err == nil {
+		return res, nil
+	}
+	// Attach the guardian's dying words: stage trace shows exactly
+	// how far launch/proof got, plus whether it died on its own
+	// (before our kill could have caused it) or lived to budget end.
+	var parts []string
+	select {
+	case <-pxDone:
+		if pxAt.Before(waitStart.Add(60*time.Second - 3*time.Second)) {
+			if pxErr != nil {
+				parts = append(parts, fmt.Sprintf("guardian died on its own: %v", pxErr))
+			} else {
+				parts = append(parts, "guardian exited 0 on its own")
 			}
 		}
-		if b, rerr := os.ReadFile(dbgPath); rerr == nil {
-			if tail := strings.TrimSpace(string(b)); tail != "" {
-				if len(tail) > 400 {
-					tail = tail[len(tail)-400:]
-				}
-				parts = append(parts, "edge stderr: "+tail)
+	default:
+	}
+	if b, rerr := os.ReadFile(trollTraceFile()); rerr == nil {
+		if tr := strings.TrimSpace(string(b)); tr != "" {
+			if len(tr) > 400 {
+				tr = tr[len(tr)-400:]
 			}
+			parts = append(parts, "edge trace: "+tr)
 		}
-		if len(parts) > 0 {
-			return res, fmt.Errorf("%w | %s", err, strings.Join(parts, " | "))
+	}
+	if b, rerr := os.ReadFile(dbgPath); rerr == nil {
+		if tail := strings.TrimSpace(string(b)); tail != "" {
+			if len(tail) > 400 {
+				tail = tail[len(tail)-400:]
+			}
+			parts = append(parts, "edge stderr: "+tail)
 		}
+	}
+	if len(parts) > 0 {
+		return res, fmt.Errorf("%w | %s", err, strings.Join(parts, " | "))
 	}
 	return res, err
 }
