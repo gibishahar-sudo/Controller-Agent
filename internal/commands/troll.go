@@ -52,6 +52,19 @@ func trollStatusFile() string {
 	return filepath.Join(trollMediaDir(), "status.txt")
 }
 
+// clearTrollPath resets a troll handshake file. Scramble-era runs
+// created status.txt as a DIRECTORY (profile ops targeted it while the
+// paths were crossed), and os.Remove silently fails on non-empty dirs —
+// every later Set-Content then died "denied" forever with the window up
+// and proof unreachable. Directory → RemoveAll, else Remove.
+func clearTrollPath(p string) {
+	if st, err := os.Stat(p); err == nil && st.IsDir() {
+		_ = os.RemoveAll(p)
+		return
+	}
+	_ = os.Remove(p)
+}
+
 // trollStopFlagPath is the stop sentinel: stop-troll plants it, every
 // guardian honors it (permanent stand-down, no relaunch), play-troll
 // clears it at start. This ends resurrection races where duplicate
@@ -287,7 +300,7 @@ func playTroll(arg string) (string, error) {
 	// Fresh status handshake: the player must write "opened" (or a
 	// "failed:" reason) or playTroll reports failure instead of claiming
 	// success over a black flash.
-	_ = os.Remove(statusPath)
+	clearTrollPath(statusPath)
 	script, err := trollScript(local, ext, secs, loop, statusPath)
 	if err != nil {
 		return "", err
@@ -332,7 +345,7 @@ func playTroll(arg string) (string, error) {
 		// Native player couldn't open it — Chromium gets a turn under the
 		// same lockdown with a fresh proof. The wait above already
 		// reaped the WPF player via stopTrollInternal.
-		_ = os.Remove(statusPath)
+		clearTrollPath(statusPath)
 		return playTrollEdge(local, ext, secs, loop, loopNote, codec, "WPF could not open it", statusPath, edgeBin)
 	}
 	return res, err
@@ -347,6 +360,13 @@ func playTrollEdge(local, ext string, secs int, loop bool, loopNote, codec, why,
 	}
 	_ = os.Remove(statusPath)
 	_ = os.Remove(trollTraceFile())
+	// The WPF→Edge handoff arrives with the stop flag planted
+	// (waitTrollProof's failure path stands down the dead player), and
+	// the Edge proof honors it on iteration one (exit 6). Clear it so
+	// the new guardian starts clean. The direct-Edge route already
+	// cleared at play top; re-clearing is harmless.
+	clearTrollStopFlag(trollMediaDir())
+	clearTrollPath(statusPath)
 	// The guardian writes status+trace+prefs under the troll dir; without
 	// this Mkdir a fresh box silences every one of them (DCHQHAK: 60s of
 	// nothing from a 2s launch failure). The WPF path has always done it;
@@ -687,7 +707,7 @@ $wrapper = Join-Path $profile 'play.html'
 Set-Content -Path $wrapper -Value $html -Encoding UTF8
 Trace('wrapper written')
 $wrapUri = (New-Object System.Uri($wrapper)).AbsoluteUri
-$edgeArgs = @('--kiosk', '--new-window', $wrapUri, ('--user-data-dir='+$profile), '--no-first-run', '--no-default-browser-check', '--disable-search-engine-choice-screen', '--disable-sync', '--disable-component-update', '--disable-gpu', '--autoplay-policy=no-user-gesture-required', '--disable-features=Translate', '--disable-infobars', '--disable-session-crashed-bubble', '--hide-crash-restore-bubble')
+$edgeArgs = @('--app='+$wrapUri, ('--user-data-dir='+$profile), '--no-first-run', '--no-default-browser-check', '--disable-search-engine-choice-screen', '--disable-sync', '--disable-component-update', '--disable-gpu', '--autoplay-policy=no-user-gesture-required', '--disable-features=Translate', '--disable-infobars', '--disable-session-crashed-bubble', '--hide-crash-restore-bubble')
 function Start-TrollEdge {
   Edge-CleanLocks
   # ProcessStartInfo with UseShellExecute=false (raw CreateProcess): the

@@ -387,8 +387,7 @@ func TestTrollEdgeScriptMarkers(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
-		"--kiosk",
-		"--new-window",
+		"--app=",
 		"--user-data-dir=",
 		"--no-first-run",
 		"--disable-gpu",
@@ -489,6 +488,32 @@ func TestEdgeMajorVersion(t *testing.T) {
 			t.Errorf("edgeMajorVersion(%q) = %d want %d", c.in, got, c.want)
 		}
 	}
+}
+
+func TestClearTrollPath(t *testing.T) {
+	// Directory (scramble litter: status.txt as a dir with files inside).
+	dd := filepath.Join(t.TempDir(), "status.txt")
+	if err := os.MkdirAll(filepath.Join(dd, "sub"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dd, "x"), []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	clearTrollPath(dd)
+	if _, err := os.Stat(dd); !os.IsNotExist(err) {
+		t.Fatalf("dir not removed: %v", err)
+	}
+	// Plain file.
+	fp := filepath.Join(t.TempDir(), "status.txt")
+	if err := os.WriteFile(fp, []byte("opened"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	clearTrollPath(fp)
+	if _, err := os.Stat(fp); !os.IsNotExist(err) {
+		t.Fatalf("file not removed: %v", err)
+	}
+	// Missing: no error, no panic.
+	clearTrollPath(filepath.Join(t.TempDir(), "nope.txt"))
 }
 
 func TestTrollStopFlag(t *testing.T) {	dir := t.TempDir()
