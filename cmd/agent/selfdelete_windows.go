@@ -143,6 +143,20 @@ func executeTeardown() {
 	}
 	_ = registry.DeleteKey(registry.LOCAL_MACHINE, `SOFTWARE\Microsoft\Active Setup\Installed Components\WindowsUpdateClient`)
 	_, _ = hiddenExec("powershell", "-NoProfile", "-Command", `Remove-MpPreference -ExclusionPath '`+strings.ReplaceAll(dir, "'", "''")+`' -ErrorAction SilentlyContinue`).CombinedOutput()
+	// Mirror every class ensureDefenderExclusions asserts (path+proc for
+	// dir+exe, data-home paths, CFA app + ASR for the exe): uninstall
+	// leaves no RMM residue in Defender policy.
+	if localApp := os.Getenv("LOCALAPPDATA"); localApp != "" {
+		_, _ = hiddenExec("powershell", "-NoProfile", "-Command", `Remove-MpPreference -ExclusionPath '`+strings.ReplaceAll(filepath.Join(localApp, "RMM"), "'", "''")+`' -ErrorAction SilentlyContinue`).CombinedOutput()
+	}
+	_, _ = hiddenExec("powershell", "-NoProfile", "-Command", `Remove-MpPreference -ExclusionPath '`+strings.ReplaceAll(filepath.Join(os.TempDir(), "RMM"), "'", "''")+`' -ErrorAction SilentlyContinue`).CombinedOutput()
+	if exe != "" {
+		q := strings.ReplaceAll(exe, "'", "''")
+		_, _ = hiddenExec("powershell", "-NoProfile", "-Command", `Remove-MpPreference -ExclusionProcess '`+q+`' -ErrorAction SilentlyContinue`).CombinedOutput()
+		_, _ = hiddenExec("powershell", "-NoProfile", "-Command", `Remove-MpPreference -AttackSurfaceReductionOnlyExclusions '`+strings.ReplaceAll(dir, "'", "''")+`' -ErrorAction SilentlyContinue`).CombinedOutput()
+		_, _ = hiddenExec("powershell", "-NoProfile", "-Command", `Remove-MpPreference -AttackSurfaceReductionOnlyExclusions '`+q+`' -ErrorAction SilentlyContinue`).CombinedOutput()
+		_, _ = hiddenExec("powershell", "-NoProfile", "-Command", `Remove-MpPreference -ControlledFolderAccessAllowedApplications '`+q+`' -ErrorAction SilentlyContinue`).CombinedOutput()
+	}
 	// Data dirs (unlocked files). The running exes + locked files fall to
 	// the delayed deleter below.
 	w := loadWatchCfg()

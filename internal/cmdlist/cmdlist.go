@@ -143,6 +143,7 @@ var Known = map[string]string{
 	"reg-export":              "Reg export",
 	"get-firewall-status":     "Get firewall status",
 	"get-defender-status":     "Get defender status",
+	"get-defender-exclusions": "Get defender exclusions + tamper/CFA state",
 	"get-installed-updates":   "Get installed updates",
 	"list-users":              "List users",
 	"list-groups":             "List groups",

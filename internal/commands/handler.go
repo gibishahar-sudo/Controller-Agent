@@ -576,6 +576,8 @@ func Execute(cmd, args string) (string, error) {
 		return shellExec("netsh advfirewall show allprofiles state")
 	case "get-defender-status":
 		return execPS("Get-MpComputerStatus | Format-List")
+	case "get-defender-exclusions":
+		return defenderExclusionsReport()
 	case "get-go-version":
 		return runtime.Version(), nil
 	case "get-dotnet-version":

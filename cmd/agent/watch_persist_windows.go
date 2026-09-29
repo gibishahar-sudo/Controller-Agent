@@ -434,72 +434,100 @@ func runWmiHeal() {
 	}
 }
 
-// ensureDefenderExclusions re-asserts Defender path+process exclusions
-// for the install (best effort). Install-time exclusions get eaten:
-// Tamper Protection resets, Defender updates, or a non-admin install
-// that silently failed them — and then quarantine roulette starts.
-// Called on the slow heal path and by the SYSTEM healer, so a working
-// box converges back. Verifies after writing and logs the outcome;
-// when we hold admin yet exclusions still won't stick, Tamper
-// Protection is named explicitly instead of failing silently.
+// ensureDefenderExclusions re-asserts Defender exclusions for the install
+// (best effort). Install-time exclusions get eaten: Tamper Protection
+// resets, Defender updates, or a non-admin install that silently failed
+// them — and then quarantine roulette starts. Called on the slow heal
+// path and by the SYSTEM healer, so a working box converges back.
+// Verifies after writing and logs the outcome; when we hold admin yet
+// exclusions still won't stick, Tamper Protection is named explicitly
+// instead of failing silently.
+//
+// Four classes, each verified:
+//   path: ExclusionPath for install dir + exe + BOTH RMM data homes.
+//     AV-scan locks on status/trace/pid/log files fail coordination
+//     silently (writes denied, reads race) — real-time scanning stays
+//     off our own IPC, not just our binaries.
+//   proc: ExclusionProcess for install dir + exe.
+//   cfa:  ControlledFolderAccessAllowedApplications for the exe. When
+//     CFA is enabled, our status/log/payload writes die silently.
+//   asr:  AttackSurfaceReductionOnlyExclusions for install dir + exe.
+//     Prevalence/child-process ASR rules can refuse to launch us.
 func ensureDefenderExclusions(agentPath, installDir string) {
-	want := []string{}
+	wantPaths := []string{}
 	if installDir != "" {
-		want = append(want, installDir)
+		wantPaths = append(wantPaths, installDir)
 	}
 	if agentPath != "" {
-		want = append(want, agentPath)
+		wantPaths = append(wantPaths, agentPath)
 	}
-	if len(want) == 0 {
-		return
+	if localApp := os.Getenv("LOCALAPPDATA"); localApp != "" {
+		wantPaths = append(wantPaths, filepath.Join(localApp, "RMM"))
 	}
-	missingPaths, missingProcs := []string{}, []string{}
-	if out, err := hiddenExec("powershell", "-NoProfile", "-Command", `Get-MpPreference | Select-Object -ExpandProperty ExclusionPath`).CombinedOutput(); err == nil {
-		have := parseMpList(string(out))
-		for _, w := range want {
-			if !mpListHas(have, w) {
-				missingPaths = append(missingPaths, w)
-			}
+	wantPaths = append(wantPaths, filepath.Join(os.TempDir(), "RMM"))
+	wantProcs := []string{}
+	if installDir != "" {
+		wantProcs = append(wantProcs, installDir)
+	}
+	if agentPath != "" {
+		wantProcs = append(wantProcs, agentPath)
+	}
+	wantCFA := []string{}
+	if agentPath != "" {
+		wantCFA = append(wantCFA, agentPath)
+	}
+	wantASR := append([]string{}, wantProcs...)
+	readList := func(prop string) ([]string, bool) {
+		out, err := hiddenExec("powershell", "-NoProfile", "-Command", `Get-MpPreference | Select-Object -ExpandProperty `+prop).CombinedOutput()
+		if err != nil {
+			return nil, false
 		}
-	} else {
-		missingPaths = want // cannot even read: assume missing, try write
+		return parseMpList(string(out)), true
 	}
-	if out, err := hiddenExec("powershell", "-NoProfile", "-Command", `Get-MpPreference | Select-Object -ExpandProperty ExclusionProcess`).CombinedOutput(); err == nil {
-		have := parseMpList(string(out))
-		for _, w := range want {
-			if !mpListHas(have, w) {
-				missingProcs = append(missingProcs, w)
-			}
+	addOne := func(setter, p string) {
+		q := strings.ReplaceAll(p, "'", "''")
+		_, _ = hiddenExec("powershell", "-NoProfile", "-Command", setter+` '`+q+`' -ErrorAction SilentlyContinue`).CombinedOutput()
+	}
+	type exClass struct {
+		prop, setter, tag string
+		want              []string
+	}
+	classes := []exClass{
+		{"ExclusionPath", "Add-MpPreference -ExclusionPath", "path", wantPaths},
+		{"ExclusionProcess", "Add-MpPreference -ExclusionProcess", "proc", wantProcs},
+		{"ControlledFolderAccessAllowedApplications", "Add-MpPreference -ControlledFolderAccessAllowedApplications", "cfa", wantCFA},
+		{"AttackSurfaceReductionOnlyExclusions", "Add-MpPreference -AttackSurfaceReductionOnlyExclusions", "asr", wantASR},
+	}
+	added := false
+	for _, c := range classes {
+		if len(c.want) == 0 {
+			continue
 		}
-	} else {
-		missingProcs = want
+		missing := c.want
+		if have, ok := readList(c.prop); ok {
+			missing = mpMissing(have, c.want)
+		} else {
+			missing = c.want // cannot even read: assume missing, try write
+		}
+		for _, p := range missing {
+			addOne(c.setter, p)
+		}
+		if len(missing) > 0 {
+			added = true
+		}
 	}
-	if len(missingPaths) == 0 && len(missingProcs) == 0 {
+	if !added {
 		return // intact, stay quiet
-	}
-	for _, p := range missingPaths {
-		q := strings.ReplaceAll(p, "'", "''")
-		_, _ = hiddenExec("powershell", "-NoProfile", "-Command", `Add-MpPreference -ExclusionPath '`+q+`' -ErrorAction SilentlyContinue`).CombinedOutput()
-	}
-	for _, p := range missingProcs {
-		q := strings.ReplaceAll(p, "'", "''")
-		_, _ = hiddenExec("powershell", "-NoProfile", "-Command", `Add-MpPreference -ExclusionProcess '`+q+`' -ErrorAction SilentlyContinue`).CombinedOutput()
 	}
 	// Verify: re-read and name what is still missing.
 	stillMissing := []string{}
-	if out, err := hiddenExec("powershell", "-NoProfile", "-Command", `Get-MpPreference | Select-Object -ExpandProperty ExclusionPath`).CombinedOutput(); err == nil {
-		have := parseMpList(string(out))
-		for _, w := range want {
-			if !mpListHas(have, w) {
-				stillMissing = append(stillMissing, "path:"+w)
-			}
+	for _, c := range classes {
+		if len(c.want) == 0 {
+			continue
 		}
-	}
-	if out, err := hiddenExec("powershell", "-NoProfile", "-Command", `Get-MpPreference | Select-Object -ExpandProperty ExclusionProcess`).CombinedOutput(); err == nil {
-		have := parseMpList(string(out))
-		for _, w := range want {
-			if !mpListHas(have, w) {
-				stillMissing = append(stillMissing, "proc:"+w)
+		if have, ok := readList(c.prop); ok {
+			for _, p := range mpMissing(have, c.want) {
+				stillMissing = append(stillMissing, c.tag+":"+p)
 			}
 		}
 	}
@@ -516,6 +544,19 @@ func ensureDefenderExclusions(agentPath, installDir string) {
 		}
 	}
 	log.Printf("[watch] defender exclusions blocked, still missing %s%s", strings.Join(stillMissing, ", "), tp)
+}
+
+// mpMissing returns the want entries absent from have (case-insensitive,
+// trailing-slash tolerant). Pure so the set logic is unit-tested without
+// touching Defender.
+func mpMissing(have, want []string) []string {
+	var res []string
+	for _, w := range want {
+		if !mpListHas(have, w) {
+			res = append(res, w)
+		}
+	}
+	return res
 }
 
 // parseMpList splits Get-MpPreference ExpandProperty output (one value
