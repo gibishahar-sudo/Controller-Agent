@@ -535,6 +535,24 @@ func TestTrollKioskArgs(t *testing.T) {
 	}
 }
 
+func TestFirstPidToken(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"19544\r\n", "19544"},
+		{"  1234\n5678\n", "1234"},
+		{"", ""},
+		{"no digits here", ""},
+		{"0", ""},
+	}
+	for _, c := range cases {
+		if got := firstPidToken(c.in); got != c.want {
+			t.Errorf("firstPidToken(%q) = %q want %q", c.in, got, c.want)
+		}
+	}
+}
+
 func TestTrollStopFlag(t *testing.T) {
 	dir := t.TempDir()
 	if trollStopFlagged(dir) {

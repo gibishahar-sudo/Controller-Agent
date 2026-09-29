@@ -450,7 +450,23 @@ func playTrollEdge(local, ext string, secs int, loop bool, loopNote, codec, why,
 	defer kcancel()
 	_, _ = runHidden(kctx, "powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-command", killEdgeProfile)
 	wrapUri := (&url.URL{Scheme: "file", Path: filepath.ToSlash(wrapper)}).String()
-	edgeProc, err := spawnGUI(edgeBin, trollKioskArgs(wrapUri, prof), nil, nil)
+	// Edge's own death-rattle file: a stillborn engine logs the reason
+	// (GPU, sandbox, profile, delegation) to stderr — previously
+	// discarded via nil handles, so instant deaths were nameless.
+	dbgExePath := filepath.Join(dbgDir, fmt.Sprintf("trolledge-exe-%d.log", time.Now().UnixNano()))
+	dbgExe, _ := os.Create(dbgExePath)
+	if dbgExe != nil {
+		defer func() {
+			_ = dbgExe.Close()
+			_ = os.Remove(dbgExePath)
+		}()
+	}
+	var edgeProc guiProc
+	if dbgExe != nil {
+		edgeProc, err = spawnGUI(edgeBin, trollKioskArgs(wrapUri, prof), dbgExe, dbgExe)
+	} else {
+		edgeProc, err = spawnGUI(edgeBin, trollKioskArgs(wrapUri, prof), nil, nil)
+	}
 	if err != nil {
 		stopTrollInternal()
 		return "", fmt.Errorf("edge failed to start: %v", err)
@@ -458,14 +474,38 @@ func playTrollEdge(local, ext string, secs int, loop bool, loopNote, codec, why,
 	edgePid := edgeProc.Pid()
 	log.Printf("[troll] edge kiosk launched pid=%d", edgePid)
 	// Liveness tripwire, in-process: a spawn that "succeeds" while Edge
-	// exits instantly (delegation, GPU, sandbox, profile) names itself
-	// in 3s instead of burning the 60s proof budget.
+	// exits instantly names itself in 3s instead of burning the 60s
+	// proof budget. The verdict carries the exit status, delegation
+	// state, and the engine's own stderr tail.
 	tripT0 := time.Now()
 	for time.Since(tripT0) < 3*time.Second {
 		time.Sleep(200 * time.Millisecond)
 		if !trollProcAlive(edgePid) {
+			werrStr := "exit 0"
+			if werr := edgeProc.Wait(); werr != nil {
+				werrStr = werr.Error()
+			}
+			holder := ""
+			hctx, hcancel := context.WithTimeout(context.Background(), 15*time.Second)
+			hout, herr := runHidden(hctx, "powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-command", `Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like '*`+strings.ReplaceAll(prof, "'", "''")+`*' } | Select-Object -ExpandProperty ProcessId`)
+			hcancel()
+			if herr == nil {
+				if pid := firstPidToken(string(hout)); pid != "" && pid != strconv.Itoa(edgePid) {
+					holder = fmt.Sprintf(", same-profile holder alive (pid %s) — launch delegated", pid)
+				}
+			}
+			log.Printf("[troll] edge pid=%d died fast: %s%s", edgePid, werrStr, holder)
 			stopTrollInternal()
-			return "", fmt.Errorf("edge failed to start: process gone within 3s of launch (pid %d)", edgePid)
+			exeTail := ""
+			if b, rerr := os.ReadFile(dbgExePath); rerr == nil {
+				if tail := strings.TrimSpace(string(b)); tail != "" {
+					if len(tail) > 400 {
+						tail = tail[len(tail)-400:]
+					}
+					exeTail = " | edge exe stderr: " + tail
+				}
+			}
+			return "", fmt.Errorf("edge failed to start: process gone within 3s of launch (pid %d: %s%s)%s", edgePid, werrStr, holder, exeTail)
 		}
 	}
 	pxDone := make(chan struct{})
@@ -515,13 +555,32 @@ func playTrollEdge(local, ext string, secs int, loop bool, loopNote, codec, why,
 			if len(tail) > 400 {
 				tail = tail[len(tail)-400:]
 			}
-			parts = append(parts, "edge stderr: "+tail)
+			parts = append(parts, "guardian stderr: "+tail)
+		}
+	}
+	if b, rerr := os.ReadFile(dbgExePath); rerr == nil {
+		if tail := strings.TrimSpace(string(b)); tail != "" {
+			if len(tail) > 400 {
+				tail = tail[len(tail)-400:]
+			}
+			parts = append(parts, "edge exe stderr: "+tail)
 		}
 	}
 	if len(parts) > 0 {
 		return res, fmt.Errorf("%w | %s", err, strings.Join(parts, " | "))
 	}
 	return res, err
+}
+
+// firstPidToken returns the first positive-integer token in s (a CIM
+// ProcessId list), or "" when none. Pure for unit tests.
+func firstPidToken(s string) string {
+	for _, f := range strings.Fields(s) {
+		if n, err := strconv.Atoi(f); err == nil && n > 0 {
+			return strconv.Itoa(n)
+		}
+	}
+	return ""
 }
 
 // trollTraceFile is the guardian's stage log (fresh per Edge attempt).
