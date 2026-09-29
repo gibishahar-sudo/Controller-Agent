@@ -203,10 +203,14 @@ func playTroll(arg string) (string, error) {
 	defer guiSpawnMu.Unlock()
 
 	// Kill any previous troll first (one at a time — lock, not a pile-up).
-	// The stop flag is cleared here (not inside stopTrollInternal, which
-	// sets it): a new play means business, a stop means stand down.
-	clearTrollStopFlag(trollMediaDir())
+	// Order is load-bearing (v1.46.28 post-mortem): stopTrollInternal
+	// PLANTS the stop flag (to stand down duplicate guardians beyond the
+	// pid file), so the clear must come AFTER it, not before. Clear-then-
+	// kill left the flag planted for the new run, and the Edge proof loop
+	// honors it on iteration one (exit 6) — the kiosk died ~instantly on
+	// every run while WPF (which never reads the flag) worked fine.
 	stopTrollInternal()
+	clearTrollStopFlag(trollMediaDir())
 
 	local := src
 	if strings.HasPrefix(src, "http://") || strings.HasPrefix(src, "https://") {
