@@ -387,21 +387,11 @@ func TestTrollEdgeScriptMarkers(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
-		"--app=",
-		"--user-data-dir=",
-		"--no-first-run",
-		"--disable-gpu",
-		"--no-default-browser-check",
-		"--disable-search-engine-choice-screen",
-		"--autoplay-policy=no-user-gesture-required",
 		"First Run",
 		"Edge-CleanLocks",
 		"SingletonLock",
 		"Start-TrollEdge",
 		"UseShellExecute",
-		"edge launched pid=",
-		"edge launch threw: ",
-		"gone within 3s of launch",
 		"lockfile",
 		"FindTrollWindow",
 		"GetTopTitles",
@@ -418,7 +408,6 @@ func TestTrollEdgeScriptMarkers(t *testing.T) {
 		"BlockInput($false)",
 		"'opened'",
 		"failed: ",
-		"user-data-dir",
 		"stopFlag",
 		"troll.stop",
 	} {
@@ -516,7 +505,38 @@ func TestClearTrollPath(t *testing.T) {
 	clearTrollPath(filepath.Join(t.TempDir(), "nope.txt"))
 }
 
-func TestTrollStopFlag(t *testing.T) {	dir := t.TempDir()
+func TestTrollKioskArgs(t *testing.T) {
+	// Exact argv, in order: Chromium is order-insensitive, but the
+	// transport lesson (v1.46.31) is that every element must arrive
+	// whole — pin the vector, not just its members.
+	got := trollKioskArgs("file:///C:/m/play.html", `C:\m\edgeprofile`)
+	want := []string{
+		"--app=file:///C:/m/play.html",
+		`--user-data-dir=C:\m\edgeprofile`,
+		"--no-first-run",
+		"--no-default-browser-check",
+		"--disable-search-engine-choice-screen",
+		"--disable-sync",
+		"--disable-component-update",
+		"--disable-gpu",
+		"--autoplay-policy=no-user-gesture-required",
+		"--disable-features=Translate",
+		"--disable-infobars",
+		"--disable-session-crashed-bubble",
+		"--hide-crash-restore-bubble",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("kiosk args len %d want %d: %q", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("kiosk arg %d = %q want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestTrollStopFlag(t *testing.T) {
+	dir := t.TempDir()
 	if trollStopFlagged(dir) {
 		t.Fatal("fresh dir should not be flagged")
 	}

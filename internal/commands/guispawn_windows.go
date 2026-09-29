@@ -70,6 +70,10 @@ func procAlive(pid int) bool {
 	return code == procAliveExitActive
 }
 
+// trollProcAlive reports whether pid is live, for shared-file callers
+// (the kiosk tripwire) that cannot touch procAlive's windows-only home.
+func trollProcAlive(pid int) bool { return procAlive(pid) }
+
 // spawnGUI starts name+args with no console, pinned to the interactive
 // desktop. out/err may be nil (discarded).
 // Falls back to a plain hidden spawn when the explicit desktop is

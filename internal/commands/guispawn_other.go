@@ -33,3 +33,7 @@ func spawnGUI(name string, args []string, out, stderr *os.File) (guiProc, error)
 	}
 	return &execProc{cmd: cmd}, nil
 }
+
+// trollProcAlive is windows-only (process exit codes); off Windows the
+// kiosk tripwire treats the child as alive and lets proof decide.
+func trollProcAlive(pid int) bool { return pid > 0 }

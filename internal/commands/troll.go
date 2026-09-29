@@ -8,7 +8,9 @@ import (
 	"image/jpeg"
 	"image/png"
 	"io"
+	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -351,6 +353,26 @@ func playTroll(arg string) (string, error) {
 	return res, err
 }
 
+// trollKioskArgs builds the exact Chromium argv for the lockdown app
+// window. Kept in Go, never in the PS script: see playTrollEdge.
+func trollKioskArgs(wrapUri, profile string) []string {
+	return []string{
+		"--app=" + wrapUri,
+		"--user-data-dir=" + profile,
+		"--no-first-run",
+		"--no-default-browser-check",
+		"--disable-search-engine-choice-screen",
+		"--disable-sync",
+		"--disable-component-update",
+		"--disable-gpu",
+		"--autoplay-policy=no-user-gesture-required",
+		"--disable-features=Translate",
+		"--disable-infobars",
+		"--disable-session-crashed-bubble",
+		"--hide-crash-restore-bubble",
+	}
+}
+
 // playTrollEdge runs the Chromium kiosk fallback: same lockdown
 // (fullscreen kiosk, input block, key hook, timers), separate engine.
 func playTrollEdge(local, ext string, secs int, loop bool, loopNote, codec, why, statusPath, edgeBin string) (string, error) {
@@ -395,6 +417,57 @@ func playTrollEdge(local, ext string, secs int, loop bool, loopNote, codec, why,
 	}
 	_ = os.MkdirAll(filepath.Dir(trollPIDFile()), 0755)
 	_ = os.WriteFile(trollPIDFile(), []byte(strconv.Itoa(gp.Pid())), 0644)
+	// Go owns the Edge launch (v1.46.31): exact argv, no quoting layers.
+	// A PS-built Arguments string glued every flag into one argv element
+	// (--app=<url> arrived WITH the flags inside the URL), so exec argv
+	// here is exact by construction. The script keeps wrapper/proof/
+	// lockdown; Start-TrollEdge survives only as the mid-run healer.
+	prof := trollEdgeProfile()
+	_ = os.MkdirAll(prof, 0755)
+	for _, n := range []string{"lockfile", "SingletonLock", "SingletonSocket", "SingletonCookie"} {
+		_ = os.Remove(filepath.Join(prof, n))
+	}
+	// The wrapper is written by the guardian script (single template
+	// source); wait for it before launching Edge at it.
+	wrapper := filepath.Join(prof, "play.html")
+	wrapperOK := false
+	for i := 0; i < 300 && !wrapperOK; i++ {
+		if st, serr := os.Stat(wrapper); serr == nil && !st.IsDir() && st.Size() > 0 {
+			wrapperOK = true
+		} else {
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+	if !wrapperOK {
+		stopTrollInternal()
+		return "", fmt.Errorf("troll guardian never wrote the wrapper (see edge trace)")
+	}
+	// Pre-launch kill: a live orphaned kiosk holding the profile lock in
+	// memory would swallow the new launch (delegation to a stale page).
+	// File-lock cleanup above only covers dead holders. Best effort.
+	killEdgeProfile := `Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like '*` + strings.ReplaceAll(prof, "'", "''") + `*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`
+	kctx, kcancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer kcancel()
+	_, _ = runHidden(kctx, "powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-command", killEdgeProfile)
+	wrapUri := (&url.URL{Scheme: "file", Path: filepath.ToSlash(wrapper)}).String()
+	edgeProc, err := spawnGUI(edgeBin, trollKioskArgs(wrapUri, prof), nil, nil)
+	if err != nil {
+		stopTrollInternal()
+		return "", fmt.Errorf("edge failed to start: %v", err)
+	}
+	edgePid := edgeProc.Pid()
+	log.Printf("[troll] edge kiosk launched pid=%d", edgePid)
+	// Liveness tripwire, in-process: a spawn that "succeeds" while Edge
+	// exits instantly (delegation, GPU, sandbox, profile) names itself
+	// in 3s instead of burning the 60s proof budget.
+	tripT0 := time.Now()
+	for time.Since(tripT0) < 3*time.Second {
+		time.Sleep(200 * time.Millisecond)
+		if !trollProcAlive(edgePid) {
+			stopTrollInternal()
+			return "", fmt.Errorf("edge failed to start: process gone within 3s of launch (pid %d)", edgePid)
+		}
+	}
 	pxDone := make(chan struct{})
 	var pxErr error
 	var pxAt time.Time
@@ -405,6 +478,12 @@ func playTrollEdge(local, ext string, secs int, loop bool, loopNote, codec, why,
 	}()
 	waitStart := time.Now()
 	res, err := waitTrollProof(statusPath, filepath.Base(local), loopNote+" via Chromium ("+why+")", codec, secs, 600, gp.Pid())
+	if err != nil && runtime.GOOS == "windows" && edgePid > 0 {
+		// Stray kiosk with a wrong title (error page, first-run) escapes
+		// the RMM-TROLL* title sweep inside stopTrollInternal: reap our
+		// exact pid so no zombie holds the screen or the profile lock.
+		_ = hideWindow(exec.Command("taskkill", "/F", "/PID", strconv.Itoa(edgePid))).Run()
+	}
 	if err == nil {
 		return res, nil
 	}
@@ -706,8 +785,12 @@ $html = '<!DOCTYPE html><html><head><title>RMM-TROLL</title><style>html,body{mar
 $wrapper = Join-Path $profile 'play.html'
 Set-Content -Path $wrapper -Value $html -Encoding UTF8
 Trace('wrapper written')
-$wrapUri = (New-Object System.Uri($wrapper)).AbsoluteUri
-$edgeArgs = @('--app='+$wrapUri, ('--user-data-dir='+$profile), '--no-first-run', '--no-default-browser-check', '--disable-search-engine-choice-screen', '--disable-sync', '--disable-component-update', '--disable-gpu', '--autoplay-policy=no-user-gesture-required', '--disable-features=Translate', '--disable-infobars', '--disable-session-crashed-bubble', '--hide-crash-restore-bubble')
+# NOTE: no launch here. Go owns the Edge launch with an exact argv
+# array (v1.46.31): a PS-built Arguments string glued every flag into
+# one argv element (--app=<url> arrived WITH the flags inside the URL),
+# Edge opened the blob, delegated, died. exec argv is exact by
+# construction. Start-TrollEdge below survives as the mid-run healer
+# (guard timer relaunches a murdered player).
 function Start-TrollEdge {
   Edge-CleanLocks
   # ProcessStartInfo with UseShellExecute=false (raw CreateProcess): the
@@ -725,22 +808,9 @@ function Start-TrollEdge {
   if (-not $p.Start()) { throw "Process.Start returned false" }
   return $p
 }
-try {
-  $ep = Start-TrollEdge
-  Trace('edge launched pid=' + $ep.Id)
-  # Liveness tripwire: a Start() that "succeeds" while Edge dies
-  # instantly (GPU, sandbox, profile) otherwise burns the whole 20s
-  # proof budget staring at nothing. Name it in 3s instead.
-  Start-Sleep -Seconds 3
-  if (-not (Edge-Running)) { throw "edge process gone within 3s of launch (pid $($ep.Id))" }
-} catch {
-  Trace('edge launch threw: ' + $_.Exception.Message)
-  Set-Content -LiteralPath $status -Value ('failed: edge launch: ' + $_.Exception.Message)
-  Trace('edge launch failed')
-  [RmmTrollEdge]::Uninstall()
-  exit 4
-}
 # Proof: PLAYING (or ENDED for noloop) means the engine renders.
+# Go launched Edge before this script reached here; if it never shows,
+# the budget below reports it (with the titles witness) and exits 5.
 # A media error fails fast with its code; buffering stalls just wait out
 # the budget; no window at all fails at budget end.
 $found = $false
