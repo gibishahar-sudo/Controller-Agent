@@ -1,0 +1,306 @@
+package controller
+
+import (
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
+	"encoding/json"
+	"log"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"rmm/internal/ui"
+)
+
+// UI login gate (tablet/PWA prerequisite). The console HTTP UI had no
+// password: anyone who could reach it controlled every agent. Everything
+// here is server-side — the desktop console (index.html and its JS) is
+// untouched; a browser just carries the session cookie after one login.
+//
+// Password source (first hit wins, no new CLI flags by design):
+// RMM_UI_PASSWORD env → ui_password.txt beside the exe (or CWD, 0600)
+// → generated once, persisted, logged (never the secret itself).
+// Sessions: 32-byte random tokens, 12h fixed TTL, server-side store.
+// Brute force: 5 bad passwords per source IP → 5-minute block (429).
+
+const (
+	uiSessionCookie = "rmm_ui"
+	uiSessionTTL    = 12 * time.Hour
+	uiPassFile      = "ui_password.txt"
+	uiFailLimit     = 5
+	uiFailBlock     = 5 * time.Minute
+)
+
+type uiFailRec struct {
+	n     int
+	until time.Time
+}
+
+// initUIAuth resolves the UI password and caches the login page. Called
+// once from startHTTP; safe to call in tests on a bare &Server{}.
+func (s *Server) initUIAuth() {
+	s.uiSessMu.Lock()
+	if s.uiSessions == nil {
+		s.uiSessions = map[string]time.Time{}
+	}
+	s.uiSessMu.Unlock()
+	s.uiFailMu.Lock()
+	if s.uiFails == nil {
+		s.uiFails = map[string]uiFailRec{}
+	}
+	s.uiFailMu.Unlock()
+	pw, src := uiResolvePassword()
+	sum := sha256.Sum256([]byte(pw))
+	s.uiPassMu.Lock()
+	s.uiPassHash = sum[:]
+	s.uiPassMu.Unlock()
+	if b, err := ui.FS.ReadFile("frontend/login.html"); err == nil {
+		s.uiLoginPage = b
+	} else {
+		log.Printf("[http] login page missing from bundle: %v", err)
+	}
+	log.Printf("[http] UI login required (password from %s)", src)
+}
+
+// uiResolvePassword returns (password, source-description).
+func uiResolvePassword() (string, string) {
+	if pw := os.Getenv("RMM_UI_PASSWORD"); pw != "" {
+		return pw, "RMM_UI_PASSWORD"
+	}
+	cands := []string{uiPassFile}
+	if exe, err := os.Executable(); err == nil {
+		cands = append([]string{filepath.Join(filepath.Dir(exe), uiPassFile)}, cands...)
+	}
+	for _, p := range cands {
+		if b, err := os.ReadFile(p); err == nil {
+			if pw := string(b); len(pw) > 0 {
+				// Trim a single trailing newline; a password that IS a
+				// newline is not a password anyone meant.
+				for len(pw) > 0 && (pw[len(pw)-1] == '\n' || pw[len(pw)-1] == '\r') {
+					pw = pw[:len(pw)-1]
+				}
+				if pw != "" {
+					return pw, p
+				}
+			}
+		}
+	}
+	raw := make([]byte, 16)
+	if _, err := rand.Read(raw); err != nil {
+		// Practically unreachable; fall back to time-mixed bytes rather
+		// than an empty password (which would lock everyone out — or
+		// worse, read as "no password").
+		sum := sha256.Sum256([]byte(time.Now().String()))
+		raw = sum[:16]
+	}
+	pw := hex.EncodeToString(raw)
+	save := cands[0]
+	if err := os.WriteFile(save, []byte(pw+"\n"), 0600); err != nil {
+		save = uiPassFile
+		_ = os.WriteFile(save, []byte(pw+"\n"), 0600)
+	}
+	log.Printf("[http] generated UI password (saved to %s) — set RMM_UI_PASSWORD to override", save)
+	return pw, "generated " + save
+}
+
+// uiVerifyPassword constant-time compares the candidate.
+func (s *Server) uiVerifyPassword(candidate string) bool {
+	sum := sha256.Sum256([]byte(candidate))
+	s.uiPassMu.Lock()
+	defer s.uiPassMu.Unlock()
+	if len(s.uiPassHash) == 0 {
+		return false
+	}
+	return subtle.ConstantTimeCompare(sum[:], s.uiPassHash) == 1
+}
+
+// uiAuthed reports whether the request carries a live session.
+func (s *Server) uiAuthed(r *http.Request) bool {
+	c, err := r.Cookie(uiSessionCookie)
+	if err != nil || c.Value == "" {
+		return false
+	}
+	now := time.Now()
+	s.uiSessMu.Lock()
+	defer s.uiSessMu.Unlock()
+	exp, ok := s.uiSessions[c.Value]
+	if !ok {
+		return false
+	}
+	if now.After(exp) {
+		delete(s.uiSessions, c.Value)
+		return false
+	}
+	return true
+}
+
+// uiIssueSession mints a token valid for uiSessionTTL.
+func (s *Server) uiIssueSession() string {
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		sum := sha256.Sum256([]byte(time.Now().String()))
+		copy(raw, sum[:])
+	}
+	tok := hex.EncodeToString(raw)
+	s.uiSessMu.Lock()
+	if s.uiSessions == nil {
+		s.uiSessions = map[string]time.Time{}
+	}
+	// Opportunistic purge so the map cannot grow forever.
+	now := time.Now()
+	for k, exp := range s.uiSessions {
+		if now.After(exp) {
+			delete(s.uiSessions, k)
+		}
+	}
+	s.uiSessions[tok] = now.Add(uiSessionTTL)
+	s.uiSessMu.Unlock()
+	return tok
+}
+
+// uiClientIP keys brute-force backoff (RemoteAddr as seen; behind a
+// tunnel all clients may share it — backoff still slows guessing).
+func uiClientIP(r *http.Request) string {
+	if h, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		return h
+	}
+	return r.RemoteAddr
+}
+
+// uiBlocked reports whether ip is inside a backoff block.
+func (s *Server) uiBlocked(ip string) bool {
+	s.uiFailMu.Lock()
+	defer s.uiFailMu.Unlock()
+	rec, ok := s.uiFails[ip]
+	if !ok {
+		return false
+	}
+	if time.Now().Before(rec.until) {
+		return true
+	}
+	if rec.n >= uiFailLimit {
+		delete(s.uiFails, ip) // block served; the next streak counts fresh
+	}
+	return false
+}
+
+// uiFail records one bad password; resets on success via uiFailReset.
+func (s *Server) uiFail(ip string) {
+	s.uiFailMu.Lock()
+	defer s.uiFailMu.Unlock()
+	if s.uiFails == nil {
+		s.uiFails = map[string]uiFailRec{}
+	}
+	rec := s.uiFails[ip]
+	rec.n++
+	if rec.n >= uiFailLimit {
+		rec.until = time.Now().Add(uiFailBlock)
+	}
+	s.uiFails[ip] = rec
+}
+
+func (s *Server) uiFailReset(ip string) {
+	s.uiFailMu.Lock()
+	defer s.uiFailMu.Unlock()
+	delete(s.uiFails, ip)
+}
+
+// handleUILogin exchanges the UI password for a session cookie.
+func (s *Server) handleUILogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	ip := uiClientIP(r)
+	if s.uiBlocked(ip) {
+		http.Error(w, "too many attempts, try later", http.StatusTooManyRequests)
+		return
+	}
+	var req struct {
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
+		http.Error(w, "bad json: need {\"password\":\"...\"}", http.StatusBadRequest)
+		return
+	}
+	if !s.uiVerifyPassword(req.Password) {
+		s.uiFail(ip)
+		http.Error(w, "bad password", http.StatusUnauthorized)
+		return
+	}
+	s.uiFailReset(ip)
+	tok := s.uiIssueSession()
+	http.SetCookie(w, &http.Cookie{
+		Name:     uiSessionCookie,
+		Value:    tok,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   int((uiSessionTTL).Seconds()),
+	})
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true})
+}
+
+// handleUILogout drops the session.
+func (s *Server) handleUILogout(w http.ResponseWriter, r *http.Request) {
+	if c, err := r.Cookie(uiSessionCookie); err == nil && c.Value != "" {
+		s.uiSessMu.Lock()
+		delete(s.uiSessions, c.Value)
+		s.uiSessMu.Unlock()
+	}
+	http.SetCookie(w, &http.Cookie{Name: uiSessionCookie, Value: "", Path: "/", MaxAge: -1})
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true})
+}
+
+// uiOriginOK rejects cross-site WebSocket hijacks. Empty Origin (native
+// clients, curl) passes — only a *mismatching* browser Origin fails.
+func uiOriginOK(r *http.Request) bool {
+	o := r.Header.Get("Origin")
+	if o == "" {
+		return true
+	}
+	u, err := url.Parse(o)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	return u.Host == r.Host
+}
+
+// uiGuard fronts the whole console mux: login endpoint + login page stay
+// public; everything else needs a live session. Unauthenticated page
+// navigations get the login page itself (so the desktop browser and the
+// future PWA just land on login), API/WS get 401.
+func (s *Server) uiGuard(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "SAMEORIGIN")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		if r.URL.Path == "/api/login" || r.URL.Path == "/api/logout" || r.URL.Path == "/login.html" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if !s.uiAuthed(r) {
+			if r.URL.Path == "/ws" || strings.HasPrefix(r.URL.Path, "/api/") {
+				http.Error(w, "login required", http.StatusUnauthorized)
+				return
+			}
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write(s.uiLoginPage)
+			return
+		}
+		if r.URL.Path == "/ws" && !uiOriginOK(r) {
+			http.Error(w, "bad origin", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}

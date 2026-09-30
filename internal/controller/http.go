@@ -31,6 +31,8 @@ func (s *Server) startHTTP(addr, dir string) {
 	mux.Handle("/screens/", http.StripPrefix("/screens/", http.FileServer(http.Dir(dir))))
 	mux.Handle("/", http.FileServer(http.FS(sub)))
 	mux.HandleFunc("/ws", s.handleWS)
+	mux.HandleFunc("/api/login", s.handleUILogin)
+	mux.HandleFunc("/api/logout", s.handleUILogout)
 	mux.HandleFunc("/api/commands", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(cmdlist.Known)
@@ -872,12 +874,13 @@ func (s *Server) startHTTP(addr, dir string) {
 
 	s.httpSrv = &http.Server{
 		Addr:              addr,
-		Handler:           mux,
+		Handler:           s.uiGuard(mux),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      15 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
+	s.initUIAuth()
 	// Bind synchronously so a clash is detected NOW, not silently later.
 	// If the configured port is taken by another controller, fall back to
 	// an ephemeral port: otherwise the native window / auto-opened browser

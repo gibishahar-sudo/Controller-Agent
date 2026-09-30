@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<meta name="theme-color" content="#0b0e14"/>
+<title>RMM — Login</title>
+<style>
+html,body{height:100%;margin:0;background:#0b0e14;color:#d6deeb;font-family:Consolas,Menlo,monospace}
+.wrap{min-height:100%;display:flex;align-items:center;justify-content:center;padding:24px;box-sizing:border-box}
+.card{width:min(360px,100%);background:#11161f;border:1px solid #232c3d;border-radius:10px;padding:28px;box-shadow:0 8px 32px rgba(0,0,0,.5)}
+h1{font-size:18px;margin:0 0 4px;color:#7ee787}
+p{font-size:12px;color:#8b949e;margin:0 0 18px}
+input{width:100%;box-sizing:border-box;background:#0b0e14;border:1px solid #232c3d;border-radius:6px;color:#d6deeb;font:inherit;font-size:14px;padding:10px 12px;margin-bottom:12px}
+input:focus{outline:none;border-color:#1f6feb}
+button{width:100%;background:#1f6feb;border:0;border-radius:6px;color:#fff;font:inherit;font-size:14px;padding:10px;cursor:pointer}
+button:hover{background:#388bfd}
+button:disabled{opacity:.6;cursor:default}
+.err{font-size:12px;color:#f85149;min-height:18px;margin-top:10px}
+</style>
+</head>
+<body>
+<div class="wrap"><div class="card">
+<h1>RMM Console</h1>
+<p>Enter the UI password to continue.</p>
+<input id="pw" type="password" autocomplete="current-password" placeholder="UI password"/>
+<button id="go">Unlock</button>
+<div class="err" id="err"></div>
+</div></div>
+<script>
+(function(){
+var pw=document.getElementById("pw"), go=document.getElementById("go"), err=document.getElementById("err");
+function fail(m){ err.textContent=m||"Login failed"; go.disabled=false; }
+function login(){
+  err.textContent=""; go.disabled=true;
+  fetch("/api/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({password:pw.value})})
+    .then(function(r){ if(!r.ok){ if(r.status===429) throw new Error("Too many attempts — try later"); throw new Error("Wrong password"); } return r.json(); })
+    .then(function(){ location.href="/"; })
+    .catch(function(e){ fail(e.message); });
+}
+go.onclick=login;
+pw.onkeydown=function(e){ if(e.key==="Enter") login(); };
+pw.focus();
+})();
+</script>
+</body>
+</html>

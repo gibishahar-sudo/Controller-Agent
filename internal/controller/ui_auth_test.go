@@ -1,0 +1,191 @@
+package controller
+
+import (
+	"crypto/sha256"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"rmm/internal/ui"
+)
+
+// testAuthServer builds a Server with a known UI password ("s3cret")
+// without touching disk or env.
+func testAuthServer() *Server {
+	s := &Server{}
+	sum := sha256.Sum256([]byte("s3cret"))
+	s.uiPassHash = sum[:]
+	if b, err := ui.FS.ReadFile("frontend/login.html"); err == nil {
+		s.uiLoginPage = b
+	}
+	return s
+}
+
+func TestUIVerifyPassword(t *testing.T) {
+	s := testAuthServer()
+	if !s.uiVerifyPassword("s3cret") {
+		t.Fatal("correct password rejected")
+	}
+	if s.uiVerifyPassword("wrong") {
+		t.Fatal("wrong password accepted")
+	}
+	if s.uiVerifyPassword("") {
+		t.Fatal("empty password accepted")
+	}
+	// Uninitialized hash must never verify.
+	if (&Server{}).uiVerifyPassword("s3cret") {
+		t.Fatal("nil hash verified")
+	}
+}
+
+func TestUISessionLifecycle(t *testing.T) {
+	s := testAuthServer()
+	tok := s.uiIssueSession()
+	r := httptest.NewRequest("GET", "/", nil)
+	if s.uiAuthed(r) {
+		t.Fatal("no-cookie request authed")
+	}
+	r.AddCookie(&http.Cookie{Name: uiSessionCookie, Value: tok})
+	if !s.uiAuthed(r) {
+		t.Fatal("fresh session rejected")
+	}
+	// Expire it manually.
+	s.uiSessMu.Lock()
+	s.uiSessions[tok] = time.Now().Add(-time.Second)
+	s.uiSessMu.Unlock()
+	if s.uiAuthed(r) {
+		t.Fatal("expired session accepted")
+	}
+	// Expired entries are purged on read.
+	s.uiSessMu.Lock()
+	_, still := s.uiSessions[tok]
+	s.uiSessMu.Unlock()
+	if still {
+		t.Fatal("expired session not purged")
+	}
+}
+
+func TestUILoginBackoff(t *testing.T) {
+	s := testAuthServer()
+	ip := "10.9.9.9"
+	login := func(pw string) int {
+		body := strings.NewReader(`{"password":"` + pw + `"}`)
+		r := httptest.NewRequest("POST", "/api/login", body)
+		r.RemoteAddr = ip + ":1234"
+		w := httptest.NewRecorder()
+		s.handleUILogin(w, r)
+		return w.Code
+	}
+	for i := 0; i < uiFailLimit; i++ {
+		if code := login("nope"); code != http.StatusUnauthorized {
+			t.Fatalf("bad attempt %d: code %d want 401", i, code)
+		}
+	}
+	if code := login("nope"); code != http.StatusTooManyRequests {
+		t.Fatalf("6th bad attempt: code %d want 429", code)
+	}
+	// Correct password during a block still fails.
+	if code := login("s3cret"); code != http.StatusTooManyRequests {
+		t.Fatalf("good password during block: code %d want 429", code)
+	}
+	// Success path (fresh server): sets an HttpOnly cookie.
+	s2 := testAuthServer()
+	body := strings.NewReader(`{"password":"s3cret"}`)
+	r := httptest.NewRequest("POST", "/api/login", body)
+	r.RemoteAddr = ip + ":1234"
+	w := httptest.NewRecorder()
+	s2.handleUILogin(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("good login: code %d want 200", w.Code)
+	}
+	found := false
+	for _, c := range w.Result().Cookies() {
+		if c.Name == uiSessionCookie && c.Value != "" && c.HttpOnly && c.Path == "/" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("login did not set a proper session cookie")
+	}
+}
+
+func TestUIGuardMatrix(t *testing.T) {
+	s := testAuthServer()
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("INNER"))
+	})
+	g := s.uiGuard(inner)
+	doReq := func(method, path, cookie, origin string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(method, path, nil)
+		if cookie != "" {
+			r.AddCookie(&http.Cookie{Name: uiSessionCookie, Value: cookie})
+		}
+		if origin != "" {
+			r.Header.Set("Origin", origin)
+			r.Host = "ctrl:8080"
+		}
+		w := httptest.NewRecorder()
+		g.ServeHTTP(w, r)
+		return w
+	}
+	// Public: login endpoint + login page.
+	if w := doReq("POST", "/api/login", "", ""); w.Code == http.StatusUnauthorized && w.Body.String() == "login required\n" {
+		t.Fatal("login endpoint gated itself")
+	}
+	if w := doReq("GET", "/login.html", "", ""); w.Code != http.StatusOK {
+		t.Fatalf("login page: code %d want 200", w.Code)
+	}
+	// Unauthenticated: API/WS get 401, pages get the login document.
+	if w := doReq("GET", "/api/files", "", ""); w.Code != http.StatusUnauthorized {
+		t.Fatalf("api unauthed: code %d want 401", w.Code)
+	}
+	if w := doReq("GET", "/ws", "", ""); w.Code != http.StatusUnauthorized {
+		t.Fatalf("ws unauthed: code %d want 401", w.Code)
+	}
+	if w := doReq("GET", "/", "", ""); w.Code != http.StatusUnauthorized || !strings.Contains(w.Body.String(), "RMM Console") {
+		t.Fatalf("root unauthed: code %d, want 401 + login page", w.Code)
+	}
+	// Authenticated: inner serves.
+	tok := s.uiIssueSession()
+	if w := doReq("GET", "/", tok, ""); w.Body.String() != "INNER" {
+		t.Fatal("authed root did not reach inner handler")
+	}
+	if w := doReq("GET", "/ws", tok, ""); w.Body.String() != "INNER" {
+		t.Fatal("authed ws with empty origin blocked (native clients send none)")
+	}
+	if w := doReq("GET", "/ws", tok, "http://ctrl:8080"); w.Body.String() != "INNER" {
+		t.Fatal("authed ws with matching origin blocked")
+	}
+	if w := doReq("GET", "/ws", tok, "http://evil.test"); w.Code != http.StatusForbidden {
+		t.Fatalf("cross-origin ws: code %d want 403", w.Code)
+	}
+	// Security headers on every response.
+	if w := doReq("GET", "/", "", ""); w.Header().Get("X-Content-Type-Options") != "nosniff" {
+		t.Fatal("missing nosniff header")
+	}
+	if w := doReq("GET", "/", tok, ""); w.Header().Get("X-Frame-Options") != "SAMEORIGIN" {
+		t.Fatal("missing framing header")
+	}
+}
+
+func TestUIOriginOK(t *testing.T) {
+	r := httptest.NewRequest("GET", "/ws", nil)
+	r.Host = "ctrl:8080"
+	if !uiOriginOK(r) {
+		t.Fatal("empty origin rejected")
+	}
+	r.Header.Set("Origin", "http://ctrl:8080")
+	if !uiOriginOK(r) {
+		t.Fatal("matching origin rejected")
+	}
+	r.Header.Set("Origin", "http://evil.test")
+	if uiOriginOK(r) {
+		t.Fatal("mismatching origin accepted")
+	}
+	r.Header.Set("Origin", "http://[::1")
+	if uiOriginOK(r) {
+		t.Fatal("malformed origin accepted")
+	}
+}

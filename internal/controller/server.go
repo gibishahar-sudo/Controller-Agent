@@ -253,6 +253,17 @@ type Server struct {
 	authLogMu   sync.Mutex
 	authLog     map[string]time.Time
 
+	// Console UI login gate (tablet/PWA prerequisite): password hash,
+	// server-side sessions, per-IP backoff. The desktop console itself
+	// is untouched — browsers just carry the cookie after one login.
+	uiPassHash  []byte
+	uiPassMu    sync.Mutex
+	uiSessions  map[string]time.Time // token -> expiry
+	uiSessMu    sync.Mutex
+	uiFails     map[string]uiFailRec // source ip -> streak/block
+	uiFailMu    sync.Mutex
+	uiLoginPage []byte
+
 	// Disk-persisted crash-rollback holdbacks by hostname (Track D).
 	heldBack map[string]heldRollback
 	holdMu   sync.Mutex
