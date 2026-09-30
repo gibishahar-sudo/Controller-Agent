@@ -901,8 +901,18 @@ func (s *Server) startHTTP(addr, dir string) {
 		}
 	}
 	s.httpAddr = ln.Addr().String()
+	// Opt-in HTTPS for internet/PWA legs (PWA service workers require a
+	// secure context): set RMM_UI_TLS_CERT + RMM_UI_TLS_KEY to PEM paths.
+	// Default stays plain HTTP (LAN posture) — no flag, no behavior
+	// change unless the operator opts in. Invalid pair logs loudly and
+	// stays plain rather than silently downgrading.
+	uiScheme := "http"
+	ln, uiScheme = uiMaybeTLS(ln, os.Getenv("RMM_UI_TLS_CERT"), os.Getenv("RMM_UI_TLS_KEY"))
+	if uiScheme == "https" {
+		log.Printf("[http] UI serving HTTPS (RMM_UI_TLS_CERT)")
+	}
 	go func() {
-		log.Printf("[http] UI at http://%s/", s.httpAddr)
+		log.Printf("[http] UI at %s://%s/", uiScheme, s.httpAddr)
 		if err := s.httpSrv.Serve(ln); err != nil && err != http.ErrServerClosed {
 			log.Printf("[http] %v", err)
 		}

@@ -4,6 +4,8 @@
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
 <meta name="theme-color" content="#0b0e14"/>
+<link rel="manifest" href="/manifest.webmanifest"/>
+<link rel="apple-touch-icon" href="/icons/icon-192.png"/>
 <title>RMM — Login</title>
 <style>
 html,body{height:100%;margin:0;background:#0b0e14;color:#d6deeb;font-family:Consolas,Menlo,monospace}
@@ -41,6 +43,7 @@ function login(){
 go.onclick=login;
 pw.onkeydown=function(e){ if(e.key==="Enter") login(); };
 pw.focus();
+if("serviceWorker" in navigator){ navigator.serviceWorker.register("/sw.js").catch(function(){}); }
 })();
 </script>
 </body>

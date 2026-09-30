@@ -147,6 +147,16 @@ func TestUIGuardMatrix(t *testing.T) {
 	if w := doReq("GET", "/", "", ""); w.Code != http.StatusUnauthorized || !strings.Contains(w.Body.String(), "RMM Console") {
 		t.Fatalf("root unauthed: code %d, want 401 + login page", w.Code)
 	}
+	// Public PWA shell: manifest, worker, icons need no session.
+	for _, p := range []string{"/manifest.webmanifest", "/sw.js", "/icons/icon-192.png"} {
+		if w := doReq("GET", p, "", ""); w.Body.String() != "INNER" {
+			t.Fatalf("public %s blocked pre-login", p)
+		}
+	}
+	// Screens stay gated (remote pixels are sensitive).
+	if w := doReq("GET", "/screens/x.png", "", ""); w.Code != http.StatusUnauthorized {
+		t.Fatalf("screens unauthed: code %d want 401", w.Code)
+	}
 	// Authenticated: inner serves.
 	tok := s.uiIssueSession()
 	if w := doReq("GET", "/", tok, ""); w.Body.String() != "INNER" {

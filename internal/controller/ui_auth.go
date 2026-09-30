@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"log"
@@ -241,6 +242,7 @@ func (s *Server) handleUILogin(w http.ResponseWriter, r *http.Request) {
 		Value:    tok,
 		Path:     "/",
 		HttpOnly: true,
+		Secure:   r.TLS != nil,
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   int((uiSessionTTL).Seconds()),
 	})
@@ -260,6 +262,22 @@ func (s *Server) handleUILogout(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true})
 }
 
+// uiMaybeTLS wraps ln in TLS when both PEM paths are set. Unset pair →
+// plain HTTP; set-but-broken → plain HTTP with a loud log (an explicit
+// request that silently downgraded would be worse than refusing loudly
+// into the log the operator already watches).
+func uiMaybeTLS(ln net.Listener, certFile, keyFile string) (net.Listener, string) {
+	if certFile == "" || keyFile == "" {
+		return ln, "http"
+	}
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		log.Printf("[http] RMM_UI_TLS_CERT/KEY invalid (%v) — serving plain HTTP", err)
+		return ln, "http"
+	}
+	return tls.NewListener(ln, &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}), "https"
+}
+
 // uiOriginOK rejects cross-site WebSocket hijacks. Empty Origin (native
 // clients, curl) passes — only a *mismatching* browser Origin fails.
 func uiOriginOK(r *http.Request) bool {
@@ -274,6 +292,20 @@ func uiOriginOK(r *http.Request) bool {
 	return u.Host == r.Host
 }
 
+// uiPublic reports whether path is servable pre-login: the login
+// endpoint + page, and the PWA shell (manifest, worker, icons —
+// branding only, zero sensitivity). Everything else needs a session,
+// notably /screens/ (remote pixels) and all of /api/.
+func uiPublic(path string) bool {
+	if path == "/api/login" || path == "/api/logout" || path == "/login.html" {
+		return true
+	}
+	if path == "/manifest.webmanifest" || path == "/sw.js" {
+		return true
+	}
+	return strings.HasPrefix(path, "/icons/")
+}
+
 // uiGuard fronts the whole console mux: login endpoint + login page stay
 // public; everything else needs a live session. Unauthenticated page
 // navigations get the login page itself (so the desktop browser and the
@@ -283,7 +315,10 @@ func (s *Server) uiGuard(next http.Handler) http.Handler {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "SAMEORIGIN")
 		w.Header().Set("Referrer-Policy", "no-referrer")
-		if r.URL.Path == "/api/login" || r.URL.Path == "/api/logout" || r.URL.Path == "/login.html" {
+		if r.TLS != nil {
+			w.Header().Set("Strict-Transport-Security", "max-age=31536000")
+		}
+		if uiPublic(r.URL.Path) {
 			next.ServeHTTP(w, r)
 			return
 		}
