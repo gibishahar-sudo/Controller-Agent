@@ -12,8 +12,15 @@ android {
         targetSdk = 34
         // Suite version is mirrored manually on each release:
         // versionName = suite (e.g. 1.46.35), versionCode = M*1000000+m*1000+p.
-        versionCode = 1046035
-        versionName = "1.46.35"
+        versionCode = 1046036
+        versionName = "1.46.36"
+    }
+
+    dependencies {
+        // gomobile-bound controller core (built via:
+        // gomobile bind -androidapi 28 -target android/arm64
+        //   -o android/app/libs/rmm.aar rmm/mobile)
+        implementation(files("libs/rmm.aar"))
     }
 
     signingConfigs {
