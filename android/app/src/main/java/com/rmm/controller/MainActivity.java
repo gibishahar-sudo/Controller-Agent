@@ -148,6 +148,11 @@ public class MainActivity extends Activity {
         String js = "(function(){"
                 + "if(document.getElementById('rmm-tablet-fit'))return;"
                 + "document.body.classList.add('rmm-tablet');"
+                // Compact declutter is a stock desktop feature (hides
+                // secondary buttons behind the ⋯ toggle); the tablet
+                // opts in on load without touching localStorage, so the
+                // desktop never sees it.
+                + "document.body.classList.add('compact');"
                 + "var s=document.createElement('style');"
                 + "s.id='rmm-tablet-fit';"
                 + "s.textContent=new TextDecoder().decode(Uint8Array.from(atob('"

@@ -9,7 +9,15 @@
   body.rmm-tablet .sidebar h2{font-size:14px;margin:2px 0 4px}
   body.rmm-tablet .conn-list{flex-direction:row;overflow-x:auto;overflow-y:hidden;padding-bottom:4px}
   body.rmm-tablet .conn-item{min-width:210px;max-width:260px;flex:0 0 auto}
-  body.rmm-tablet .btn-grid{grid-template-columns:repeat(4,1fr)}
+  body.rmm-tablet .btn-grid{grid-template-columns:repeat(4,1fr);gap:4px}
+  /* Strip density: the touch-first 44px minima eat the portrait strip,
+     so strip + topbar buttons drop to 36px (main-area buttons keep 44).
+     The quick-connect row hides (list + filter cover selection). */
+  body.rmm-tablet .sidebar{gap:4px;padding:8px}
+  body.rmm-tablet .sidebar .btn{min-height:36px}
+  body.rmm-tablet .quick{display:none}
+  body.rmm-tablet .conn-item{padding:8px 10px}
+  body.rmm-tablet .topbar .btn-small{min-height:36px}
   body.rmm-tablet .status-bar{flex-wrap:wrap;row-gap:4px}
   /* Main column gets the freed space; bars wrap instead of clipping. */
   body.rmm-tablet .main{min-height:0}
