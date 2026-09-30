@@ -11,16 +11,9 @@ android {
         minSdk = 28
         targetSdk = 34
         // Suite version is mirrored manually on each release:
-        // versionName = suite (e.g. 1.46.35), versionCode = M*1000000+m*1000+p.
-        versionCode = 1046036
-        versionName = "1.46.36"
-    }
-
-    dependencies {
-        // gomobile-bound controller core (built via:
-        // gomobile bind -androidapi 28 -target android/arm64
-        //   -o android/app/libs/rmm.aar rmm/mobile)
-        implementation(files("libs/rmm.aar"))
+        // versionName = suite (e.g. 1.46.37), versionCode = M*1000000+m*1000+p.
+        versionCode = 1046037
+        versionName = "1.46.37"
     }
 
     signingConfigs {
@@ -50,3 +43,16 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 }
+
+dependencies {
+    // gomobile-bound controller core (built via:
+    // gomobile bind -androidapi 28 -target android/arm64
+    //   -o android/app/libs/rmm.aar rmm/mobile)
+    implementation(files("libs/rmm.aar"))
+}
+
+// Bundled controller identity (used by SetupActivity.ensureIdentity):
+// stage before building (gitignored, never committed):
+//   copy agent_token.txt, server.crt, server.key from the controller PC
+//   into android/app/src/main/res/raw/ as agent_token.txt, server_crt,
+//   server_key. Rotations ride the next APK build.

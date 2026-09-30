@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<lint>
+    <!-- PackagedPrivateKey is exempted for res/raw/server_key ONLY (any
+         other bundled key still fails the build). Justification: this
+         app IS a controller — it needs the fleet's server key to unwrap
+         agent key exchanges (agents seal globally once E2E is active; a
+         different key sees hellos but zero traffic). Same-trust-domain
+         device copy, like the controller PC itself; the APK ships
+         sideload-only from a private release, never a store. Rotations
+         ride the next build (res/raw is gitignored build-time staging,
+         see app/build.gradle). -->
+    <issue id="PackagedPrivateKey" severity="error">
+        <ignore path="src/main/res/raw/server_key" />
+    </issue>
+</lint>

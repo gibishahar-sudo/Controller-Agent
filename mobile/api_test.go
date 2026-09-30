@@ -38,14 +38,12 @@ func TestStrField(t *testing.T) {
 }
 
 func TestStartRequiresSecrets(t *testing.T) {
-	if got := Start(t.TempDir(), "", "pw", "c", "k"); got == "" || !strings.Contains(got, "agent token") {
-		t.Fatalf("empty token must fail, got %q", got)
+	if got := Start(t.TempDir(), "tok", "", "c", "k"); got == "" || !strings.Contains(got, "UI password") {
+		t.Fatalf("empty password must fail, got %q", got)
 	}
-	if got := Start(t.TempDir(), "tok", "", "c", "k"); got == "" {
-		t.Fatal("empty password must fail")
-	}
-	if got := Start(t.TempDir(), "tok", "pw", "", ""); got == "" {
-		t.Fatal("empty cert must fail")
+	// Empty identity args fall back to pre-placed files; bare dir fails loud.
+	if got := Start(t.TempDir(), "", "pw", "", ""); got == "" || !strings.Contains(got, "agent_token.txt") {
+		t.Fatalf("missing pre-placed identity must fail, got %q", got)
 	}
 	if got := Stop(); got != "" {
 		t.Fatalf("stop-when-idle must be empty, got %q", got)

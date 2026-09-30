@@ -43,25 +43,31 @@ public class RmmService extends Service {
         startForeground(NOTIF_ID, notif);
         new Thread(() -> {
             String dir = new File(getFilesDir(), "core").getAbsolutePath();
+            try {
+                SetupActivity.ensureIdentity(this);
+            } catch (Exception e) {
+                fail("identity: " + e.getMessage());
+                return;
+            }
             String err = Mobile.start(
-                    dir,
-                    SetupActivity.pref(this, SetupActivity.KEY_TOKEN, ""),
-                    SetupActivity.pref(this, SetupActivity.KEY_PASSWORD, ""),
-                    SetupActivity.pref(this, SetupActivity.KEY_CERT, ""),
-                    SetupActivity.pref(this, SetupActivity.KEY_KEY, ""));
+                    dir, "", SetupActivity.pref(this, SetupActivity.KEY_PASSWORD, ""), "", "");
             if (err != null && !err.isEmpty()) {
-                NotificationManager nm = getSystemService(NotificationManager.class);
-                Notification failed = new Notification.Builder(this, CHANNEL)
-                        .setContentTitle("RMM Console failed to start")
-                        .setContentText(err)
-                        .setSmallIcon(R.drawable.ic_fg)
-                        .setOngoing(false)
-                        .build();
-                nm.notify(NOTIF_ID + 1, failed);
-                stopSelf();
+                fail(err);
             }
         }, "rmm-core-start").start();
         return START_STICKY;
+    }
+
+    private void fail(String err) {
+        NotificationManager nm = getSystemService(NotificationManager.class);
+        Notification failed = new Notification.Builder(this, CHANNEL)
+                .setContentTitle("RMM Console failed to start")
+                .setContentText(err)
+                .setSmallIcon(R.drawable.ic_fg)
+                .setOngoing(false)
+                .build();
+        nm.notify(NOTIF_ID + 1, failed);
+        stopSelf();
     }
 
     @Override

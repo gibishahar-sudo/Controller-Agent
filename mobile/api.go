@@ -24,30 +24,33 @@ var (
 )
 
 // Start boots the controller core. dataDir is the app-private dir
-// (secrets + screens live there); agentToken/uiPassword/serverCert/
-// serverKey are pasted once in app setup. httpAddr is fixed to
-// 127.0.0.1:8080 by the caller. Returns "" on success, "error: …" on
-// failure (never Go errors — the boundary speaks strings).
+// (secrets + screens live there). The shell pre-places agent_token.txt,
+// server.crt and server.key from the bundled build-time identity, so
+// empty args mean "already placed" — but presence is VERIFIED, never
+// assumed. uiPassword has no fallback: the operator types it.
+// Returns "" on success, "error: …" on failure (never Go errors — the
+// boundary speaks strings).
 func Start(dataDir, agentToken, uiPassword, serverCert, serverKey string) string {
 	coreMu.Lock()
 	defer coreMu.Unlock()
 	if coreSrv != nil {
 		return ""
 	}
-	if strings.TrimSpace(agentToken) == "" {
-		return "error: agent token required (paste from desktop Settings)"
-	}
 	if strings.TrimSpace(uiPassword) == "" {
 		return "error: UI password required"
-	}
-	if strings.TrimSpace(serverCert) == "" || strings.TrimSpace(serverKey) == "" {
-		return "error: controller certificate + key required (copy server.crt/server.key from the controller PC)"
 	}
 	if err := os.MkdirAll(dataDir, 0700); err != nil {
 		return "error: datadir: " + err.Error()
 	}
-	writeSecret := func(name, val string) error {
-		return os.WriteFile(filepath.Join(dataDir, name), []byte(strings.TrimSpace(val)+"\n"), 0600)
+	place := func(name, val string) error {
+		p := filepath.Join(dataDir, name)
+		if v := strings.TrimSpace(val); v != "" {
+			return os.WriteFile(p, []byte(v+"\n"), 0600)
+		}
+		if st, err := os.Stat(p); err != nil || st.IsDir() {
+			return fmt.Errorf("missing %s (pass it or pre-place it)", name)
+		}
+		return nil
 	}
 	for _, kv := range [][2]string{
 		{"agent_token.txt", agentToken},
@@ -55,8 +58,8 @@ func Start(dataDir, agentToken, uiPassword, serverCert, serverKey string) string
 		{"server.crt", serverCert},
 		{"server.key", serverKey},
 	} {
-		if err := writeSecret(kv[0], kv[1]); err != nil {
-			return "error: " + kv[0] + ": " + err.Error()
+		if err := place(kv[0], kv[1]); err != nil {
+			return "error: " + err.Error()
 		}
 	}
 	// Secrets resolve from CWD (agent_token.txt, ui_password.txt): run

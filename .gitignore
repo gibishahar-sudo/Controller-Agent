@@ -25,5 +25,8 @@ android/.gradle/
 android/app/build/
 android/build/
 android/app/libs/
+# Bundled controller identity (agent token + TLS key): staged at build
+# time from the controller PC, never committed.
+android/app/src/main/res/raw/
 *.jks
 *.apk
