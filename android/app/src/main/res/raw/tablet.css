@@ -65,3 +65,15 @@
 body.rmm-tablet #spyBtn{display:none}
 body.rmm-tablet #installBtn{display:none}
 body.rmm-tablet #editBtn{display:none}
+/* v1.46.42: tab beauty. Screen toolbar becomes one slim scroll row
+   (was a tall wrap); niche toggles leave; files/commands rows wrap. */
+body.rmm-tablet #tab-screen .toolbar{flex-wrap:nowrap;overflow-x:auto;scrollbar-width:thin}
+body.rmm-tablet #tab-screen .toolbar>*{flex:0 0 auto}
+body.rmm-tablet #dualToggle,body.rmm-tablet #consoleToggle,body.rmm-tablet #monRefresh{display:none}
+body.rmm-tablet .transfer-mid{flex-direction:row;flex-wrap:wrap}
+body.rmm-tablet .pathbar{flex-wrap:wrap}
+body.rmm-tablet .pathbar input{min-width:120px}
+body.rmm-tablet .file-row{font-size:11px;padding:7px 8px}
+body.rmm-tablet #macroBar{flex-wrap:wrap}
+body.rmm-tablet #macroHint{display:none}
+body.rmm-tablet .inputbar{flex-wrap:wrap}

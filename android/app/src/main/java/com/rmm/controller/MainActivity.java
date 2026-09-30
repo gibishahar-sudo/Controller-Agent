@@ -27,6 +27,10 @@ public class MainActivity extends Activity {
     private WebView web;
     private LinearLayout errorView;
     private TextView errorText;
+    private LinearLayout rootView;
+    private View customView;
+    private android.webkit.WebChromeClient.CustomViewCallback customCallback;
+    private android.webkit.WebChromeClient chrome;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -41,6 +45,7 @@ public class MainActivity extends Activity {
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(0xFF0B0E14);
+        rootView = root;
 
         errorView = buildErrorView();
         errorView.setVisibility(View.GONE);
@@ -157,6 +162,42 @@ public class MainActivity extends Activity {
                 }
             }
         });
+        // Fullscreen support (the console's ⛶ button): without a chrome
+        // client the request is denied ("Fullscreen blocked" toast).
+        // The custom view fills our root; BACK exits (below).
+        chrome = new android.webkit.WebChromeClient() {
+            @Override
+            public void onShowCustomView(View view,
+                    android.webkit.WebChromeClient.CustomViewCallback callback) {
+                if (customView != null) {
+                    callback.onCustomViewHidden();
+                    return;
+                }
+                customView = view;
+                customCallback = callback;
+                rootView.addView(view, new LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT,
+                        LinearLayout.LayoutParams.MATCH_PARENT));
+                web.setVisibility(View.GONE);
+                enterImmersive();
+            }
+
+            @Override
+            public void onHideCustomView() {
+                if (customView == null) {
+                    return;
+                }
+                rootView.removeView(customView);
+                customView = null;
+                web.setVisibility(View.VISIBLE);
+                if (customCallback != null) {
+                    customCallback.onCustomViewHidden();
+                    customCallback = null;
+                }
+                enterImmersive();
+            }
+        };
+        web.setWebChromeClient(chrome);
     }
 
     /** Injects the tablet-fit stylesheet (res/raw/tablet.css) once per
@@ -221,6 +262,10 @@ public class MainActivity extends Activity {
 
     @Override
     public void onBackPressed() {
+        if (customView != null && chrome != null) {
+            chrome.onHideCustomView();
+            return;
+        }
         if (web != null && web.getVisibility() == View.VISIBLE && web.canGoBack()) {
             web.goBack();
             return;
