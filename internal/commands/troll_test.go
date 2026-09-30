@@ -553,6 +553,25 @@ func TestFirstPidToken(t *testing.T) {
 	}
 }
 
+func TestTrollTwinPath(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{`C:\Users\Shahar\Documents\songs\x.mp4`, `C:\Users\Shahar\OneDrive\Documents\songs\x.mp4`},
+		{`C:\Users\Shahar\OneDrive\Documents\songs\x.mp4`, `C:\Users\Shahar\Documents\songs\x.mp4`},
+		{`C:\USERS\SHAHAR\documents\X.MP4`, `C:\USERS\SHAHAR\OneDrive\documents\X.MP4`},
+		{`C:\vids\clip.mp4`, ""},
+		{`C:\My Docs\file.txt`, ""},
+		{`https://x/y.mp4`, ""},
+	}
+	for _, c := range cases {
+		if got := trollTwinPath(c.in); got != c.want {
+			t.Errorf("trollTwinPath(%q) = %q want %q", c.in, got, c.want)
+		}
+	}
+}
+
 func TestTrollStopFlag(t *testing.T) {
 	dir := t.TempDir()
 	if trollStopFlagged(dir) {

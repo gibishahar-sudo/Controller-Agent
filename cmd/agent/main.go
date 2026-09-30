@@ -1510,7 +1510,20 @@ func (a *agent) connectViaMQTT() error {
 		if env.Enc {
 			plain, ok := commands.E2EOpen(payload)
 			if !ok {
-				log.Printf("[!] mqtt: undecryptable payload, dropped")
+				// Multi-box bus: other instances' traffic is routinely
+				// undecryptable here. Rate-limit the line (counted,
+				// one per minute) instead of spamming every 5s.
+				undecryptLogMu.Lock()
+				undecryptDropped++
+				if time.Since(undecryptLastLog) >= time.Minute {
+					n := undecryptDropped
+					undecryptDropped = 0
+					undecryptLastLog = time.Now()
+					undecryptLogMu.Unlock()
+					log.Printf("[!] mqtt: undecryptable payload, dropped (%d in the last minute)", n)
+				} else {
+					undecryptLogMu.Unlock()
+				}
 				return
 			}
 			payload = plain
@@ -1819,6 +1832,14 @@ func startHealthyHeartbeat(stop <-chan struct{}) {
 // dlog is the verbose lane: everything log.* writes PLUS debug-only extras.
 // agent.log stays short; agent-debug.log is the superset for deep dives.
 var dlog = log.New(io.Discard, "", log.LstdFlags)
+
+// undecryptDropLog rate-limits the multi-box undecryptable-payload line
+// (other instances' traffic, routine) to one counted line per minute.
+var (
+	undecryptLogMu   sync.Mutex
+	undecryptDropped int
+	undecryptLastLog time.Time
+)
 
 // setupLogFile mirrors logs to %LOCALAPPDATA%/RMM/agent.log (short) and
 // agent-debug.log (verbose superset; the silent agent otherwise has no

@@ -54,6 +54,22 @@ func trollStatusFile() string {
 	return filepath.Join(trollMediaDir(), "status.txt")
 }
 
+// trollTwinPath swaps \Documents\ <-> \OneDrive\Documents\ (either
+// direction, case-preserving). Explorer shows the former while the disk
+// holds the latter on OneDrive-backed profiles, and operators keep
+// typing the wrong one. Returns "" when p has no Documents segment.
+// Pure for unit tests.
+func trollTwinPath(p string) string {
+	low := strings.ToLower(p)
+	if i := strings.Index(low, `\onedrive\documents\`); i >= 0 {
+		return p[:i] + `\Documents\` + p[i+len(`\onedrive\documents\`):]
+	}
+	if i := strings.Index(low, `\documents\`); i >= 0 {
+		return p[:i] + `\OneDrive` + p[i:]
+	}
+	return ""
+}
+
 // clearTrollPath resets a troll handshake file. Scramble-era runs
 // created status.txt as a DIRECTORY (profile ops targeted it while the
 // paths were crossed), and os.Remove silently fails on non-empty dirs —
@@ -217,16 +233,10 @@ func playTroll(arg string) (string, error) {
 	guiSpawnMu.Lock()
 	defer guiSpawnMu.Unlock()
 
-	// Kill any previous troll first (one at a time — lock, not a pile-up).
-	// Order is load-bearing (v1.46.28 post-mortem): stopTrollInternal
-	// PLANTS the stop flag (to stand down duplicate guardians beyond the
-	// pid file), so the clear must come AFTER it, not before. Clear-then-
-	// kill left the flag planted for the new run, and the Edge proof loop
-	// honors it on iteration one (exit 6) — the kiosk died ~instantly on
-	// every run while WPF (which never reads the flag) worked fine.
-	stopTrollInternal()
-	clearTrollStopFlag(trollMediaDir())
-
+	// Resolve + validate BEFORE touching the running show (v1.46.33
+	// QoL): a typo'd path used to kill the current playback and then
+	// fail. Downloads happen here too — the old show plays on while
+	// the new file lands.
 	local := src
 	if strings.HasPrefix(src, "http://") || strings.HasPrefix(src, "https://") {
 		dl, err := downloadTroll(src)
@@ -234,6 +244,18 @@ func playTroll(arg string) (string, error) {
 			return "", fmt.Errorf("troll download failed: %w", err)
 		}
 		local = dl
+	} else if _, err := os.Stat(local); err != nil {
+		// OneDrive twin: Explorer shows Documents, the disk has
+		// OneDrive\Documents (or the reverse). Try the sibling.
+		if twin := trollTwinPath(local); twin != "" {
+			if _, terr := os.Stat(twin); terr == nil {
+				local = twin
+			}
+		}
+	}
+	twinNote := ""
+	if local != src && !strings.HasPrefix(src, "http") {
+		twinNote = " (OneDrive twin)"
 	}
 	st, err := os.Stat(local)
 	if err != nil {
@@ -273,10 +295,21 @@ func playTroll(arg string) (string, error) {
 			indexReason = reason
 		}
 	}
+
+	// Kill any previous troll first (one at a time — lock, not a pile-up).
+	// Order is load-bearing (v1.46.28 post-mortem): stopTrollInternal
+	// PLANTS the stop flag (to stand down duplicate guardians beyond the
+	// pid file), so the clear must come AFTER it, not before. Clear-then-
+	// kill left the flag planted for the new run, and the Edge proof loop
+	// honors it on iteration one (exit 6) — the kiosk died ~instantly on
+	// every run while WPF (which never reads the flag) worked fine.
+	stopTrollInternal()
+	clearTrollStopFlag(trollMediaDir())
 	loopNote := "looping"
 	if !loop {
 		loopNote = "once"
 	}
+	loopNote += twinNote
 	_ = os.MkdirAll(trollMediaDir(), 0755)
 	statusPath := trollStatusFile()
 
