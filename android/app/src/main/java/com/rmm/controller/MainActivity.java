@@ -56,6 +56,12 @@ public class MainActivity extends Activity {
 
         setContentView(root);
 
+        // Workstation mode: immersive fullscreen (status + nav bars hide,
+        // swipe reveals transiently) and no sleep while the console is up.
+        // Re-asserted on focus return; SetupActivity stays normal chrome.
+        enterImmersive();
+        getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+
         try {
             startForegroundService(new Intent(this, RmmService.class));
         } catch (Exception e) {
@@ -63,6 +69,25 @@ public class MainActivity extends Activity {
             return;
         }
         web.loadUrl(CONSOLE_URL);
+    }
+
+    private void enterImmersive() {
+        View decor = getWindow().getDecorView();
+        int flags = View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                | View.SYSTEM_UI_FLAG_FULLSCREEN
+                | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                | View.SYSTEM_UI_FLAG_LAYOUT_STABLE;
+        decor.setSystemUiVisibility(flags);
+    }
+
+    @Override
+    public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        if (hasFocus) {
+            enterImmersive();
+        }
     }
 
     private LinearLayout buildErrorView() {

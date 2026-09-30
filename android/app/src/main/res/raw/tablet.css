@@ -47,3 +47,21 @@
   body.rmm-tablet .screen-wrap{min-height:200px}
   body.rmm-tablet #toasts{left:12px;right:12px;max-width:none}
 }
+/* v1.46.41: workstation — wide landscape gets the dense treatment
+   (slimmer rail, tighter type), and rarely-used buttons leave the
+   chrome by ID. Hidden-by-ID controls stay reachable on desktop;
+   the tablet keeps every daily action one tap away. */
+@media (min-width:901px) and (orientation:landscape) {
+  body.rmm-tablet .sidebar{width:220px;min-width:220px;padding:8px;gap:6px}
+  body.rmm-tablet .sidebar h2{font-size:14px}
+  body.rmm-tablet .conn-item{padding:6px 8px}
+  body.rmm-tablet .btn-grid{grid-template-columns:1fr 1fr;gap:4px}
+  body.rmm-tablet .topbar{padding:0 10px;gap:8px}
+  body.rmm-tablet .terminal{font-size:13px}
+  body.rmm-tablet .tab-content{margin:0 8px 8px;padding:10px}
+}
+/* Declutter by ID (any orientation): niche/maintenance actions that
+   cost a full button each on a small screen. */
+body.rmm-tablet #spyBtn{display:none}
+body.rmm-tablet #installBtn{display:none}
+body.rmm-tablet #editBtn{display:none}
