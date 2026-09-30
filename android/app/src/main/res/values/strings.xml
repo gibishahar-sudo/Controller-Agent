@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">RMM Console</string>
+    <string name="setup_title">RMM Console</string>
+    <string name="setup_hint">Controller URL — https://your-tunnel.trycloudflare.com or http://192.168.1.50:8080</string>
+    <string name="setup_save">Connect</string>
+    <string name="change_server">Change server</string>
+    <string name="retry">Retry</string>
+    <string name="cert_title">Unknown certificate</string>
+    <string name="cert_accept">Trust once</string>
+    <string name="cert_cancel">Cancel</string>
+</resources>

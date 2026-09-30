@@ -1,0 +1,45 @@
+plugins {
+    id("com.android.application")
+}
+
+android {
+    namespace = "com.rmm.controller"
+    compileSdk = 34
+
+    defaultConfig {
+        applicationId = "com.rmm.controller"
+        minSdk = 28
+        targetSdk = 34
+        // Suite version is mirrored manually on each release:
+        // versionName = suite (e.g. 1.46.35), versionCode = M*1000000+m*1000+p.
+        versionCode = 1046035
+        versionName = "1.46.35"
+    }
+
+    signingConfigs {
+        // Release key lives OUTSIDE the repo (~/.gradle/gradle.properties:
+        // rmm.keyStore, rmm.keyAlias, rmm.storePassword, rmm.keyPassword).
+        // Missing props fall back to the debug key so any dev box builds.
+        release {
+            storeFile = findProperty("rmm.keyStore") != null ? file(findProperty("rmm.keyStore")) : null
+            storePassword = findProperty("rmm.storePassword")
+            keyAlias = findProperty("rmm.keyAlias")
+            keyPassword = findProperty("rmm.keyPassword")
+        }
+    }
+
+    buildTypes {
+        release {
+            signingConfig = signingConfigs.release.storeFile != null ? signingConfigs.release : signingConfigs.debug
+            minifyEnabled = false
+            shrinkResources = false
+        }
+        debug {
+            applicationIdSuffix = ".debug"
+        }
+    }
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+}

@@ -1,0 +1,6 @@
+// Top-level build file for the RMM Controller Android app (WebView
+// shell around the controller console). Toolchain: JDK 17 + AGP 8.5 +
+// SDK 34 (see repo root docs in this file's header on first build).
+plugins {
+    id("com.android.application") version "8.5.2" apply false
+}

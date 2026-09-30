@@ -19,3 +19,10 @@ desired_modes.json
 desired_updates.json
 gh_token.txt
 github_token.txt
+# Android build residue (SDK path, caches, outputs) - never commit.
+android/local.properties
+android/.gradle/
+android/app/build/
+android/build/
+*.jks
+*.apk
