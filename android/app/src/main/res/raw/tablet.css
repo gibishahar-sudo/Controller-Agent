@@ -1,0 +1,30 @@
+/* RMM tablet fit — injected by the Android app only (WebView).
+   The desktop console (index.html) is NEVER touched; this file lives
+   in the APK. Scope everything under body.rmm-tablet (added by the
+   injector) so the rules cannot leak anywhere else. */
+@media (max-width:900px),(orientation:portrait) {
+  /* Sidebar becomes a top strip: list scrolls sideways, buttons 4-up. */
+  body.rmm-tablet .app{flex-direction:column}
+  body.rmm-tablet .sidebar{width:auto;min-width:0;max-height:34vh;border-right:0;border-bottom:1px solid var(--border)}
+  body.rmm-tablet .sidebar h2{font-size:14px;margin:2px 0 4px}
+  body.rmm-tablet .conn-list{flex-direction:row;overflow-x:auto;overflow-y:hidden;padding-bottom:4px}
+  body.rmm-tablet .conn-item{min-width:210px;max-width:260px;flex:0 0 auto}
+  body.rmm-tablet .btn-grid{grid-template-columns:repeat(4,1fr)}
+  body.rmm-tablet .status-bar{flex-wrap:wrap;row-gap:4px}
+  /* Main column gets the freed space; bars wrap instead of clipping. */
+  body.rmm-tablet .main{min-height:0}
+  body.rmm-tablet .topbar{flex-wrap:wrap;height:auto;row-gap:6px;padding:6px 10px;gap:8px}
+  body.rmm-tablet .topbar .label{display:none}
+  body.rmm-tablet .device-switch{min-width:0;flex:1 1 140px}
+  body.rmm-tablet .active-label{flex:1 1 100%;font-size:11px}
+  body.rmm-tablet .tabs{overflow-x:auto}
+  body.rmm-tablet .tab{flex:0 0 auto}
+  body.rmm-tablet .tab-content{margin:0 8px 8px;padding:8px}
+  body.rmm-tablet .toolbar{row-gap:6px}
+  /* Touch-sized controls that the base coarse rules miss. */
+  body.rmm-tablet select{font-size:14px;min-height:40px}
+  body.rmm-tablet .terminal{font-size:13px;min-height:120px}
+  body.rmm-tablet .file-panes{flex-direction:column}
+  body.rmm-tablet .screen-wrap{min-height:200px}
+  body.rmm-tablet #toasts{left:12px;right:12px;max-width:none}
+}

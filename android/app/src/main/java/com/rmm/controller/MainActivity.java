@@ -100,6 +100,10 @@ public class MainActivity extends Activity {
         s.setMediaPlaybackRequiresUserGesture(false);
         s.setBuiltInZoomControls(true);
         s.setDisplayZoomControls(false);
+        // Fit the desktop console to the tablet viewport (page zoom,
+        // no buttons — the console has its own pinch on the screen).
+        s.setUseWideViewPort(true);
+        s.setLoadWithOverviewMode(true);
         s.setAllowFileAccess(false);
         s.setAllowContentAccess(false);
         s.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW);
@@ -107,6 +111,12 @@ public class MainActivity extends Activity {
             @Override
             public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
                 return false; // stay inside the app for all navigation
+            }
+
+            @Override
+            public void onPageFinished(WebView view, String url) {
+                super.onPageFinished(view, url);
+                injectTabletFit(view);
             }
 
             @Override
@@ -122,6 +132,46 @@ public class MainActivity extends Activity {
                 }
             }
         });
+    }
+
+    /** Injects the tablet-fit stylesheet (res/raw/tablet.css) once per
+     * document: desktop index.html is never modified, the override lives
+     * in the APK. Base64 transport avoids every quoting trap. */
+    private void injectTabletFit(WebView view) {
+        String css = readRaw(R.raw.tablet);
+        if (css == null || css.isEmpty()) {
+            return;
+        }
+        String b64 = android.util.Base64.encodeToString(
+                css.getBytes(java.nio.charset.StandardCharsets.UTF_8),
+                android.util.Base64.NO_WRAP);
+        String js = "(function(){"
+                + "if(document.getElementById('rmm-tablet-fit'))return;"
+                + "document.body.classList.add('rmm-tablet');"
+                + "var s=document.createElement('style');"
+                + "s.id='rmm-tablet-fit';"
+                + "s.textContent=new TextDecoder().decode(Uint8Array.from(atob('"
+                + b64
+                + "'),function(c){return c.charCodeAt(0)}));"
+                + "document.head.appendChild(s);"
+                + "})()";
+        view.evaluateJavascript(js, null);
+    }
+
+    private String readRaw(int resId) {
+        try {
+            java.io.InputStream in = getResources().openRawResource(resId);
+            java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+            byte[] chunk = new byte[8192];
+            int n;
+            while ((n = in.read(chunk)) >= 0) {
+                bos.write(chunk, 0, n);
+            }
+            in.close();
+            return bos.toString("UTF-8");
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     @Override

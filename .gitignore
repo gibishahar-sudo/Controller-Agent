@@ -26,7 +26,10 @@ android/app/build/
 android/build/
 android/app/libs/
 # Bundled controller identity (agent token + TLS key): staged at build
-# time from the controller PC, never committed.
-android/app/src/main/res/raw/
+# time from the controller PC, never committed. tablet.css in the same
+# dir IS committed (plain styling, no secrets).
+android/app/src/main/res/raw/agent_token.txt
+android/app/src/main/res/raw/server_crt
+android/app/src/main/res/raw/server_key
 *.jks
 *.apk
