@@ -268,7 +268,7 @@ html{touch-action:manipulation}
         <div class="sep"></div>
         <span style="font-size:11px;color:#888">Mon:</span><select id="monitorSel" class="select" title="Capture monitor"><option value="0">Primary (0)</option><option value="1">Monitor 1</option><option value="-1">All</option></select><button class="btn btn-small" id="monRefresh" title="Refresh monitor list">⟳</button>
         <span style="font-size:11px;color:#888">FPS:</span><select id="fpsSel" class="select" title="Stream frame rate"><option value="0">On-demand</option><option value="1" selected>1</option><option value="2">2</option><option value="5">5</option><option value="10">10</option><option value="15">15</option><option value="20">20</option><option value="30">30</option><option value="60">60</option></select>
-        <span style="font-size:11px;color:#888">Pipe:</span><select id="pipeSel" class="select" title="Frames allowed in flight: overlaps round trips for higher fps"><option value="1">1</option><option value="2">2</option><option value="3" selected>3</option><option value="4">4</option><option value="5">5</option><option value="6">6</option></select>
+        <span style="font-size:11px;color:#888">Pipe:</span><select id="pipeSel" class="select" title="Frames allowed in flight: overlaps round trips for higher fps"><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option><option value="5">5</option><option value="6" selected>6</option></select>
         <span style="font-size:11px;color:#888">Detail:</span><select id="detailSel" class="select" title="Capture detail: Auto uses full-res on direct links, half-res on relay links"><option value="auto" selected>Auto</option><option value="full">Full</option><option value="half">Half</option></select>
         <div class="sep"></div>
         <span style="font-size:11px;color:#888">Preset:</span><select id="presetSel" class="select" title="One-click display presets (sets Quality+FPS+Detail+Pipe)"><option value="custom">Custom</option><option value="fast">Fast</option><option value="balanced" selected>Balanced</option><option value="crisp">Crisp</option></select>
@@ -1843,7 +1843,7 @@ async function sha256hex(bytes){ const d=await crypto.subtle.digest("SHA-256",by
 function setXfer(pct,label){ $("transferBar").style.width=pct+"%"; $("transferLabel").textContent=label; }
 // Chunk sizes mirror the controller's fileChunkRaw table — keep in sync.
 function xferChunkRaw(a){ const r=(a&&a.remote)||""; if(r==="mqtt") return 128*1024; return 512*1024; }
-function xferPace(a){ const r=(a&&a.remote)||""; if(r==="mqtt") return 100; return 0; }
+function xferPace(a){ const r=(a&&a.remote)||""; if(r==="mqtt") return 25; return 0; }
 function fileVia(){ const el=$("fileViaSel"); return el?el.value:""; }
 let dlSession=null; // {id,path,saveName,total,size,sha,chunks:Map,retries,timer,mode,kind}
 let dlQueue=[]; // queued browser downloads {path,saveName}
@@ -1979,7 +1979,7 @@ async function sendMissingSeqs(o,seqs,label){
   }
 }
 // uploadWithRefill: begin + full streamed pass, then poll agent status
-// every 20s and refill exactly the holes until "upload complete".
+// every 5s and refill exactly the holes until "upload complete".
 // Only 30min of zero movement fails it — slow links just take longer.
 // o:{target,dst,size,total,chunk,pace,tag,getSlice(seq)->b64,begin()}
 function uploadWithRefill(o){
@@ -2019,7 +2019,7 @@ function uploadWithRefill(o){
       if(done) return;
       if(Date.now()-lastProgress>30*60*1000){ fail(new Error("upload stalled 30min with no progress — retry manually")); return; }
       if(ws&&ws.readyState===1){ try{ ws.send(JSON.stringify({type:"command",cmd:"upload-status "+o.dst,target:o.target,cmdId:mkCmdId()})); }catch{} }
-      pollTimer=setTimeout(poll,20000);
+      pollTimer=setTimeout(poll,5000);
     };
     try{
       await o.begin();
@@ -2027,7 +2027,7 @@ function uploadWithRefill(o){
       await sendMissingSeqs(o,all,"sending");
       addTerm(`${o.tag}Upload sent — watching for gaps…`,"out");
       lastProgress=Date.now();
-      pollTimer=setTimeout(poll,20000);
+      pollTimer=setTimeout(poll,5000);
     }catch(e){ fail(e); }
   });
 }

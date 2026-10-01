@@ -403,12 +403,13 @@ func fileDlStream(path string, fromSeq int, haveStr string, chunkRaw int, thumb 
 	if len(seqs) == 0 {
 		return // requester already holds everything
 	}
-	// Relay-sized chunks go out over 2 lanes with pacing (back-to-back
+	// Relay-sized chunks go out over 4 lanes with pacing (back-to-back
 	// 175KB QoS0 publishes collapse on public brokers — same lesson as
-	// update pushes); direct-sized chunks stay serial at full speed.
+	// update pushes — so message SIZE stays 128KB and only the rate rises;
+	// direct-sized chunks stay serial at full speed.
 	lanes, pacing := 1, time.Duration(0)
 	if chunkRaw <= 128*1024 {
-		lanes, pacing = 2, 40*time.Millisecond
+		lanes, pacing = 4, 20*time.Millisecond
 	}
 	if lanes == 1 {
 		for _, seq := range seqs {
