@@ -346,14 +346,23 @@ type pendingUpdate struct {
 	SHA    string `json:"sha,omitempty"` // hex sha256 of the new binary (v1.44.1+)
 }
 
+// pendingClaimPath locates the on-disk update claim. RMM_PENDING_CLAIM
+// overrides (tests + custom layouts); default is beside the exe.
+func pendingClaimPath() string {
+	if p := os.Getenv("RMM_PENDING_CLAIM"); p != "" {
+		return p
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(exe), "pending_update.json")
+}
+
 // PendingClaim reports the on-disk update claim for the watchdog:
 // to-version, expected binary SHA, staged flag. ok=false when absent.
 func PendingClaim() (to, sha string, staged, ok bool) {
-	exe, err := os.Executable()
-	if err != nil {
-		return "", "", false, false
-	}
-	raw, err := os.ReadFile(filepath.Join(filepath.Dir(exe), "pending_update.json"))
+	raw, err := os.ReadFile(pendingClaimPath())
 	if err != nil {
 		return "", "", false, false
 	}

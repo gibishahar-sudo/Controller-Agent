@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"embed"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/fs"
@@ -72,6 +73,59 @@ func copyFile(src, dst string) error {
 	defer out.Close()
 	_, err = io.Copy(out, in)
 	return err
+}
+
+// agentProcsAlive reports whether any agent binary is still running.
+// tasklist itself failing reads as alive (fail safe: retry the kill
+// rather than assume the exe is unlocked).
+func agentProcsAlive() bool {
+	out, err := hiddenExec("tasklist", "/FI", "IMAGENAME eq MicrosoftWindowsClient.exe", "/FO", "CSV", "/NH").CombinedOutput()
+	if err != nil {
+		return true
+	}
+	return tasklistHasAgent(string(out))
+}
+
+// tasklistHasAgent parses tasklist CSV output for our binary. The quoted
+// field match rejects lookalikes (e.g. .bak copies). Pure for unit tests.
+func tasklistHasAgent(out string) bool {
+	return strings.Contains(strings.ToLower(out), `"microsoftwindowsclient.exe"`)
+}
+
+// verifyFileSHA compares a written file against expected bytes. Every
+// installer write below is silent on failure — this is the backstop
+// that turns a no-op install into a loud nonzero exit instead.
+func checkFileSHA(path string, want []byte, what string) error {
+	got, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("verify %s: %s: %v", what, path, err)
+	}
+	sumGot := sha256.Sum256(got)
+	sumWant := sha256.Sum256(want)
+	if sumGot != sumWant {
+		return fmt.Errorf("verify %s: %s bytes differ from payload (short/legacy write?)", what, path)
+	}
+	return nil
+}
+
+func checkVersionFile(dir, want, what string) error {
+	b, err := os.ReadFile(filepath.Join(dir, "version.txt"))
+	if err != nil || strings.TrimSpace(string(b)) != want {
+		return fmt.Errorf("verify %s: version.txt missing or not %q", what, want)
+	}
+	return nil
+}
+
+func verifyFileSHA(path string, want []byte, what string) {
+	if err := checkFileSHA(path, want, what); err != nil {
+		log.Fatalf("%v", err)
+	}
+}
+
+func verifyVersionFile(dir, want, what string) {
+	if err := checkVersionFile(dir, want, what); err != nil {
+		log.Fatalf("%v", err)
+	}
 }
 
 // hideFile sets hidden+system attributes so the backup survives casual
@@ -236,6 +290,32 @@ func install() {
 	// mode); kill any left running.
 	_, _ = hiddenExec("powershell", "-NoProfile", "-command", "Get-CimInstance Win32_Process -Filter \"Name='powershell.exe'\" | Where-Object { $_.CommandLine -like '*watchdog.ps1*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }").CombinedOutput()
 	time.Sleep(1500 * time.Millisecond)
+	// Kill-verify (v1.46.51 post-mortem): taskkill is fire-and-forget,
+	// and a survivor holds the exe locked — every write below then fails
+	// silently and the old version keeps running behind an exit-0
+	// install. Retry, then abort LOUDLY (box keeps the old version,
+	// operator retries/reboots) instead of corrupting forward.
+	for i := 0; i < 3 && agentProcsAlive(); i++ {
+		_, _ = hiddenExec("taskkill", "/F", "/IM", "agent.exe").CombinedOutput()
+		_, _ = hiddenExec("taskkill", "/F", "/IM", "MicrosoftWindowsClient.exe").CombinedOutput()
+		time.Sleep(2000 * time.Millisecond)
+	}
+	if agentProcsAlive() {
+		log.Fatalf("agent processes survive forced kill - aborting install (old version left running intact)")
+	}
+	// Payload bytes up front (v1.46.51 post-mortem): the walk below
+	// swallows read errors, which would "install" empty files behind an
+	// exit-0. No payload = no install, loudly.
+	payloadExe, err := fs.ReadFile(payloadFS, "payload/MicrosoftWindowsClient.exe")
+	if err != nil || len(payloadExe) == 0 {
+		log.Fatalf("embedded agent payload unreadable: %v", err)
+	}
+	// Previous version for the update claim (best effort): lets the
+	// watcher tell this verified install from a trojan swap later.
+	prevVer := ""
+	if b, err := os.ReadFile(filepath.Join(installDir, "version.txt")); err == nil {
+		prevVer = strings.TrimSpace(string(b))
+	}
 
 	skip := map[string]bool{"install.bat": true, "README.txt": true, "README.md": true, "agent.exe": true}
 	_ = fs.WalkDir(payloadFS, "payload", func(path string, d fs.DirEntry, err error) error {
@@ -500,6 +580,32 @@ func install() {
 	// shift-delete sweeps that skip system files.
 	for _, p := range []string{backupAgent, backupCert, backupAgent2, backupCert2, backupToken, backupToken2} {
 		hideFile(p)
+	}
+	// Post-flight verification (v1.46.51 post-mortem): every write above
+	// is silent on failure, and new papers over old bytes is exactly the
+	// shape the watcher then "heals" backward into a downgrade. Verify
+	// bytes + versions now and fail LOUDLY (nonzero exit surfaces as e=
+	// in the install CMD) instead of exiting 0 over a no-op install.
+	verifyFileSHA(filepath.Join(installDir, "MicrosoftWindowsClient.exe"), payloadExe, "install exe")
+	verifyFileSHA(backupAgent, payloadExe, "backup exe")
+	verifyFileSHA(backupAgent2, payloadExe, "backup2 exe")
+	verifyFileSHA(vaultAgent, payloadExe, "vault exe")
+	verifyVersionFile(installDir, version.Version, "install")
+	verifyVersionFile(blenderDir, version.Version, "backup")
+	verifyVersionFile(backupDir2, version.Version, "backup2")
+	verifyVersionFile(vault, version.Version, "vault")
+	log.Printf("[*] install verified: %s bytes match payload in all 4 slots", version.Version)
+	// Pending update claim: same file+format as update pushes, so the
+	// watcher can tell this verified install (installed==pin: healthy,
+	// converge backups forward) from a trojan swap later.
+	claimSum := sha256.Sum256(payloadExe)
+	claim, _ := json.Marshal(map[string]string{
+		"from": prevVer, "to": version.Version,
+		"at":   time.Now().UTC().Format(time.RFC3339),
+		"sha":  hex.EncodeToString(claimSum[:]),
+	})
+	if err := os.WriteFile(filepath.Join(installDir, "pending_update.json"), append(claim, '\n'), 0644); err != nil {
+		log.Fatalf("claim write failed: %v", err)
 	}
 
 	// Native supervisor (v1.40.9+): the agent binary watches itself

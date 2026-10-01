@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -97,6 +98,73 @@ func TestWriteFileAtomic(t *testing.T) {
 		if e.Name() != "x.bin" {
 			t.Fatalf("temp dropping left behind: %s", e.Name())
 		}
+	}
+}
+
+// Claim-match converges FORWARD (v1.46.51 post-mortem): a poisoned
+// backup slot (old bytes under fresh papers, e.g. a failed refresh
+// during install) must never overwrite a healthy pinned install.
+// The trojan path (installed matches neither pin nor backup) is
+// intentionally not executed here — it kills live agent processes.
+func TestVerifyBinaryConvergesForward(t *testing.T) {
+	newBytes := []byte("agent-1.46.51-fresh-bytes")
+	oldBytes := []byte("agent-1.46.49-stale-bytes")
+	const ver = "1.46.51"
+
+	installDir := t.TempDir()
+	agentPath := filepath.Join(installDir, "MicrosoftWindowsClient.exe")
+	if err := os.WriteFile(agentPath, newBytes, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(installDir, "version.txt"), []byte(ver+"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	backupDir := t.TempDir()
+	backupAgent := filepath.Join(backupDir, "MicrosoftWindowsClient.exe")
+	if err := os.WriteFile(backupAgent, oldBytes, 0755); err != nil {
+		t.Fatal(err)
+	}
+	// pickBackup needs the cert sibling beside every binary.
+	backupCert := filepath.Join(backupDir, "server.crt")
+	if err := os.WriteFile(backupCert, []byte("fake-cert"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// Fresh papers over stale bytes, no manifest (legacy slot): the
+	// exact shape a failed installer refresh leaves behind.
+	if err := os.WriteFile(filepath.Join(backupDir, "version.txt"), []byte(ver+"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	backupDir2 := t.TempDir() // absent slot: restoreBinary's re-sync owns it, not converge
+
+	claimDir := t.TempDir()
+	newSHA := fileHash(agentPath)
+	claim := `{"from":"1.46.49","to":"` + ver + `","sha":"` + newSHA + `"}`
+	if err := os.WriteFile(filepath.Join(claimDir, "pending_update.json"), []byte(claim), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("RMM_PENDING_CLAIM", filepath.Join(claimDir, "pending_update.json"))
+
+	w := &watchCfg{
+		agentPath:   agentPath,
+		installDir:  installDir,
+		backupDir:   backupDir,
+		backupAgent: backupAgent,
+		backupCert:  backupCert,
+		backupDir2:  backupDir2,
+		backupAgent2: filepath.Join(backupDir2, "MicrosoftWindowsClient.exe"),
+	}
+	w.verifyBinary()
+
+	if got, _ := os.ReadFile(agentPath); string(got) != string(newBytes) {
+		t.Fatalf("installed binary touched (downgraded?): %q", got)
+	}
+	if got, _ := os.ReadFile(backupAgent); string(got) != string(newBytes) {
+		t.Fatalf("stale backup not converged forward: %q", got)
+	}
+	// Fresh manifest pins the converged bytes (quarantine-proof).
+	raw, err := os.ReadFile(filepath.Join(backupDir, "integrity.json"))
+	if err != nil || !strings.Contains(string(raw), newSHA) {
+		t.Fatalf("no fresh manifest for converged backup: %q, %v", raw, err)
 	}
 }
 

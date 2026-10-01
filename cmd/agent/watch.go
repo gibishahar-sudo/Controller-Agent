@@ -550,7 +550,12 @@ func (w *watchCfg) verifyBinary() {
 		// trojan swap, restored from prev below. No claim: legacy path.
 		if to, sha, _, ok := commands.PendingClaim(); ok && to == instVer && sha != "" {
 			if h1 == sha {
-				return // installed == pinned update bytes: healthy
+				// Healthy fresh install: converge stale backups FORWARD
+				// from the pinned bytes (a failed refresh left old bytes
+				// under new papers) instead of alarming — and never
+				// restore backward here.
+				w.convergeBackups(h1)
+				return
 			}
 			log.Printf("[watch] INSTALLED BINARY MATCHES NEITHER BACKUP NOR PINNED UPDATE SHA (v%s) - trojan suspected", instVer)
 			w.killAgents()
@@ -572,6 +577,46 @@ func (w *watchCfg) verifyBinary() {
 			_ = os.WriteFile(w.agentPath, b, 0755)
 		}
 		setProtAlarm("agent binary replaced - restored backup v" + instVer)
+	}
+}
+
+// convergeBackups syncs stale backup slots FORWARD from the installed
+// (claim-pinned) bytes: exe + version + fresh manifest per slot. Only
+// slots whose bytes differ are touched; missing slots are left to
+// restoreBinary's re-sync (it owns absence, this owns staleness). The
+// vault is best-effort (elevated readers only).
+func (w *watchCfg) convergeBackups(instSHA string) {
+	type slot struct{ dir, bin string }
+	slots := []slot{
+		{w.backupDir, w.backupAgent},
+		{w.backupDir2, w.backupAgent2},
+	}
+	if v := vaultDir(); v != "" {
+		slots = append(slots, slot{v, filepath.Join(v, "MicrosoftWindowsClient.exe")})
+	}
+	inst, err := os.ReadFile(w.agentPath)
+	if err != nil {
+		log.Printf("[watch] converge backups: cannot read installed: %v", err)
+		return
+	}
+	for _, s := range slots {
+		if s.dir == "" || s.bin == "" {
+			continue
+		}
+		if h := fileHash(s.bin); h != "" && h == instSHA {
+			continue
+		} else if h == "" {
+			// Missing slot: restoreBinary's re-sync owns absence.
+			if _, err := os.Stat(s.bin); os.IsNotExist(err) {
+				continue
+			}
+		}
+		if err := writeFileAtomic(s.bin, inst, 0755); err != nil {
+			log.Printf("[watch] converge backups: %s: %v", s.bin, err)
+			continue
+		}
+		writeBackupManifest(filepath.Dir(s.bin), readVerFile(w.installDir), s.bin)
+		log.Printf("[watch] converged stale backup forward: %s", s.bin)
 	}
 }
 
