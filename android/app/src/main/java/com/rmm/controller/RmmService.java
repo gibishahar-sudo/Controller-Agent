@@ -82,6 +82,7 @@ public class RmmService extends Service {
                 fail(err);
                 return;
             }
+            RmmWidget.updateNow(this);
             countHandler = new android.os.Handler(android.os.Looper.getMainLooper());
             countHandler.postDelayed(countTick, 30000);
         }, "rmm-core-start").start();

@@ -17,7 +17,7 @@
         <!-- Cleartext is for LAN testing over plain HTTP; the internet
              leg should be HTTPS (tunnel or RMM_UI_TLS_CERT). -->
         <activity
-            android:name=".MainActivity"
+            android:name=".HomeActivity"
             android:exported="true"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden">
             <intent-filter>
@@ -26,11 +26,25 @@
             </intent-filter>
         </activity>
         <activity
+            android:name=".MainActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden" />
+        <activity
             android:name=".SetupActivity"
             android:exported="false" />
         <service
             android:name=".RmmService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
+        <receiver
+            android:name=".RmmWidget"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/widget_info" />
+        </receiver>
     </application>
 </manifest>

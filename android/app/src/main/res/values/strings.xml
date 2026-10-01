@@ -2,4 +2,5 @@
 <resources>
     <string name="app_name">RMM Console</string>
     <string name="retry">Retry</string>
+    <string name="widget_desc">RMM agent count</string>
 </resources>

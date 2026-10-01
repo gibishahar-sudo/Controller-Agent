@@ -41,7 +41,30 @@ public class MainActivity extends Activity {
             finish();
             return;
         }
+        // App lock (no secrets to protect before first setup, so the
+        // gate sits here, not above). Rotation restore carries a
+        // one-time pass; process death re-locks.
+        boolean restored = savedInstanceState != null
+                && savedInstanceState.getBoolean("rmm_unlocked", false);
+        if (AppLock.requiresPrompt(this, restored, this::startConsole)) {
+            return;
+        }
+        startConsole();
+    }
 
+    @Override
+    protected void onSaveInstanceState(Bundle out) {
+        super.onSaveInstanceState(out);
+        out.putBoolean("rmm_unlocked", true);
+    }
+
+    @Override
+    protected void onStop() {
+        super.onStop();
+        AppLock.onBackgrounded();
+    }
+
+    private void startConsole() {
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(0xFF0B0E14);
@@ -123,8 +146,7 @@ public class MainActivity extends Activity {
         });
     }
 
-    private void configureWebView() {
-        WebSettings s = web.getSettings();
+    private void configureWebView() {        WebSettings s = web.getSettings();
         s.setJavaScriptEnabled(true);
         s.setDomStorageEnabled(true);
         s.setMediaPlaybackRequiresUserGesture(false);
@@ -162,6 +184,33 @@ public class MainActivity extends Activity {
                 }
             }
         });
+        // File downloads (Files tab "download to browser", snapshots):
+        // without this listener WebView drops them silently on Android.
+        // The session cookie is forwarded so authed endpoints serve.
+        web.setDownloadListener((url, userAgent, contentDisposition, mimeType, contentLength) -> {
+            try {
+                android.app.DownloadManager dm =
+                        (android.app.DownloadManager) getSystemService(DOWNLOAD_SERVICE);
+                android.app.DownloadManager.Request req =
+                        new android.app.DownloadManager.Request(android.net.Uri.parse(url));
+                String cookie = android.webkit.CookieManager.getInstance().getCookie(url);
+                if (cookie != null) {
+                    req.addRequestHeader("Cookie", cookie);
+                }
+                req.addRequestHeader("User-Agent", userAgent);
+                String name = android.webkit.URLUtil.guessFileName(url, contentDisposition, mimeType);
+                req.setDestinationInExternalPublicDir(
+                        android.os.Environment.DIRECTORY_DOWNLOADS, "RMM-" + name);
+                req.setNotificationVisibility(
+                        android.app.DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
+                dm.enqueue(req);
+                android.widget.Toast.makeText(this, "Downloading " + name,
+                        android.widget.Toast.LENGTH_SHORT).show();
+            } catch (Exception e) {
+                android.widget.Toast.makeText(this, "Download failed: " + e.getMessage(),
+                        android.widget.Toast.LENGTH_LONG).show();
+            }
+        });
         // Fullscreen support (the console's ⛶ button): without a chrome
         // client the request is denied ("Fullscreen blocked" toast).
         // The custom view fills our root; BACK exits (below).
@@ -195,6 +244,50 @@ public class MainActivity extends Activity {
                     customCallback = null;
                 }
                 enterImmersive();
+            }
+
+            // JS dialogs (alert/confirm/prompt): a custom chrome client
+            // disables the defaults, which silently breaks console flows
+            // (save-path prompt, confirmations). Native dialogs restore
+            // them one-for-one.
+            @Override
+            public boolean onJsAlert(WebView view, String url, String message,
+                    android.webkit.JsResult result) {
+                new android.app.AlertDialog.Builder(MainActivity.this)
+                        .setMessage(message)
+                        .setPositiveButton("OK", (d, w) -> result.confirm())
+                        .setOnCancelListener(d -> result.confirm())
+                        .show();
+                return true;
+            }
+
+            @Override
+            public boolean onJsConfirm(WebView view, String url, String message,
+                    android.webkit.JsResult result) {
+                new android.app.AlertDialog.Builder(MainActivity.this)
+                        .setMessage(message)
+                        .setPositiveButton("OK", (d, w) -> result.confirm())
+                        .setNegativeButton("Cancel", (d, w) -> result.cancel())
+                        .setOnCancelListener(d -> result.cancel())
+                        .show();
+                return true;
+            }
+
+            @Override
+            public boolean onJsPrompt(WebView view, String url, String message,
+                    String def, android.webkit.JsPromptResult result) {
+                final android.widget.EditText input =
+                        new android.widget.EditText(MainActivity.this);
+                input.setText(def != null ? def : "");
+                new android.app.AlertDialog.Builder(MainActivity.this)
+                        .setMessage(message)
+                        .setView(input)
+                        .setPositiveButton("OK",
+                                (d, w) -> result.confirm(input.getText().toString()))
+                        .setNegativeButton("Cancel", (d, w) -> result.cancel())
+                        .setOnCancelListener(d -> result.cancel())
+                        .show();
+                return true;
             }
         };
         web.setWebChromeClient(chrome);
@@ -245,10 +338,24 @@ public class MainActivity extends Activity {
         }
     }
 
+    private static final int REQ_IMPORT = 1001;
+
     @Override
     public boolean onCreateOptionsMenu(Menu menu) {
-        menu.add(0, 1, 0, "Setup (token / password / certs)");
+        menu.add(0, 1, 0, "Setup (password)");
+        menu.add(0, 2, 0, "Import file to device");
+        menu.add(0, 3, 0, "Lock app now");
+        menu.add(0, 4, 0, AppLock.enabled(this) ? "App lock: ON" : "App lock: OFF");
         return true;
+    }
+
+    @Override
+    public boolean onPrepareOptionsMenu(Menu menu) {
+        MenuItem lock = menu.findItem(4);
+        if (lock != null) {
+            lock.setTitle(AppLock.enabled(this) ? "App lock: ON" : "App lock: OFF");
+        }
+        return super.onPrepareOptionsMenu(menu);
     }
 
     @Override
@@ -257,7 +364,96 @@ public class MainActivity extends Activity {
             startActivity(new Intent(this, SetupActivity.class));
             return true;
         }
+        if (item.getItemId() == 2) {
+            // System picker -> copy into the core files home, so the
+            // Files tab local pane (sandbox) can upload it onward.
+            // No storage permission needed (SAF grant).
+            Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+            i.addCategory(Intent.CATEGORY_OPENABLE);
+            i.setType("*/*");
+            try {
+                startActivityForResult(i, REQ_IMPORT);
+            } catch (Exception e) {
+                toast("No file picker: " + e.getMessage());
+            }
+            return true;
+        }
+        if (item.getItemId() == 3) {
+            AppLock.lockNow(this);
+            return true;
+        }
+        if (item.getItemId() == 4) {
+            boolean on = !AppLock.enabled(this);
+            AppLock.setEnabled(this, on);
+            toast(on ? "App lock on" : "App lock off");
+            if (on) {
+                AppLock.lockNow(this);
+            }
+            return true;
+        }
         return super.onOptionsItemSelected(item);
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode != REQ_IMPORT || resultCode != RESULT_OK || data == null
+                || data.getData() == null) {
+            return;
+        }
+        try {
+            android.net.Uri uri = data.getData();
+            String name = displayName(uri);
+            if (name == null || name.isEmpty()) {
+                name = "import-" + System.currentTimeMillis();
+            }
+            java.io.File dir = new java.io.File(getFilesDir(), "core/files/import");
+            if (!dir.isDirectory() && !dir.mkdirs()) {
+                throw new Exception("cannot create " + dir.getAbsolutePath());
+            }
+            java.io.File dst = new java.io.File(dir, new java.io.File(name).getName());
+            java.io.InputStream in = getContentResolver().openInputStream(uri);
+            java.io.OutputStream out = new java.io.FileOutputStream(dst);
+            byte[] chunk = new byte[65536];
+            int n;
+            while ((n = in.read(chunk)) >= 0) {
+                out.write(chunk, 0, n);
+            }
+            in.close();
+            out.close();
+            toast("Imported to device files/import/" + dst.getName()
+                    + " — pick it in the Files local pane");
+            if (web != null) {
+                web.evaluateJavascript("try{typeof refreshFiles==='function'&&refreshFiles(false)}catch(e){}", null);
+            }
+        } catch (Exception e) {
+            toast("Import failed: " + e.getMessage());
+        }
+    }
+
+    private String displayName(android.net.Uri uri) {
+        try {
+            android.database.Cursor c = getContentResolver().query(
+                    uri, new String[]{android.provider.OpenableColumns.DISPLAY_NAME},
+                    null, null, null);
+            if (c == null) {
+                return null;
+            }
+            try {
+                if (c.moveToFirst()) {
+                    return c.getString(0);
+                }
+            } finally {
+                c.close();
+            }
+        } catch (Exception e) {
+            // fall through
+        }
+        return null;
+    }
+
+    private void toast(String msg) {
+        android.widget.Toast.makeText(this, msg, android.widget.Toast.LENGTH_LONG).show();
     }
 
     @Override

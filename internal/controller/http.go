@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -38,12 +37,17 @@ func (s *Server) startHTTP(addr, dir string) {
 		_ = json.NewEncoder(w).Encode(cmdlist.Known)
 	})
 	mux.HandleFunc("/api/files", func(w http.ResponseWriter, r *http.Request) {
+		// Default C:\ is the drive root on Windows and the sandbox
+		// home everywhere else (mapped below), so the local pane
+		// opens somewhere real on every platform.
 		p := r.URL.Query().Get("path")
 		if p == "" {
 			p = `C:\`
-			if runtime.GOOS != "windows" {
-				p = "/"
-			}
+		}
+		var err error
+		if p, err = ctrlLocalPath(p); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
 		}
 		entries, err := os.ReadDir(p)
 		if err != nil {
@@ -96,8 +100,21 @@ func (s *Server) startHTTP(addr, dir string) {
 			fail("path required")
 			return
 		}
-		// Refuse drive/filesystem roots for destructive ops.
-		isRoot := len(req.Path) <= 3 || req.Path == "/" || req.Path == "\\"
+		var err error
+		rawPath := req.Path
+		if req.Path, err = ctrlLocalPath(req.Path); err != nil {
+			fail(err.Error())
+			return
+		}
+		if req.Dst != "" {
+			if req.Dst, err = ctrlLocalPath(req.Dst); err != nil {
+				fail(err.Error())
+				return
+			}
+		}
+		// Refuse drive/filesystem roots for destructive ops (judged on
+		// the raw path, so the mapped sandbox root is refused too).
+		isRoot := len(rawPath) <= 3 || rawPath == "/" || rawPath == "\\"
 		switch req.Op {
 		case "mkdir":
 			if err := os.MkdirAll(req.Path, 0755); err != nil {
@@ -210,6 +227,11 @@ func (s *Server) startHTTP(addr, dir string) {
 			fail(http.StatusBadRequest, "path required")
 			return
 		}
+		var err error
+		if p, err = ctrlLocalPath(p); err != nil {
+			fail(500, err.Error())
+			return
+		}
 		var offset int64
 		var length int64 = 512 * 1024
 		if v := r.URL.Query().Get("offset"); v != "" {
@@ -256,6 +278,11 @@ func (s *Server) startHTTP(addr, dir string) {
 		p := r.URL.Query().Get("path")
 		if p == "" {
 			http.Error(w, "path required", http.StatusBadRequest)
+			return
+		}
+		var err error
+		if p, err = ctrlLocalPath(p); err != nil {
+			http.Error(w, err.Error(), 500)
 			return
 		}
 		f, err := os.Open(p)
