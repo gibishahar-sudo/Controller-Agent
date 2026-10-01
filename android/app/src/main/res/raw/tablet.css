@@ -67,7 +67,7 @@ body.rmm-tablet #installBtn{display:none}
 body.rmm-tablet #editBtn{display:none}
 /* v1.46.46: fullscreen monitor switcher (injected button, app only).
    Hidden unless the app flags native fullscreen (body.rmm-full). */
-#rmm-monbtn{display:none;position:fixed;left:14px;bottom:14px;z-index:10001;
+#rmm-monbtn{display:none;position:absolute;left:14px;bottom:14px;z-index:10001;
   min-width:76px;height:52px;border-radius:12px;border:1px solid var(--border);
   background:rgba(17,22,31,.94);color:#E8E8E8;
   font-size:12px;font-family:inherit;padding:6px 10px;cursor:pointer}

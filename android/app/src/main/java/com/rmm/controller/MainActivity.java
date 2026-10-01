@@ -322,28 +322,35 @@ public class MainActivity extends Activity {
                 + b64
                 + "'),function(c){return c.charCodeAt(0)}));"
                 + "document.head.appendChild(s);"
-                // Fullscreen monitor switcher (tablet): floating button
-                // cycling monitorSel options (All/0/1/...) and dispatching
-                // change, which the page honors live mid-stream. Shown
-                // only in native fullscreen (body.rmm-full, toggled by
-                // the app around the custom view).
+                // Fullscreen monitor switcher (tablet): the button must
+                // live INSIDE #screenWrap — native fullscreen renders only
+                // that subtree, so a body-level button is never visible.
+                // Stream (re)starts wipe the wrap's children, hence the
+                // node is kept in window.rmmMonBtn and re-placed by a
+                // MutationObserver. Shown only in native fullscreen
+                // (body.rmm-full, toggled by the app).
                 + "function rmmMonLabel(){var s=document.getElementById('monitorSel');"
                 + "if(!s||!s.options.length)return 'Mon';var v=s.value;"
                 + "return v==='-1'?'All':(v==='0'?'Primary':'Mon '+v);}"
-                + "if(!document.getElementById('rmm-monbtn')){"
+                + "function rmmMonPlace(){var w=document.getElementById('screenWrap');"
+                + "if(w&&window.rmmMonBtn&&!w.contains(window.rmmMonBtn))w.appendChild(window.rmmMonBtn);}"
+                + "if(!window.rmmMonBtn){"
                 + "var mb=document.createElement('button');mb.id='rmm-monbtn';"
                 + "mb.textContent='scr '+rmmMonLabel();"
                 + "mb.onclick=function(){var s=document.getElementById('monitorSel');"
                 + "if(!s||!s.options.length)return;"
                 + "s.selectedIndex=(s.selectedIndex+1)%s.options.length;"
                 + "s.dispatchEvent(new Event('change'));"
-                + "mb.textContent='scr '+rmmMonLabel();};"
-                + "document.body.appendChild(mb);"
+                + "if(window.rmmMonBtn)window.rmmMonBtn.textContent='scr '+rmmMonLabel();};"
+                + "window.rmmMonBtn=mb;"
                 + "var ms=document.getElementById('monitorSel');"
                 + "if(ms&&!ms.rmmHooked){ms.rmmHooked=1;"
                 + "ms.addEventListener('change',function(){"
-                + "var b2=document.getElementById('rmm-monbtn');"
-                + "if(b2)b2.textContent='scr '+rmmMonLabel();});}"
+                + "if(window.rmmMonBtn)window.rmmMonBtn.textContent='scr '+rmmMonLabel();});}"
+                + "if(window.rmmMonObs)window.rmmMonObs.disconnect();"
+                + "window.rmmMonObs=new MutationObserver(function(){rmmMonPlace();});"
+                + "window.rmmMonObs.observe(document.body,{childList:true,subtree:true});}"
+                + "rmmMonPlace();"
                 + "})()";
         view.evaluateJavascript(js, null);
     }
