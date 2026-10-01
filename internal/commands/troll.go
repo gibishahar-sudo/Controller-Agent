@@ -478,8 +478,11 @@ func playTrollEdge(local, ext string, secs int, loop bool, loopNote, codec, why,
 	// Pre-launch kill: a live orphaned kiosk holding the profile lock in
 	// memory would swallow the new launch (delegation to a stale page).
 	// File-lock cleanup above only covers dead holders. Best effort.
-	killEdgeProfile := `Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like '*` + strings.ReplaceAll(prof, "'", "''") + `*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`
-	kctx, kcancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// Settle wait included: Edge takes seconds to exit after the kill,
+	// and spawning into a dying holder delegates all the same — so we
+	// poll the killed PIDs (fast, no CIM re-enum) until they are gone.
+	killEdgeProfile := `$me = @(Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like '*` + strings.ReplaceAll(prof, "'", "''") + `*' }); $ids = @($me | ForEach-Object { $_.ProcessId }); $me | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }; for ($i = 0; $i -lt 50 -and $ids.Count -gt 0; $i++) { $alive = @(Get-Process -Id $ids -ErrorAction SilentlyContinue); if ($alive.Count -eq 0) { break }; Start-Sleep -Milliseconds 200 }; "KILLED $($ids.Count)"`
+	kctx, kcancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer kcancel()
 	_, _ = runHidden(kctx, "powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-command", killEdgeProfile)
 	wrapUri := (&url.URL{Scheme: "file", Path: filepath.ToSlash(wrapper)}).String()

@@ -22,6 +22,33 @@ public class RmmService extends Service {
     public static final String CHANNEL = "rmm_core";
     private static final int NOTIF_ID = 41;
 
+    private android.os.Handler countHandler;
+    private final Runnable countTick = new Runnable() {
+        @Override
+        public void run() {
+            // Workstation touch: the persistent notification names the
+            // live agent count (parsed from core Status JSON, best effort
+            // — a parse miss just keeps the previous text).
+            try {
+                org.json.JSONObject st = new org.json.JSONObject(Mobile.status());
+                int n = st.optJSONArray("agents").length();
+                NotificationManager nm = getSystemService(NotificationManager.class);
+                Notification upd = new Notification.Builder(RmmService.this, CHANNEL)
+                        .setContentTitle("RMM Console active")
+                        .setContentText(n == 1 ? "1 agent online" : n + " agents online")
+                        .setSmallIcon(R.drawable.ic_fg)
+                        .setOngoing(true)
+                        .build();
+                nm.notify(NOTIF_ID, upd);
+            } catch (Exception e) {
+                // keep previous notification text
+            }
+            if (countHandler != null) {
+                countHandler.postDelayed(this, 30000);
+            }
+        }
+    };
+
     @Override
     public void onCreate() {
         super.onCreate();
@@ -53,7 +80,10 @@ public class RmmService extends Service {
                     dir, "", SetupActivity.pref(this, SetupActivity.KEY_PASSWORD, ""), "", "");
             if (err != null && !err.isEmpty()) {
                 fail(err);
+                return;
             }
+            countHandler = new android.os.Handler(android.os.Looper.getMainLooper());
+            countHandler.postDelayed(countTick, 30000);
         }, "rmm-core-start").start();
         return START_STICKY;
     }
@@ -72,6 +102,7 @@ public class RmmService extends Service {
 
     @Override
     public void onDestroy() {
+        countHandler = null;
         try {
             Mobile.stop();
         } catch (Exception e) {
