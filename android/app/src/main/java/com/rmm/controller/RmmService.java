@@ -40,8 +40,8 @@ public class RmmService extends Service {
                         .setOngoing(true)
                         .build();
                 nm.notify(NOTIF_ID, upd);
-            } catch (Exception e) {
-                // keep previous notification text
+            } catch (Throwable e) {
+                // keep previous notification text (incl. native load fail)
             }
             if (countHandler != null) {
                 countHandler.postDelayed(this, 30000);

@@ -172,6 +172,35 @@ public class HomeActivity extends Activity {
         setContentView(scroll);
         refreshStatus();
         flushQueue(false);
+        // Last-resort evidence: if the previous run died, show the
+        // recorded stack for copy-paste diagnosis.
+        String crash = CrashLog.consume(this);
+        if (crash != null && !crash.isEmpty()) {
+            showCrash(crash);
+        }
+    }
+
+    private void showCrash(String crash) {
+        android.widget.ScrollView scroll = new android.widget.ScrollView(this);
+        TextView body = new TextView(this);
+        body.setText(crash);
+        body.setTypeface(android.graphics.Typeface.MONOSPACE);
+        body.setTextSize(11);
+        body.setTextIsSelectable(true);
+        int pad = (int) (16 * getResources().getDisplayMetrics().density);
+        body.setPadding(pad, pad, pad, pad);
+        scroll.addView(body);
+        new android.app.AlertDialog.Builder(this)
+                .setTitle("Previous run crashed — copy this to Jarvis")
+                .setView(scroll)
+                .setPositiveButton("Copy", (d, w) -> {
+                    android.content.ClipboardManager cm =
+                            (android.content.ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+                    cm.setPrimaryClip(android.content.ClipData.newPlainText("rmm-crash", crash));
+                    toast("Copied — paste it to Jarvis");
+                })
+                .setNegativeButton("Dismiss", null)
+                .show();
     }
 
     private void toast(String msg) {
@@ -208,7 +237,7 @@ public class HomeActivity extends Activity {
                         ids.add(id.isEmpty() ? hn : id);
                     }
                 }
-            } catch (Exception e) {
+            } catch (Throwable e) {
                 running = "error: " + e.getMessage();
             }
             final String fRunning = running;

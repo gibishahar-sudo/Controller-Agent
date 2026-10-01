@@ -68,6 +68,20 @@ public final class AppLock {
             a.runOnUiThread(onOk);
             return;
         }
+        try {
+            promptBiometric(a, onOk);
+        } catch (Exception e) {
+            // Vendor ROM quirks around BiometricPrompt must never brick
+            // the app: fail open, loudly, like the no-PIN path.
+            Toast.makeText(a, "Biometric unavailable (" + e.getMessage() + ") — app lock off",
+                    Toast.LENGTH_LONG).show();
+            setEnabled(a, false);
+            locked = false;
+            a.runOnUiThread(onOk);
+        }
+    }
+
+    private static void promptBiometric(Activity a, Runnable onOk) {
         Executor exec = a.getMainExecutor();
         BiometricPrompt.Builder b = new BiometricPrompt.Builder(a)
                 .setTitle("RMM Console")

@@ -37,8 +37,8 @@ public class RmmWidget extends AppWidgetProvider {
                 org.json.JSONArray arr = st.optJSONArray("agents");
                 agents = arr != null ? arr.length() : 0;
             }
-        } catch (Exception e) {
-            // leave -1 (core down / starting)
+        } catch (Throwable e) {
+            // leave -1 (core down / starting / wrong ABI)
         }
         RemoteViews views = new RemoteViews(context.getPackageName(), R.layout.widget);
         if (agents < 0) {

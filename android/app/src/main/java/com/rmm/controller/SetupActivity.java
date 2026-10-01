@@ -146,6 +146,21 @@ public class SetupActivity extends Activity {
         });
         v.addView(save);
 
+        TextView diag = new TextView(this);
+        String abi = android.os.Build.SUPPORTED_ABIS.length > 0
+                ? android.os.Build.SUPPORTED_ABIS[0] : "?";
+        String ver = "?";
+        try {
+            ver = getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
+        } catch (Exception e) {
+            // leave placeholder
+        }
+        diag.setText("app " + ver + " | " + abi
+                + " | android " + android.os.Build.VERSION.RELEASE);
+        diag.setTextColor(0xFF8B949E);
+        diag.setTextSize(11);
+        v.addView(diag);
+
         setContentView(scroll);
     }
 }
