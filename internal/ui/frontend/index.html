@@ -1132,7 +1132,7 @@ function updateStreamStats(){
   const el=$("streamStats"); if(!el) return;
   let fps="—", ms="—";
   if(frameTimes.length){ const avg=frameTimes.reduce((a,b)=>a+b,0)/frameTimes.length; fps=(1000/Math.max(1,avg)).toFixed(1); ms=Math.round(avg)+""; }
-  el.textContent=`${fps}fps • ${ms}ms • ${(lastFrameBytes/1024).toFixed(0)}KB • ${frameW}×${frameH} • lanes scr ${screenLanes()}/10 file ${fileLanes()}/10`;
+    el.textContent=`${fps}fps • ${ms}ms • ${(lastFrameBytes/1024).toFixed(0)}KB • ${frameW}×${frameH} • lanes scr ${screenLanes()}/10 file ${fileLanes()}/10 • inf ${inflight}`;
 }
 function positionRemoteCursor(x,y){
   const dot=$("remoteCursor"), img=$("screenImg"); if(!dot||!img) return;

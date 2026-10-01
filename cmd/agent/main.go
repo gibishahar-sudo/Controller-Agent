@@ -258,11 +258,19 @@ func captureTiled(quality, monitor int, all bool, scale float64) (msgs []protoco
 	if !modeCanScreen() {
 		return nil, fmt.Errorf("%s", commands.ModeDenied(agentMode))
 	}
+	// Per-frame stage timing (debug log): separates capture+encode cost
+	// from publish drain (logged per send batch) when diagnosing fps.
+	t0 := time.Now()
+	var capMs int64
+	defer func() {
+		dlog.Printf("[shot] frames=%d cap=%dms total=%dms err=%v", len(msgs), capMs, time.Since(t0).Milliseconds(), err)
+	}()
 	s0 := frameSeq.Load()
 	img, w, h, ox, oy, err := captureRaw(monitor, all, scale)
 	if err != nil {
 		return nil, err
 	}
+	capMs = time.Since(t0).Milliseconds()
 	if frameSeq.Load() != s0 {
 		return nil, nil // superseded during capture; UI would drop this frame
 	}
@@ -474,6 +482,24 @@ func fileDlStream(path string, fromSeq int, haveStr string, chunkRaw int, thumb 
 		}()
 	}
 	wg.Wait()
+}
+
+// sendShotMsgs publishes one capture's messages and logs the aggregate
+// drain (bytes + ms). Diagnoses link-vs-capture bounds per frame:
+// cap+encode time comes from captureTiled's own line, publish drain
+// from here. Aborts on first error like the inline loops it replaces.
+func sendShotMsgs(send func(protocol.Message) error, msgs []protocol.Message) error {
+	t0 := time.Now()
+	var bytes int64
+	for i, m := range msgs {
+		bytes += int64(len(m.Data))
+		if err := send(m); err != nil {
+			dlog.Printf("[shot] pub n=%d/%d bytes=%d ms=%d err=%v", i, len(msgs), bytes, time.Since(t0).Milliseconds(), err)
+			return err
+		}
+	}
+	dlog.Printf("[shot] pub n=%d bytes=%d ms=%d", len(msgs), bytes, time.Since(t0).Milliseconds())
+	return nil
 }
 
 // sendCamFrags delivers a command result, splitting multi-line CAMFRAG
@@ -1076,11 +1102,8 @@ func (a *agent) connectOnce() error {
 						_ = a.send(protocol.Message{Type: protocol.TypeScreen, Error: err.Error()})
 						return
 					}
-					for _, m := range msgs {
-						if err := a.send(m); err != nil {
-							log.Printf("[!] send screen: %v", err)
-							return
-						}
+					if err := sendShotMsgs(a.send, msgs); err != nil {
+						log.Printf("[!] send screen: %v", err)
 					}
 					return
 				}
@@ -1347,20 +1370,18 @@ func relayListenOnce(a *agent, hn, user, me, caFile string) error {
 						_ = mout(protocol.Message{Type: protocol.TypeScreen, Error: err.Error()})
 						return
 					}
-					for _, m := range msgs {
-						_ = mout(m)
-					}
+					_ = sendShotMsgs(mout, msgs)
 					return
 				}
 				s0 := frameSeq.Load()
 				data, w, h, ox, oy, format, err := captureImage(quality, monitor, all, scale)
-				if err != nil {
-					_ = mout(protocol.Message{Type: protocol.TypeScreen, Error: err.Error()})
-					return
-				}
-				if frameSeq.Load() != s0 {
-					return // superseded by a newer frame; UI would drop this one
-				}
+					if err != nil {
+						_ = mout(protocol.Message{Type: protocol.TypeScreen, Error: err.Error()})
+						return
+					}
+					if frameSeq.Load() != s0 {
+						return // superseded by a newer frame; UI would drop this one
+					}
 				b64 := base64.StdEncoding.EncodeToString(data)
 				_ = mout(protocol.Message{Type: protocol.TypeScreen, Width: w, Height: h, OX: ox, OY: oy, Data: b64, Format: format, FSeq: nextFrameSeq(), Scale: effectiveScale(scale)})
 			}(msg.Quality, msg.Monitor, msg.AllMonitors, msg.Scale, msg.Tiles)
@@ -1637,21 +1658,19 @@ func (a *agent) connectViaMQTT() error {
 						_ = mout(protocol.Message{Type: protocol.TypeScreen, Error: err.Error()})
 						return
 					}
-					for _, m := range msgs {
-						_ = mout(m)
-					}
+					_ = sendShotMsgs(mout, msgs)
 					return
 				}
 				s0 := frameSeq.Load()
 				data, w, h, ox, oy, format, err := captureImage(quality, monitor, all, scale)
-				if err != nil {
-					_ = mout(protocol.Message{Type: protocol.TypeScreen, Error: err.Error()})
-					return
-				}
-				if frameSeq.Load() != s0 {
-					log.Printf("[*] MQTT screenshot superseded, dropping")
-					return // a newer frame already published; UI would drop this one
-				}
+					if err != nil {
+						_ = mout(protocol.Message{Type: protocol.TypeScreen, Error: err.Error()})
+						return
+					}
+					if frameSeq.Load() != s0 {
+						log.Printf("[*] MQTT screenshot superseded, dropping")
+						return // a newer frame already published; UI would drop this one
+					}
 				b64 := base64.StdEncoding.EncodeToString(data)
 				log.Printf("[*] MQTT captured %dx%d+%d+%d %s %d bytes", w, h, ox, oy, format, len(data))
 				_ = mout(protocol.Message{Type: protocol.TypeScreen, Width: w, Height: h, OX: ox, OY: oy, Data: b64, Format: format, FSeq: nextFrameSeq(), Scale: effectiveScale(scale)})
