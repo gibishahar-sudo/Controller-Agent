@@ -142,9 +142,20 @@ func captureRaw(monitor int, all bool, scale float64) (img *image.RGBA, w, h, ox
 	} else if monitor > 0 && monitor < n {
 		bounds = screenshot.GetDisplayBounds(monitor)
 	}
-	cimg, cerr := screenshot.CaptureRect(bounds)
-	if cerr != nil {
-		return nil, 0, 0, 0, 0, cerr
+	// Layered pass first (SRCCOPY|CAPTUREBLT renders overlays/video
+	// instead of black); kbinani fallback on any error. kbinani alone
+	// "succeeds" over video with black pixels, which no error check
+	// can catch — so the richer capture must lead, not follow.
+	cimg, cerr := captureLayered(bounds)
+	if cerr != nil || cimg == nil {
+		kimg, kerr := screenshot.CaptureRect(bounds)
+		if kerr != nil {
+			if cerr != nil {
+				return nil, 0, 0, 0, 0, fmt.Errorf("layered: %v; fallback: %v", cerr, kerr)
+			}
+			return nil, 0, 0, 0, 0, kerr
+		}
+		cimg = kimg
 	}
 	img = cimg
 	w, h = bounds.Dx(), bounds.Dy()
