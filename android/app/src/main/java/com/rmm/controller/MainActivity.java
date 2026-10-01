@@ -378,6 +378,7 @@ public class MainActivity extends Activity {
         menu.add(0, 1, 0, "Setup (password)");
         menu.add(0, 2, 0, "Import file to device");
         menu.add(0, 3, 0, "Lock app now");
+        menu.add(0, 5, 0, "Diagnose view");
         menu.add(0, 4, 0, AppLock.enabled(this) ? "App lock: ON" : "App lock: OFF");
         return true;
     }
@@ -422,6 +423,10 @@ public class MainActivity extends Activity {
             if (on) {
                 AppLock.lockNow(this);
             }
+            return true;
+        }
+        if (item.getItemId() == 5) {
+            diagnoseView();
             return true;
         }
         return super.onOptionsItemSelected(item);
@@ -483,6 +488,58 @@ public class MainActivity extends Activity {
             // fall through
         }
         return null;
+    }
+
+    /** Ground-truth probe: reports what the page actually contains
+     * (fit CSS, button presence/visibility, fullscreen flag, monitor
+     * options) so a missing widget is diagnosed, not guessed. */
+    private void diagnoseView() {
+        if (web == null) {
+            toast("WebView not up");
+            return;
+        }
+        String probe = "(function(){"
+                + "function ex(id){return !!document.getElementById(id);}"
+                + "var b=document.getElementById('rmm-monbtn');"
+                + "var disp='none',inWrap=false,label='';"
+                + "if(b){disp=window.getComputedStyle(b).display;"
+                + "var w=document.getElementById('screenWrap');"
+                + "inWrap=!!(w&&w.contains(b));label=b.textContent;}"
+                + "var s=document.getElementById('monitorSel');"
+                + "var opts='',idx=-1;"
+                + "if(s){idx=s.selectedIndex;"
+                + "for(var i=0;i<s.options.length;i++){opts+=s.options[i].value+',';}}"
+                + "var tab='';var t=document.getElementById('tab-screen');"
+                + "if(t)tab=t.className;"
+                + "return JSON.stringify({url:location.href,"
+                + "fit:ex('rmm-tablet-fit'),"
+                + "btn:!!b,btnDisplay:disp,btnInWrap:inWrap,btnLabel:label,"
+                + "rmmFull:document.body.classList.contains('rmm-full'),"
+                + "tablet:document.body.classList.contains('rmm-tablet'),"
+                + "compact:document.body.classList.contains('compact'),"
+                + "monOpts:opts,monIdx:idx,tabScreen:tab});"
+                + "})()";
+        web.evaluateJavascript(probe, result -> runOnUiThread(() -> {
+            TextView body = new TextView(this);
+            body.setText(result != null ? result : "(no result)");
+            body.setTypeface(android.graphics.Typeface.MONOSPACE);
+            body.setTextSize(12);
+            body.setTextIsSelectable(true);
+            int pad = (int) (16 * getResources().getDisplayMetrics().density);
+            body.setPadding(pad, pad, pad, pad);
+            new android.app.AlertDialog.Builder(this)
+                    .setTitle("View diagnosis — copy to Jarvis")
+                    .setView(body)
+                    .setPositiveButton("Copy", (d, w) -> {
+                        android.content.ClipboardManager cm =
+                                (android.content.ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+                        cm.setPrimaryClip(android.content.ClipData.newPlainText(
+                                "rmm-diag", result != null ? result : ""));
+                        toast("Copied");
+                    })
+                    .setNegativeButton("Close", null)
+                    .show();
+        }));
     }
 
     private void toast(String msg) {

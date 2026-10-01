@@ -72,6 +72,9 @@ body.rmm-tablet #editBtn{display:none}
   background:rgba(17,22,31,.94);color:#E8E8E8;
   font-size:12px;font-family:inherit;padding:6px 10px;cursor:pointer}
 body.rmm-full #rmm-monbtn{display:block}
+/* Also visible in the normal Screen tab (same box, non-fullscreen):
+   one-tap switching without hunting the toolbar. */
+#tab-screen.active #rmm-monbtn{display:block}
 /* v1.46.42: tab beauty. Screen toolbar becomes one slim scroll row
    (was a tall wrap); niche toggles leave; files/commands rows wrap. */
 body.rmm-tablet #tab-screen .toolbar{flex-wrap:nowrap;overflow-x:auto;scrollbar-width:thin}
