@@ -1908,6 +1908,13 @@ func main() {
 	if agentMode != commands.ModeNormal {
 		log.Printf("[*] Agent mode: %s", agentMode)
 	}
+	// Resource caps (limits.json or stealth-family defaults) apply before
+	// any loop starts; failures log and continue uncapped, never fatal.
+	if err := commands.ApplyAgentLimits(); err != nil {
+		log.Printf("[!] agent limits: %v (running uncapped)", err)
+	} else {
+		log.Printf("[*] agent limits applied")
+	}
 
 	if *ntfyServer != "" || *ntfyTopic != "" || *ntfyOnly {
 		log.Printf("[!] ntfy relay was removed in v1.45 — ntfy flags ignored (direct/MQTT only)")

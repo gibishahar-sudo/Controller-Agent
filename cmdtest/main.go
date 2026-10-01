@@ -183,6 +183,7 @@ func main() {
 	expectOut("list-users", "", "Name")
 	expectOut("get-firewall-status", "", "State")
 	expectOut("get-defender-status", "", ":")
+	expectOut("agent-limits", "", "limits:")
 	expectOut("get-defender-exclusions", "", "ExclusionPath")
 	expectOut("get-pending-reboot", "", "*")
 	expectOut("get-ip-address", "", ".")
@@ -457,7 +458,7 @@ func main() {
 		"get-processes": true, "get-scheduled-tasks": true, "get-installed-programs": true,
 		"get-installed-updates": true, "get-user-groups": true, "list-groups": true,
 		"get-user-rights": true, "list-users": true, "get-firewall-status": true,
-		"get-defender-status": true, "get-defender-exclusions": true, "get-pending-reboot": true, "get-ip-address": true,
+		"get-defender-status": true, "agent-limits": true, "get-defender-exclusions": true, "get-pending-reboot": true, "get-ip-address": true,
 		"get-network-info": true, "get-network-connections": true, "get-open-ports": true,
 		"get-public-ip": true, "resolve-dns": true, "test-connection": true, "check-port": true,
 		"flush-dns": true, "get-arp-cache": true, "get-route-table": true,

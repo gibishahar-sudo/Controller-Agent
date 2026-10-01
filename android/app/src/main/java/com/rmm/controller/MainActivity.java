@@ -351,8 +351,18 @@ public class MainActivity extends Activity {
                 + "window.rmmMonObs=new MutationObserver(function(){rmmMonPlace();});"
                 + "window.rmmMonObs.observe(document.body,{childList:true,subtree:true});}"
                 + "rmmMonPlace();"
-                + "})()";
+                // Hide toggle (menu): inline display beats the stylesheet,
+                // so 'none' hides everywhere and '' restores sheet control.
+                // Re-enforced on every injection (fresh documents forget).
+                + monbtnDisplayJs() + "})()";
         view.evaluateJavascript(js, null);
+    }
+
+    /** JS enforcing the saved monitor-button visibility (inline style
+     * wins over the stylesheet; '' hands control back to it). */
+    private String monbtnDisplayJs() {
+        String v = SetupActivity.monbtnEnabled(this) ? "''" : "'none'";
+        return "if(window.rmmMonBtn)window.rmmMonBtn.style.display=" + v + ";";
     }
 
     private String readRaw(int resId) {
@@ -379,6 +389,7 @@ public class MainActivity extends Activity {
         menu.add(0, 2, 0, "Import file to device");
         menu.add(0, 3, 0, "Lock app now");
         menu.add(0, 5, 0, "Diagnose view");
+        menu.add(0, 6, 0, SetupActivity.monbtnEnabled(this) ? "Monitor button: ON" : "Monitor button: OFF");
         menu.add(0, 4, 0, AppLock.enabled(this) ? "App lock: ON" : "App lock: OFF");
         return true;
     }
@@ -388,6 +399,10 @@ public class MainActivity extends Activity {
         MenuItem lock = menu.findItem(4);
         if (lock != null) {
             lock.setTitle(AppLock.enabled(this) ? "App lock: ON" : "App lock: OFF");
+        }
+        MenuItem mon = menu.findItem(6);
+        if (mon != null) {
+            mon.setTitle(SetupActivity.monbtnEnabled(this) ? "Monitor button: ON" : "Monitor button: OFF");
         }
         return super.onPrepareOptionsMenu(menu);
     }
@@ -427,6 +442,19 @@ public class MainActivity extends Activity {
         }
         if (item.getItemId() == 5) {
             diagnoseView();
+            return true;
+        }
+        if (item.getItemId() == 6) {
+            boolean on = !SetupActivity.monbtnEnabled(this);
+            SetupActivity.setMonbtn(this, on);
+            toast(on ? "Monitor button on" : "Monitor button off");
+            if (web != null) {
+                final boolean show = on;
+                web.evaluateJavascript(
+                        "if(window.rmmMonBtn)window.rmmMonBtn.style.display="
+                                + (show ? "''" : "'none'") + ";",
+                        null);
+            }
             return true;
         }
         return super.onOptionsItemSelected(item);

@@ -28,6 +28,15 @@ public class SetupActivity extends Activity {
 
     public static final String PREFS = "rmm_setup";
     public static final String KEY_PASSWORD = "ui_password";
+    public static final String KEY_MONBTN = "monbtn";
+
+    public static boolean monbtnEnabled(Context c) {
+        return c.getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(KEY_MONBTN, true);
+    }
+
+    public static void setMonbtn(Context c, boolean on) {
+        c.getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean(KEY_MONBTN, on).apply();
+    }
 
     public static String pref(Context c, String k, String def) {
         return c.getSharedPreferences(PREFS, MODE_PRIVATE).getString(k, def);

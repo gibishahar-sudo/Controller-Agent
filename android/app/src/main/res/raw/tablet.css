@@ -87,3 +87,11 @@ body.rmm-tablet .file-row{font-size:11px;padding:7px 8px}
 body.rmm-tablet #macroBar{flex-wrap:wrap}
 body.rmm-tablet #macroHint{display:none}
 body.rmm-tablet .inputbar{flex-wrap:wrap}
+/* v1.46.50 polish: toasts clear the fullscreen switcher; the send bar
+   sticks while output scrolls; tighter chips and pane headers. */
+body.rmm-full #toasts{bottom:80px}
+body.rmm-tablet .inputbar{position:sticky;bottom:0;z-index:5}
+body.rmm-tablet #cmdFavs .chip{padding:5px 9px;font-size:11px}
+body.rmm-tablet .file-pane h4,body.rmm-tablet .audio-card h4{font-size:11px;margin-bottom:6px}
+body.rmm-tablet .terminal{font-size:12px;line-height:1.5}
+body.rmm-tablet .toolbar{padding:6px}
