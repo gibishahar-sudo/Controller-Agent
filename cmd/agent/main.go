@@ -484,21 +484,50 @@ func fileDlStream(path string, fromSeq int, haveStr string, chunkRaw int, thumb 
 	wg.Wait()
 }
 
-// sendShotMsgs publishes one capture's messages and logs the aggregate
-// drain (bytes + ms). Diagnoses link-vs-capture bounds per frame:
-// cap+encode time comes from captureTiled's own line, publish drain
-// from here. Aborts on first error like the inline loops it replaces.
+// sendShotMsgs publishes one capture's messages over a small worker
+// pool and logs the aggregate drain (bytes + ms). Tile/keyframe batches
+// were sent strictly serially: every publish pays paho socket-drain
+// latency in turn, so a 60-tile frame cost ~60 round trips (~460ms
+// observed). Workers overlap the drain; tiles carry coords+FSeq so
+// order is free, and the UI dedupes generations. Semantics vs the old
+// loop: all racing messages finish (old code stopped at the first
+// error); the first error is still returned. Safe for both send impls:
+// direct-TLS Encode is mutex-guarded, relay Publish is thread-safe.
 func sendShotMsgs(send func(protocol.Message) error, msgs []protocol.Message) error {
 	t0 := time.Now()
-	var bytes int64
-	for i, m := range msgs {
-		bytes += int64(len(m.Data))
-		if err := send(m); err != nil {
-			dlog.Printf("[shot] pub n=%d/%d bytes=%d ms=%d err=%v", i, len(msgs), bytes, time.Since(t0).Milliseconds(), err)
-			return err
-		}
+	var bytes atomic.Int64
+	var firstErr atomic.Value
+	jobs := make(chan protocol.Message, len(msgs))
+	for _, m := range msgs {
+		bytes.Add(int64(len(m.Data)))
+		jobs <- m
 	}
-	dlog.Printf("[shot] pub n=%d bytes=%d ms=%d", len(msgs), bytes, time.Since(t0).Milliseconds())
+	close(jobs)
+	workers := 4
+	if len(msgs) < workers {
+		workers = len(msgs)
+	}
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for m := range jobs {
+				if err := send(m); err != nil {
+					if firstErr.Load() == nil {
+						firstErr.Store(err)
+					}
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	if v := firstErr.Load(); v != nil {
+		dlog.Printf("[shot] pub n=%d bytes=%d ms=%d err=%v", len(msgs), bytes.Load(), time.Since(t0).Milliseconds(), v.(error))
+		return v.(error)
+	}
+	dlog.Printf("[shot] pub n=%d bytes=%d ms=%d", len(msgs), bytes.Load(), time.Since(t0).Milliseconds())
 	return nil
 }
 

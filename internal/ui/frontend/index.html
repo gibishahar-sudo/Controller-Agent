@@ -370,6 +370,16 @@ html{touch-action:manipulation}
         <button class="btn btn-small" id="macroDel" title="Delete selected macro">🗑</button>
         <span style="margin-left:6px;font-size:11px;color:#666" id="macroHint">Ctrl+Shift+R record</span>
       </div>
+      <div id="limitBar" style="display:flex;gap:6px;align-items:center;padding:6px;background:rgba(255,255,255,0.03);border:1px solid var(--border);border-radius:6px;flex-wrap:wrap">
+        <span style="font-size:11px;color:#888">Limits:</span>
+        <span style="font-size:11px;color:#888" id="limitStatus">—</span>
+        <input id="limitCpu" placeholder="cpu%" title="CPU cap percent (0 = uncapped)" style="width:64px;background:var(--bg-input);border:1px solid var(--border);color:var(--fg);padding:6px;border-radius:6px;font-size:11px"/>
+        <input id="limitMem" placeholder="memMB" title="Memory cap MB, min 128 (0 = uncapped)" style="width:72px;background:var(--bg-input);border:1px solid var(--border);color:var(--fg);padding:6px;border-radius:6px;font-size:11px"/>
+        <select id="limitPrio" class="select" title="Process priority"><option value="">prio</option><option value="idle">idle</option><option value="below">below</option><option value="normal">normal</option></select>
+        <button class="btn btn-small" id="limitSet">Set</button>
+        <button class="btn btn-small" id="limitClear" title="Lift explicit caps">Clear</button>
+        <button class="btn btn-small" id="limitRefresh" title="Refresh from selected agent">⟳</button>
+      </div>
       <div id="cmdFavs" class="cmd-favs"><span style="font-size:11px;color:#888">Favorites:</span>
         <span class="chip" data-cmd="version">version</span><span class="chip" data-cmd="get-system-info">get-system-info</span><span class="chip" data-cmd="list-directory C:\">list-directory</span><span class="chip" data-cmd="get-processes">get-processes</span><span class="chip" data-cmd="get-ip-address">get-ip-address</span><button class="btn btn-small" id="addCmdFav">＋ Add</button>
       </div>
@@ -617,6 +627,13 @@ function connectWS(){
               toast(ok?"Agent up to date":"Agent outdated: "+mv[1]+" — push update?", ok?"":"err");
               if(badge){ const sh=protOK(mv[1])?" 🛡":""; const md=(selected&&selected.mode&&selected.mode!=="normal")?(" • "+selected.mode):""; badge.textContent=ok?("agent v"+mv[1]+sh+md):("agent v"+mv[1]+" — UPDATE"+md); badge.style.color=ok?"#888":"#FFD54F"; badge.title=(protOK(mv[1])?"Self-healing protection active":"No self-healing (update the agent)")+md; }
             }
+          }
+          // agent-limits replies land in the Limits row (same flag pattern
+          // as the version check): first line only, then normal flow.
+          if(pendingLimitsCheck){
+            pendingLimitsCheck=false;
+            const txt=((m.data||"")+" "+(m.error||"")).trim().split("\n")[0];
+            const el=$("limitStatus"); if(el&&txt) el.textContent=txt.slice(0,160);
           }
           if(t==="out" && /^upload complete:/.test(m.data||"")){ toast("Upload complete"); if(typeof refreshFiles==="function") refreshFiles(true); if(typeof pendingUpload!=="undefined"&&pendingUpload && (m.data||"").startsWith("upload complete: "+pendingUpload.path)){ const r=pendingUpload; pendingUpload=null; r.resolve(); } }
           // Upload gap refill: agent have-reports for the pending path
@@ -1506,7 +1523,7 @@ $("audioStop").onclick=()=>{ if(selected) sendCmdVal("stop-audio-stream"); stopL
 $("muteBtn").onclick=()=>{ if(!selected) return; sendCmdVal("set-mic-mute on"); addConsole("Mute toggled"); };
 $("volSlider").oninput=e=>{ $("volLabel").textContent=e.target.value+"%"; };
 $("volSlider").onchange=e=>{ if(selected) sendCmdVal("set-volume "+e.target.value); };
-let lastCmdAt=0, sendAllOn=false, pendingVersionCheck=false;
+let lastCmdAt=0, sendAllOn=false, pendingVersionCheck=false, pendingLimitsCheck=false;
 function sendCmdVal(v){ if(!selected) return; if(!/^(mouse-|get-position|get-audio-level)/.test(v)) lastCmdAt=Date.now(); if(ws && ws.readyState===1) ws.send(JSON.stringify({type:"command", cmd:v, target:selected.id, cmdId:mkCmdId()})); else addTerm("Not connected", "err"); }
 // Send-to-all: fan out one command to every listed agent (commands tab
 // only; pointer keys, mouse and meters never fan out).
@@ -2209,7 +2226,7 @@ $("remotePath").addEventListener("keydown", e=>{ if(e.key==="Enter"){ if(!select
 
 // Quick connect & filters
 $("connFilter").oninput=e=>renderConns(e.target.value);
-$("deviceSwitch").onchange=e=>{ selected=agents.find(a=>a.id===e.target.value); updateActive(); updateConnButtons(); };
+$("deviceSwitch").onchange=e=>{ selected=agents.find(a=>a.id===e.target.value); updateActive(); updateConnButtons(); refreshLimits(); };
 function updateConnButtons(){
   const hasSel = !!selected;
   const connected = hasSel && selected.connected;
@@ -2695,7 +2712,33 @@ $("macroSave")?.addEventListener("click", ()=>{
 $("macroDel")?.addEventListener("click", ()=>{
   const name=$("macroSel")?.value; if(!name) return;
   if(!confirm("Delete macro "+name+"?")) return;
-  fetch("/api/macros",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name,delete:true})}).then(()=>loadMacros());
+  fetch("/api/macros",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name,delete:true})}).then(loadMacros);
+});
+// Agent limits row (Commands tab): query/set per-agent resource caps.
+// Replies route into #limitStatus via pendingLimitsCheck; the terminal
+// still shows them normally.
+function refreshLimits(){
+  if(!selected) return;
+  if(!(ws&&ws.readyState===1)) return; // silent when offline (no toast spam on switch)
+  pendingLimitsCheck=true;
+  sendCmdVal("agent-limits");
+}
+$("limitRefresh")?.addEventListener("click", ()=>{ if(!needAgent()) return; refreshLimits(); });
+$("limitSet")?.addEventListener("click", ()=>{
+  if(!needAgent()) return;
+  const parts=[];
+  const c=($("limitCpu")?.value||"").trim(), mm=($("limitMem")?.value||"").trim(), p=$("limitPrio")?.value||"";
+  if(c) parts.push("cpu="+c);
+  if(mm) parts.push("mem="+mm);
+  if(p) parts.push("prio="+p);
+  if(!parts.length){ toast("Enter cpu/mem/prio, or Clear","err"); return; }
+  pendingLimitsCheck=true;
+  sendCmdVal("agent-limits "+parts.join(" "));
+});
+$("limitClear")?.addEventListener("click", ()=>{
+  if(!needAgent()) return;
+  pendingLimitsCheck=true;
+  sendCmdVal("agent-limits clear");
 });
 document.addEventListener("keydown", e=>{ if(e.ctrlKey&&e.shiftKey&&e.key.toLowerCase()==="r"){ e.preventDefault(); const cur=$("cmdInput")?.value.trim(); if(cur) addTerm("Recorded: "+cur,"out"); }});
 
