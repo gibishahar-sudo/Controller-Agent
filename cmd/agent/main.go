@@ -800,8 +800,10 @@ func (a *agent) quietRemain() time.Duration {
 // startPushStream switches the agent to self-paced frame streaming
 // (v1.46.55+). The controller sends screenshot_request with push=true;
 // the agent then captures + publishes frames at its own pace until
-// disconnect or a new push request. Quarter-scale (0.25) keeps CPU
-// sane on weak agents while still delivering 15+ fps over MQTT.
+// disconnect or a new push request. Frames go through captureTiled:
+// idle screens cost a heartbeat, small changes cost a few tiles, full
+// motion costs a keyframe. Quality adapts to the measured cycle time
+// (drops when the box can't keep up, recovers when it can).
 func (a *agent) startPushStream(quality, monitor int, all bool, scale float64) {
 	a.pushMu.Lock()
 	if a.pushCancel != nil {
@@ -813,9 +815,19 @@ func (a *agent) startPushStream(quality, monitor int, all bool, scale float64) {
 
 	go func() {
 		defer cancel()
-		interval := 66 * time.Millisecond // ~15fps target
+		interval := 33 * time.Millisecond // ~30fps target; slow captures pace the loop naturally
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
+		q := quality
+		if q <= 0 {
+			q = 70
+		}
+		qHi := q
+		sc := scale
+		if sc <= 0 {
+			sc = 0.5
+		}
+		var emaMs float64
 		for {
 			select {
 			case <-ctx.Done():
@@ -826,13 +838,35 @@ func (a *agent) startPushStream(quality, monitor int, all bool, scale float64) {
 				if !captureSlot() {
 					continue
 				}
-				data, w, h, ox, oy, format, err := captureImage(quality, monitor, all, 0.25)
+				c0 := time.Now()
+				msgs, err := captureTiled(q, monitor, all, sc)
 				releaseSlot()
 				if err != nil {
 					continue
 				}
-				b64 := base64.StdEncoding.EncodeToString(data)
-				_ = a.send(protocol.Message{Type: protocol.TypeScreen, Width: w, Height: h, OX: ox, OY: oy, Data: b64, Format: format, FSeq: nextFrameSeq(), Scale: 0.25})
+				ms := time.Since(c0).Milliseconds()
+				if emaMs == 0 {
+					emaMs = float64(ms)
+				} else {
+					emaMs = 0.2*float64(ms) + 0.8*emaMs
+				}
+				// Adaptive quality: slow box -> cheaper frames, fast box -> recover.
+				if emaMs > 100 && q > 40 {
+					q -= 10
+					dlog.Printf("[push] slow cycle ema=%.0fms, quality %d->%d", emaMs, q+10, q)
+				} else if emaMs < 40 && q < qHi {
+					q += 5
+					if q > qHi {
+						q = qHi
+					}
+					dlog.Printf("[push] fast cycle ema=%.0fms, quality recovered to %d", emaMs, q)
+				}
+				if len(msgs) == 0 {
+					continue
+				}
+				if err := sendShotMsgs(a.send, msgs); err != nil {
+					return // transport dead; loop exits, next push restarts
+				}
 			}
 		}
 	}()
