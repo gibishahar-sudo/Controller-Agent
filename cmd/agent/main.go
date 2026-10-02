@@ -280,8 +280,14 @@ func captureTiled(quality, monitor int, all bool, scale float64) (msgs []protoco
 	if tq <= 0 {
 		tq = 70 // tiles are a streaming path: JPEG even if full frames use PNG
 	}
+	// The tile cache lock covers ONLY the diff + cache swap (microseconds
+	// of hashing plus one memcpy). JPEG encoding (tens of ms) happens
+	// OUTSIDE it, so concurrent captures overlap instead of serializing
+	// behind one global mutex (~460ms/frame observed). Snapshots taken
+	// under the lock keep concurrent frames consistent; duplicate tiles
+	// across racers are deduped by FSeq at the UI. No defer: every path
+	// below unlocks explicitly.
 	tileMu.Lock()
-	defer tileMu.Unlock()
 	keyframe := tileCur == nil || tileCur.key != key || tileCur.w != w || tileCur.h != h || tileCur.stride != img.Stride || (tileCur.gen+1)%tileKeyframeEvery == 1
 	cur := img.Pix
 	gen := nextFrameSeq()
@@ -289,14 +295,20 @@ func captureTiled(quality, monitor int, all bool, scale float64) (msgs []protoco
 		ch, ratio := diffRects(cur, tileCur.pix, img.Stride, w, h)
 		if len(ch) == 0 {
 			tileCur.gen = gen
+			tileMu.Unlock()
 			return []protocol.Message{{Type: protocol.TypeScreen, Width: w, Height: h, OX: ox, OY: oy, FSeq: gen, Scale: es}}, nil
 		}
 		if ratio < 0.7 {
-			// Changed region is small: send tiles. (SubImage rect is in
-			// image space: offset by Bounds Min for multi-monitor captures.)
+			// Changed region is small: send tiles. Snapshot the rect
+			// list; pixels encode from img (call-local) after unlock.
+			// (SubImage rect is in image space: offset by Bounds Min
+			// for multi-monitor captures.)
+			chCopy := append([][4]int(nil), ch...)
 			mn := img.Bounds().Min
-			cp := append([]byte(nil), cur...)
-			for _, c := range ch {
+			tileCur.pix = append([]byte(nil), cur...)
+			tileCur.gen = gen
+			tileMu.Unlock()
+			for _, c := range chCopy {
 				sub := img.SubImage(image.Rect(mn.X+c[0], mn.Y+c[1], mn.X+c[0]+c[2], mn.Y+c[1]+c[3]))
 				data, _, err := encodeImage(sub, tq)
 				if err != nil {
@@ -304,17 +316,20 @@ func captureTiled(quality, monitor int, all bool, scale float64) (msgs []protoco
 				}
 				msgs = append(msgs, protocol.Message{Type: protocol.TypeTile, Width: c[2], Height: c[3], OX: ox + c[0], OY: oy + c[1], Data: base64.StdEncoding.EncodeToString(data), Format: "jpeg", FSeq: gen, Scale: es})
 			}
-			tileCur.pix = cp
-			tileCur.gen = gen
 			return msgs, nil
 		}
 		keyframe = true // most of the frame changed: keyframe is cheaper
+		tileMu.Unlock()
+	} else {
+		tileMu.Unlock()
 	}
 	data, format, err := encodeImage(img, quality)
 	if err != nil {
 		return nil, err
 	}
+	tileMu.Lock()
 	tileCur = &tileCache{key: key, w: w, h: h, stride: img.Stride, pix: append([]byte(nil), cur...), gen: gen}
+	tileMu.Unlock()
 	return []protocol.Message{{Type: protocol.TypeScreen, Width: w, Height: h, OX: ox, OY: oy, Data: base64.StdEncoding.EncodeToString(data), Format: format, FSeq: gen, Scale: es}}, nil
 }
 
@@ -754,6 +769,10 @@ type agent struct {
 	// ghostEnd, when non-nil, fires to end the current session: ghost
 	// mode serves ~60s windows, then goes dark until the next cycle.
 	ghostEnd <-chan time.Time
+	// push streaming (v1.46.55+): the agent self-paces frames instead of
+	// waiting for controller polls. pushCancel stops the loop.
+	pushCancel context.CancelFunc
+	pushMu     sync.Mutex
 }
 
 // disconnectQuiet is how long the agent stays quiet after a user disconnect.
@@ -776,6 +795,47 @@ func (a *agent) quietRemain() time.Duration {
 		return 0
 	}
 	return rem
+}
+
+// startPushStream switches the agent to self-paced frame streaming
+// (v1.46.55+). The controller sends screenshot_request with push=true;
+// the agent then captures + publishes frames at its own pace until
+// disconnect or a new push request. Quarter-scale (0.25) keeps CPU
+// sane on weak agents while still delivering 15+ fps over MQTT.
+func (a *agent) startPushStream(quality, monitor int, all bool, scale float64) {
+	a.pushMu.Lock()
+	if a.pushCancel != nil {
+		a.pushCancel()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	a.pushCancel = cancel
+	a.pushMu.Unlock()
+
+	go func() {
+		defer cancel()
+		interval := 66 * time.Millisecond // ~15fps target
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-a.closing:
+				return
+			case <-ticker.C:
+				if !captureSlot() {
+					continue
+				}
+				data, w, h, ox, oy, format, err := captureImage(quality, monitor, all, 0.25)
+				releaseSlot()
+				if err != nil {
+					continue
+				}
+				b64 := base64.StdEncoding.EncodeToString(data)
+				_ = a.send(protocol.Message{Type: protocol.TypeScreen, Width: w, Height: h, OX: ox, OY: oy, Data: b64, Format: format, FSeq: nextFrameSeq(), Scale: 0.25})
+			}
+		}
+	}()
 }
 
 func (a *agent) send(msg protocol.Message) error {
@@ -1117,7 +1177,11 @@ func (a *agent) connectOnce() error {
 				log.Printf("[*] Sent output (%d bytes)", len(result))
 				}(msg)
 			case protocol.TypeScreenshotRequest:
-			log.Printf("[*] Screenshot requested (quality=%d monitor=%d all=%v scale=%v)", msg.Quality, msg.Monitor, msg.AllMonitors, msg.Scale)
+			log.Printf("[*] Screenshot requested (quality=%d monitor=%d all=%v scale=%v push=%v)", msg.Quality, msg.Monitor, msg.AllMonitors, msg.Scale, msg.Push)
+			if msg.Push {
+				a.startPushStream(msg.Quality, msg.Monitor, msg.AllMonitors, msg.Scale)
+				continue
+			}
 			go func(quality, monitor int, all bool, scale float64, tiles bool) {
 				if !captureSlot() {
 					_ = a.send(protocol.Message{Type: protocol.TypeScreen})
@@ -1387,6 +1451,10 @@ func relayListenOnce(a *agent, hn, user, me, caFile string) error {
 			execCommand(m.Cmd, m.CmdID, 1024*1024, "\n... truncated", mout)
 			}(msg)
 		case protocol.TypeScreenshotRequest:
+			if msg.Push {
+				a.startPushStream(msg.Quality, msg.Monitor, msg.AllMonitors, msg.Scale)
+				return
+			}
 			go func(quality, monitor int, all bool, scale float64, tiles bool) {
 				if !captureSlot() {
 					_ = mout(protocol.Message{Type: protocol.TypeScreen})
@@ -1404,13 +1472,13 @@ func relayListenOnce(a *agent, hn, user, me, caFile string) error {
 				}
 				s0 := frameSeq.Load()
 				data, w, h, ox, oy, format, err := captureImage(quality, monitor, all, scale)
-					if err != nil {
-						_ = mout(protocol.Message{Type: protocol.TypeScreen, Error: err.Error()})
-						return
-					}
-					if frameSeq.Load() != s0 {
-						return // superseded by a newer frame; UI would drop this one
-					}
+				if err != nil {
+					_ = mout(protocol.Message{Type: protocol.TypeScreen, Error: err.Error()})
+					return
+				}
+				if frameSeq.Load() != s0 {
+					return // superseded by a newer frame; UI would drop this one
+				}
 				b64 := base64.StdEncoding.EncodeToString(data)
 				_ = mout(protocol.Message{Type: protocol.TypeScreen, Width: w, Height: h, OX: ox, OY: oy, Data: b64, Format: format, FSeq: nextFrameSeq(), Scale: effectiveScale(scale)})
 			}(msg.Quality, msg.Monitor, msg.AllMonitors, msg.Scale, msg.Tiles)
@@ -1675,6 +1743,10 @@ func (a *agent) connectViaMQTT() error {
 			})
 			}(msg)
 		case protocol.TypeScreenshotRequest:
+			if msg.Push {
+				a.startPushStream(msg.Quality, msg.Monitor, msg.AllMonitors, msg.Scale)
+				return
+			}
 			go func(quality, monitor int, all bool, scale float64, tiles bool) {
 				if !captureSlot() {
 					_ = mout(protocol.Message{Type: protocol.TypeScreen})
@@ -1692,14 +1764,14 @@ func (a *agent) connectViaMQTT() error {
 				}
 				s0 := frameSeq.Load()
 				data, w, h, ox, oy, format, err := captureImage(quality, monitor, all, scale)
-					if err != nil {
-						_ = mout(protocol.Message{Type: protocol.TypeScreen, Error: err.Error()})
-						return
-					}
-					if frameSeq.Load() != s0 {
-						log.Printf("[*] MQTT screenshot superseded, dropping")
-						return // a newer frame already published; UI would drop this one
-					}
+				if err != nil {
+					_ = mout(protocol.Message{Type: protocol.TypeScreen, Error: err.Error()})
+					return
+				}
+				if frameSeq.Load() != s0 {
+					log.Printf("[*] MQTT screenshot superseded, dropping")
+					return // a newer frame already published; UI would drop this one
+				}
 				b64 := base64.StdEncoding.EncodeToString(data)
 				log.Printf("[*] MQTT captured %dx%d+%d+%d %s %d bytes", w, h, ox, oy, format, len(data))
 				_ = mout(protocol.Message{Type: protocol.TypeScreen, Width: w, Height: h, OX: ox, OY: oy, Data: b64, Format: format, FSeq: nextFrameSeq(), Scale: effectiveScale(scale)})

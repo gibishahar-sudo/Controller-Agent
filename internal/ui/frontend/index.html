@@ -479,6 +479,8 @@ function needAgent(){ if(!selected){ toast("No agent selected — connect one fi
 // health heartbeat) when its hello version is >= 1.40.6. Inferred from the
 // version string so no protocol change is needed.
 function protOK(v){ const m=String(v||"").match(/(\d+)\.(\d+)\.(\d+)/); if(!m) return false; const a=+m[1],b=+m[2],c=+m[3]; return a>1||(a===1&&(b>40||(b===40&&c>=6))); }
+// pushOK: agent supports self-paced push streaming (v1.46.55+)
+function pushOK(v){ const m=String(v||"").match(/(\d+)\.(\d+)\.(\d+)/); if(!m) return false; const a=+m[1],b=+m[2],c=+m[3]; return a>1||(a===1&&(b>46||(b===46&&c>=55))); }
 
 // Connects list (stable selection: keep current unless it vanished)
 function renderConns(filter=""){
@@ -1200,7 +1202,8 @@ function requestShot(){
   if(!streaming||streamPaused||streamSuspended||!selected||!ws||ws.readyState!==1) return;
   if(inflight>=effPipe()) return; // pipeline full: wait for arrivals
   inflight++;
-  ws.send(JSON.stringify({type:"screenshot_request", target:selected.id, quality:screenQuality(), monitor:streamMonitor(), allMonitors:streamAllMonitors(), scale:streamScale(), tiles:true}));
+  const push=pushOK(selected.version);
+  ws.send(JSON.stringify({type:"screenshot_request", target:selected.id, quality:screenQuality(), monitor:streamMonitor(), allMonitors:streamAllMonitors(), scale:streamScale(), tiles:!push, push:push}));
 }
 // Fill the pipe: every arrival tops up to pipeDepth outstanding instead of
 // waiting out the interval (the old steady state kept exactly 1 in flight,

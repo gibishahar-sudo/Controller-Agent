@@ -1016,7 +1016,8 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 				scale = f
 			}
 			tiles, _ := msg["tiles"].(bool)
-			_ = s.sendToAgent(ac, protocol.Message{Type: protocol.TypeScreenshotRequest, Quality: quality, Monitor: monitor, AllMonitors: allMonitors, Scale: scale, Tiles: tiles})
+			push, _ := msg["push"].(bool)
+			_ = s.sendToAgent(ac, protocol.Message{Type: protocol.TypeScreenshotRequest, Quality: quality, Monitor: monitor, AllMonitors: allMonitors, Scale: scale, Tiles: tiles, Push: push})
 		case "file-dl", "file-dl-more":
 			path, _ := msg["path"].(string)
 			via, _ := msg["via"].(string)
