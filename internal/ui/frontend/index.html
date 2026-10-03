@@ -2485,6 +2485,7 @@ function browserAudioChunk(m){
   const seq=m.seq|0;
   if(browserAudio.expect>=0&&seq<browserAudio.expect-5) return; // stale resend
   if(browserAudio.pending.has(seq)) return;
+  if(browserAudio.firstBlock!==true){ browserAudio.firstBlock=true; const el=$("audioHealth"); if(el) el.textContent="browser: playing — first block arrived"; }
   if(browserAudio.pending.size>40){ browserAudio.dropped++; return; } // saturated: shed, don't balloon
   browserAudio.pending.set(seq, f);
 }
@@ -2513,13 +2514,15 @@ function scheduleBuf(ctx, gain, buf, when){
 function browserAudioStop(){
   const B=browserAudio;
   if(selected&&ws&&ws.readyState===1){ try{ ws.send(JSON.stringify({type:"browser_audio", target:selected.id, on:false})); }catch{} }
-  B.pending.clear(); B.expect=-1; B.next=0;
+  B.pending.clear(); B.expect=-1; B.next=0; B.firstBlock=false;
   if(B.ctx){ B.ctx.suspend().catch(()=>{}); }
 }
 function browserAudioStart(){
   if(!selected) return false;
   if(!browserAudioOn()){ toast("Browser audio unsupported here", "err"); return false; }
   try{ ws.send(JSON.stringify({type:"browser_audio", target:selected.id, on:true})); }catch{}
+  browserAudio.firstBlock=false;
+  const el=$("audioHealth"); if(el) el.textContent="browser: subscribed, waiting for first block…";
   return true;
 }
 // "Play here" toggle: tablets default ON (the controller's speakers are a
@@ -2531,7 +2534,12 @@ function browserAudioStart(){
   box.checked=!!(coarse||small);
   const lbl=document.querySelector("#browserAudioToggle");
   const paint=()=>{ if(lbl) lbl.childNodes[1].textContent=box.checked?" 🔊 Play here: ON":" 🔊 Play here (this browser — for tablets)"; };
-  box.addEventListener("change", paint); paint();
+  box.addEventListener("change", ()=>{
+    paint();
+    if(box.checked){ const st=$("localAudioStatus"); if(st) st.textContent="Playing in this browser — controller speakers not used"; }
+    else loadLocalAudioDevices(true); // back to native path: re-probe the controller's speakers
+  });
+  paint();
 })();
 function browserPlayHere(){ return !!document.querySelector("#browserAudioToggle input")?.checked; }
 function localOutName(){ return $("localOutDev")?.value||"Default"; }
@@ -2581,10 +2589,14 @@ $("audioOutDev")?.addEventListener("change", ()=>audioDevDetails("audioOutDev","
 // API, no browser media APIs needed). Saved per agent on the controller.
 async function loadLocalAudioDevices(silent){
   const sel=$("localOutDev"); if(!sel) return;
+  if(browserPlayHere()){ // tablet path: controller speakers are a different room; don't probe them (a failing probe prints a scary, irrelevant error)
+    if(!silent) $("localAudioStatus").textContent="Playing in this browser — controller speakers not used";
+    return;
+  }
   if(!silent) $("localAudioStatus").textContent="Loading my devices…";
   try{
     const r=await fetch("/api/local-audio-devices");
-    if(!r.ok) throw new Error(await r.text());
+    if(!r.ok) throw new Error("HTTP "+r.status+": "+(await r.text()));
     const j=await r.json(); const list=(j.devices||[]).filter(d=>d&&(d.kind==="output"||d.kind==="unknown"||!d.kind));
     const keep=sel.value;
     sel.innerHTML='<option value="">Default</option>';

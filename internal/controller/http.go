@@ -398,7 +398,7 @@ func (s *Server) startHTTP(addr, dir string) {
 		}
 		devs, err := ListLocalAudioDevices()
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			http.Error(w, "controller audio endpoints: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 		if devs == nil {
