@@ -1109,7 +1109,7 @@ $("addCmdFav").onclick=()=>{
 // Screen — frame-driven streaming: each arriving frame schedules the next
 // one, so the stream self-paces to the real round-trip (no pile-ups, no
 // stalls). A 3s watchdog re-requests if a frame gets lost in transit.
-let streaming=false, lastFrameAt=0, streamWatch=null, nextShotTimer=null, streamPaused=false, streamSuspended=false;
+let streaming=false, lastFrameAt=0, streamWatch=null, nextShotTimer=null, streamPaused=false, streamSuspended=false, pushActive=false;
 let pipeDepth=3, inflight=0, lastFSeq=0;
 // Shared 20-lane budget: 10 screen / 10 files baseline; the idle side's
 // lanes go to whoever is active.
@@ -1200,10 +1200,27 @@ function streamScale(){
 }
 function requestShot(){
   if(!streaming||streamPaused||streamSuspended||!selected||!ws||ws.readyState!==1) return;
+  const wantPush=pushOK(selected.version);
+  if(wantPush&&pushActive) return; // push mode: agent self-paces; one start per stream (re-sends would restart its loop and wipe adaptive quality)
   if(inflight>=effPipe()) return; // pipeline full: wait for arrivals
   inflight++;
-  const push=pushOK(selected.version);
-  ws.send(JSON.stringify({type:"screenshot_request", target:selected.id, quality:screenQuality(), monitor:streamMonitor(), allMonitors:streamAllMonitors(), scale:streamScale(), tiles:!push, push:push}));
+  ws.send(JSON.stringify({type:"screenshot_request", target:selected.id, quality:screenQuality(), monitor:streamMonitor(), allMonitors:streamAllMonitors(), scale:streamScale(), tiles:!wantPush, push:wantPush}));
+  pushActive=wantPush;
+}
+// Frame-param controls (monitor/quality/detail/fps) are no-ops mid-push
+// (requestShot early-returns once the loop runs), so restart the loop to
+// apply them. The caller's topUpShots() right after re-sends push:start.
+function restartPush(){
+  if(!streaming) return;
+  sendPushStop(selected&&selected.id);
+  pushActive=false; inflight=0;
+}
+// Tell the agent its push loop must stop (stream stopped/paused/failed
+// over). Otherwise it captures at 30fps forever, burning CPU+bandwidth.
+function sendPushStop(id){
+  if(!pushActive||!id||!ws||ws.readyState!==1) return;
+  pushActive=false;
+  try{ ws.send(JSON.stringify({type:"screenshot_request", target:id, push:false})); }catch{}
 }
 // Fill the pipe: every arrival tops up to pipeDepth outstanding instead of
 // waiting out the interval (the old steady state kept exactly 1 in flight,
@@ -1222,7 +1239,7 @@ function scheduleNextShot(){
 $("screenStart").onclick=()=>{
   if(!selected){ toast("No agent selected", "err"); return; }
   if(!selected.connected){ toast("Agent not connected", "err"); return; }
-  streaming=true; lastFrameAt=Date.now(); inflight=0; lastFSeq=0;
+  streaming=true; lastFrameAt=Date.now(); inflight=0; lastFSeq=0; pushActive=false;
   topUpShots();
   if(streamWatch) clearInterval(streamWatch);
   streamWatch=setInterval(()=>{ if(streaming && !streamSuspended && Date.now()-lastFrameAt>3000){ if(autoFailoverStream()) return; inflight=0; topUpShots(); } },3000);
@@ -1235,9 +1252,12 @@ $("screenStart").onclick=()=>{
 // fseq/tile continuity survives the switch.
 function autoFailoverStream(){
   if(!selected) return false;
+  const oldId=selected.id;
   const sibs=agents.filter(a=>a.id!==selected.id && a.hostname && a.hostname===selected.hostname && a.connected && isRelay(a)!==isRelay(selected));
   if(!sibs.length) return false;
   sibs.sort((x,y)=>((isRelay(x)?0:1)-(isRelay(y)?0:1))); // direct first
+  sendPushStop(oldId); // halt the old loop; the push:start below restarts it on the new transport
+  pushActive=false; // cleared by sendPushStop; new transport re-sends push:start via topUp below
   selected=sibs[0];
   lastFrameAt=Date.now(); inflight=0; lastFSeq=0;
   renderConns($("connFilter").value); renderDeviceSwitch(); updateActive();
@@ -1248,6 +1268,7 @@ function autoFailoverStream(){
 }
 function stopStream(silent){
   streaming=false; streamPaused=false; streamSuspended=false; inflight=0;
+  sendPushStop(selected&&selected.id);
   if(nextShotTimer){ clearTimeout(nextShotTimer); nextShotTimer=null; }
   if(streamWatch){ clearInterval(streamWatch); streamWatch=null; }
   if(screenTimer){ clearInterval(screenTimer); screenTimer=null; }
@@ -1258,7 +1279,7 @@ function stopStream(silent){
 $("screenStop").onclick=()=>stopStream(false);
 $("followSel").onchange=()=>{ followSelMode=$("followSel").value||"auto"; const r=followRateEff(); addConsole("Follow "+followSelMode+(followSelMode==="auto"?` (auto: ${r}Hz on this link)`:(r>0?` (${r}Hz)`:" (off)"))); };
 $("pipeSel").onchange=()=>{ pipeDepth=parseInt($("pipeSel").value)||3; markPresetCustom(); addConsole("Pipeline depth "+pipeDepth); if(streaming) topUpShots(); };
-$("detailSel").onchange=()=>{ const d=$("detailSel").value||"auto"; markPresetCustom(); addConsole("Detail "+d+(d==="auto"?" (auto: "+(streamScale()===1?"full-res on this link":"half-res on this link")+")":"")); if(streaming) topUpShots(); };
+$("detailSel").onchange=()=>{ const d=$("detailSel").value||"auto"; markPresetCustom(); addConsole("Detail "+d+(d==="auto"?" (auto: "+(streamScale()===1?"full-res on this link":"half-res on this link")+")":"")); restartPush(); if(streaming) topUpShots(); };
 function applyZoom(){ const img=$("screenImg"); if(img) img.style.transform=screenZoom>1?`scale(${screenZoom})`:""; }
 $("zoomIn").onclick=()=>{ screenZoom=Math.min(4,Math.round((screenZoom+0.25)*100)/100); applyZoom(); };
 $("zoomOut").onclick=()=>{ screenZoom=Math.max(1,Math.round((screenZoom-0.25)*100)/100); applyZoom(); };
@@ -1267,7 +1288,8 @@ $("screenPause").onclick=()=>{
   streamPaused=!streamPaused;
   $("screenPause").textContent=streamPaused?"▶ Resume":"⏸ Pause";
   addConsole(streamPaused?"Stream paused (frame kept)":"Stream resumed");
-  if(!streamPaused) topUpShots();
+  if(streamPaused) sendPushStop(selected&&selected.id); // halt the agent loop; resume restarts it
+  else topUpShots();
 };
 $("saveFrame").onclick=()=>{
   const img=$("screenImg");
@@ -1388,6 +1410,7 @@ $("monitorSel").onchange=()=>{
   const v=$("monitorSel").value;
   addConsole("Monitor set to "+v);
   $("screenRes").textContent = v==="-1"?"All": v==="0"?"Primary":"Monitor "+v;
+  restartPush();
   if(streaming) topUpShots();
 };
 function markPresetCustom(){ const p=$("presetSel"); if(p) p.value="custom"; }
@@ -1397,7 +1420,7 @@ $("fpsSel").onchange=()=>{
   markPresetCustom();
   if(streaming) topUpShots();
 };
-$("qualitySel").onchange=()=>{ qualityTouched=true; markPresetCustom(); addConsole("Quality manual: "+$("qualitySel").value); if(streaming) topUpShots(); };
+$("qualitySel").onchange=()=>{ qualityTouched=true; markPresetCustom(); addConsole("Quality manual: "+$("qualitySel").value); restartPush(); if(streaming) topUpShots(); };
 // One-click display presets (Quality + FPS + Detail + Pipe together).
 function applyPreset(p){
   const q=$("qualitySel"), f=$("fpsSel"), d=$("detailSel"), pipe=$("pipeSel");
@@ -1407,6 +1430,7 @@ function applyPreset(p){
   else return;
   qualityTouched=true; pipeDepth=parseInt(pipe.value)||3;
   addConsole("Preset "+p+" (q="+q.value+" fps="+f.value+" detail="+d.value+" pipe="+pipe.value+")");
+  restartPush();
   if(streaming) topUpShots();
 }
 $("presetSel").onchange=e=>{ if(e.target.value!=="custom") applyPreset(e.target.value); };
@@ -2229,7 +2253,7 @@ $("remotePath").addEventListener("keydown", e=>{ if(e.key==="Enter"){ if(!select
 
 // Quick connect & filters
 $("connFilter").oninput=e=>renderConns(e.target.value);
-$("deviceSwitch").onchange=e=>{ selected=agents.find(a=>a.id===e.target.value); updateActive(); updateConnButtons(); refreshLimits(); };
+$("deviceSwitch").onchange=e=>{ if(streaming){ sendPushStop(selected&&selected.id); pushActive=false; inflight=0; lastFSeq=0; } selected=agents.find(a=>a.id===e.target.value); updateActive(); updateConnButtons(); refreshLimits(); if(streaming) topUpShots(); };
 function updateConnButtons(){
   const hasSel = !!selected;
   const connected = hasSel && selected.connected;

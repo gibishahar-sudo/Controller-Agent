@@ -200,8 +200,11 @@ func captureScreen() ([]byte, int, int, error) {
 // only changed 128px tiles are sent (each a small JPEG), plus a full
 // keyframe every tileKeyframeEvery generations to heal any desync. Static
 // screen = near-zero bytes; full motion degrades gracefully to keyframes.
+// 120 (was 30): transports are reliable TCP, so desync is near-impossible;
+// the old value forced a full JPEG every second at 30fps (a visible fps
+// stutter) for insurance that never pays out.
 const tileSize = 128
-const tileKeyframeEvery = 30
+const tileKeyframeEvery = 120
 
 type tileCache struct {
 	key string // dims+scale+monitor+all: any change forces a keyframe
@@ -797,6 +800,19 @@ func (a *agent) quietRemain() time.Duration {
 	return rem
 }
 
+// stopPushStream cancels an active push loop (stream stopped/paused from
+// the UI, which sends screenshot_request with push=false). Nil-guarded:
+// legacy polls (no Push field) call it on every request as a harmless
+// no-op when no loop runs.
+func (a *agent) stopPushStream() {
+	a.pushMu.Lock()
+	defer a.pushMu.Unlock()
+	if a.pushCancel != nil {
+		a.pushCancel()
+		a.pushCancel = nil
+	}
+}
+
 // startPushStream switches the agent to self-paced frame streaming
 // (v1.46.55+). The controller sends screenshot_request with push=true;
 // the agent then captures + publishes frames at its own pace until
@@ -1216,6 +1232,7 @@ func (a *agent) connectOnce() error {
 				a.startPushStream(msg.Quality, msg.Monitor, msg.AllMonitors, msg.Scale)
 				continue
 			}
+			a.stopPushStream()
 			go func(quality, monitor int, all bool, scale float64, tiles bool) {
 				if !captureSlot() {
 					_ = a.send(protocol.Message{Type: protocol.TypeScreen})
@@ -1489,6 +1506,7 @@ func relayListenOnce(a *agent, hn, user, me, caFile string) error {
 				a.startPushStream(msg.Quality, msg.Monitor, msg.AllMonitors, msg.Scale)
 				return
 			}
+			a.stopPushStream()
 			go func(quality, monitor int, all bool, scale float64, tiles bool) {
 				if !captureSlot() {
 					_ = mout(protocol.Message{Type: protocol.TypeScreen})
@@ -1781,6 +1799,7 @@ func (a *agent) connectViaMQTT() error {
 				a.startPushStream(msg.Quality, msg.Monitor, msg.AllMonitors, msg.Scale)
 				return
 			}
+			a.stopPushStream()
 			go func(quality, monitor int, all bool, scale float64, tiles bool) {
 				if !captureSlot() {
 					_ = mout(protocol.Message{Type: protocol.TypeScreen})
