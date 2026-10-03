@@ -5,6 +5,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.os.Bundle;
+import android.view.View;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.LinearLayout;
@@ -16,6 +17,10 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 
 /** One-time setup: only the UI password (kept by the operator). The
@@ -136,6 +141,10 @@ public class SetupActivity extends Activity {
 
         Button save = new Button(this);
         save.setText("Save & start console");
+        Button anyway = new Button(this);
+        anyway.setText("Open console anyway");
+        anyway.setVisibility(View.GONE);
+        anyway.setOnClickListener(unused2 -> goMain());
         save.setOnClickListener(unused -> {
             String p = password.getText().toString().trim();
             if (p.isEmpty()) {
@@ -148,12 +157,17 @@ public class SetupActivity extends Activity {
             // Restart the core so the password takes effect immediately.
             stopService(new Intent(this, RmmService.class));
             startForegroundService(new Intent(this, RmmService.class));
-            Intent i = new Intent(this, MainActivity.class);
-            i.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
-            startActivity(i);
-            finish();
+            // Prove the new password against the rebooted core before
+            // leaving: a stale core or a typo used to surface later as a
+            // bare "wrong password" on the console login page.
+            save.setEnabled(false);
+            anyway.setVisibility(View.GONE);
+            err.setTextColor(0xFF8B949E);
+            err.setText("Saved. Starting console, verifying login…");
+            verifyPassword(p, err, save, anyway);
         });
         v.addView(save);
+        v.addView(anyway);
 
         TextView diag = new TextView(this);
         String abi = android.os.Build.SUPPORTED_ABIS.length > 0
@@ -171,5 +185,68 @@ public class SetupActivity extends Activity {
         v.addView(diag);
 
         setContentView(scroll);
+    }
+
+    private void goMain() {
+        Intent i = new Intent(this, MainActivity.class);
+        i.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+        startActivity(i);
+        finish();
+    }
+
+    /** POSTs the password to the local core's login gate until it accepts
+     * (a rebooted core takes seconds) or attempts run out. Success
+     * auto-opens the console; failure stays here with the exact reason
+     * plus a manual proceed (slow devices may still be starting). */
+    private void verifyPassword(String p, TextView status, Button save, Button anyway) {
+        String esc = p.replace("\\", "\\\\").replace("\"", "\\\"");
+        byte[] body = ("{\"password\":\"" + esc + "\"}").getBytes(StandardCharsets.UTF_8);
+        new Thread(() -> {
+            String lastErr = "unreachable";
+            for (int attempt = 0; attempt < 8; attempt++) {
+                try {
+                    Thread.sleep(attempt == 0 ? 4000 : 3000);
+                } catch (InterruptedException e) {
+                    return;
+                }
+                int code = -1;
+                try {
+                    HttpURLConnection c = (HttpURLConnection)
+                            new URL("http://127.0.0.1:8080/api/login").openConnection();
+                    c.setRequestMethod("POST");
+                    c.setConnectTimeout(5000);
+                    c.setReadTimeout(5000);
+                    c.setDoOutput(true);
+                    c.setRequestProperty("Content-Type", "application/json");
+                    OutputStream out = c.getOutputStream();
+                    try {
+                        out.write(body);
+                    } finally {
+                        out.close();
+                    }
+                    code = c.getResponseCode();
+                    c.disconnect();
+                } catch (Exception e) {
+                    lastErr = "core not up yet (" + e.getClass().getSimpleName() + ")";
+                    continue;
+                }
+                if (code == 200) {
+                    runOnUiThread(() -> {
+                        status.setTextColor(0xFF7EE787);
+                        status.setText("Verified — console unlocked.");
+                        goMain();
+                    });
+                    return;
+                }
+                lastErr = "HTTP " + code + (code == 401 ? " (core runs a different password)" : "");
+            }
+            String msg = lastErr;
+            runOnUiThread(() -> {
+                status.setTextColor(0xFFF85149);
+                status.setText("Core did not accept it: " + msg + ".");
+                save.setEnabled(true);
+                anyway.setVisibility(View.VISIBLE);
+            });
+        }, "rmm-verify-pw").start();
     }
 }
