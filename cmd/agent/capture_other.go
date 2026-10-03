@@ -12,3 +12,9 @@ import (
 func captureLayered(rect image.Rectangle) (*image.RGBA, error) {
 	return nil, fmt.Errorf("layered capture is windows-only")
 }
+
+// captureLayeredScaled is Windows-only (StretchBlt downscale); elsewhere
+// the caller falls back to full-res + halveRGBA.
+func captureLayeredScaled(rect image.Rectangle) (*image.RGBA, error) {
+	return nil, fmt.Errorf("layered capture is windows-only")
+}

@@ -92,6 +92,8 @@ func encodeImage(img image.Image, quality int) (data []byte, format string, err 
 		if quality > 100 {
 			quality = 100
 		}
+		// Stdlib encodes 4:2:0 chroma always (no subsample knob to turn):
+		// already the fast/small choice for streamed video.
 		if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: quality}); err != nil {
 			return nil, "", err
 		}
@@ -165,7 +167,14 @@ func captureRaw(monitor int, all bool, scale float64) (img *image.RGBA, w, h, ox
 		// stay in one consistent (scaled) space. The effective scale is
 		// echoed on every frame (FrameScale) so the UI converts clicks
 		// back to real pixels.
-		img = halveRGBA(img)
+		if scimg, scerr := captureLayeredScaled(bounds); scerr == nil && scimg != nil {
+			// GDI downscaled during the blit: no full-res transfer, no
+			// full-frame swap, no halveRGBA pass. Falls back below on
+			// any error (non-Windows always falls back).
+			img = scimg
+		} else {
+			img = halveRGBA(img)
+		}
 		w /= 2
 		h /= 2
 		ox /= 2
