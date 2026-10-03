@@ -708,9 +708,16 @@ function connectWS(){
       }
       else if(m.type==="tile"){
         // One frame = one generation of tiles: account a single pipe slot
-        // per generation, not per tile, or the pipe over-fills.
-        if(m.fseq){ if(m.fseq!==tileAcctGen){ tileAcctGen=m.fseq; inflight=Math.max(0,inflight-1); } }
-        else inflight=Math.max(0,inflight-1);
+        // per generation, not per tile, or the pipe over-fills. The first
+        // tile of a generation is also the frame boundary for the fps
+        // meter (keyframes alone would read ~0.3fps); every tile proves
+        // the stream alive so the 3s stall watchdog doesn't fail over a
+        // healthy tile flow between (rare) keyframes.
+        if(m.fseq){
+          if(m.fseq!==tileAcctGen){ tileAcctGen=m.fseq; inflight=Math.max(0,inflight-1); pushFrameStats(Date.now(), (m.data||"").length); }
+          else { lastFrameAt=Date.now(); lastFrameBytes+=(m.data||"").length; }
+        }
+        else { inflight=Math.max(0,inflight-1); lastFrameAt=Date.now(); }
         drawTile(m); topUpShots();
       }
       else if(m.type==="update-progress"){
