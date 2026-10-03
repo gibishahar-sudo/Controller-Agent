@@ -1215,6 +1215,7 @@ function requestShot(){
   inflight++;
   ws.send(JSON.stringify({type:"screenshot_request", target:selected.id, quality:screenQuality(), monitor:streamMonitor(), allMonitors:streamAllMonitors(), scale:streamScale(), tiles:!wantPush, push:wantPush}));
   pushActive=wantPush;
+  if(wantPush){ lastFSeq=0; tileGen=0; tileAcctGen=null; } // new epoch: the agent's generation counter resets on restart, so pre-start generations are meaningless (otherwise the first post-restart keyframe is dropped as "stale" and the picture freezes)
 }
 // Frame-param controls (monitor/quality/detail/fps) are no-ops mid-push
 // (requestShot early-returns once the loop runs), so restart the loop to
@@ -1251,7 +1252,7 @@ $("screenStart").onclick=()=>{
   streaming=true; lastFrameAt=Date.now(); inflight=0; lastFSeq=0; pushActive=false;
   topUpShots();
   if(streamWatch) clearInterval(streamWatch);
-  streamWatch=setInterval(()=>{ if(streaming && !streamSuspended && Date.now()-lastFrameAt>3000){ if(autoFailoverStream()) return; inflight=0; topUpShots(); } },3000);
+  streamWatch=setInterval(()=>{ if(streaming && !streamSuspended && Date.now()-lastFrameAt>3000){ if(autoFailoverStream()) return; inflight=0; if(pushActive){ pushActive=false; addConsole("Stream starved — re-sending push:start (agent may have restarted)"); } topUpShots(); } },3000);
   $("screenStart").disabled=true; $("screenStop").disabled=false;
   addConsole("Stream started (monitor "+$("monitorSel").value+(streamAllMonitors()?", all":"")+", q="+$("qualitySel").value+")");
 };
