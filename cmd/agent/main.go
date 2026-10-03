@@ -211,6 +211,7 @@ type tileCache struct {
 	w, h int
 	stride int // row bytes of pix (RGBA stride, not assumed == w*4)
 	pix  []byte // last-sent RGBA pixels
+	hash []uint64 // per-tile FNV of pix (row-major nx*ny): diff hashes each tile ONCE per frame instead of twice (cur+prev)
 	gen  uint64
 }
 
@@ -226,11 +227,16 @@ func hashTile(pix []byte, stride, x, y, tw, th int) uint64 {
 	return h.Sum64()
 }
 
-// diffRects compares two same-stride RGBA buffers tile by tile, returning
-// changed tile rects [x,y,w,h] and the changed-pixel ratio. Pure function:
-// the unit-tested core of tile-diff streaming.
-func diffRects(cur, prev []byte, stride, w, h int) (changed [][4]int, ratio float64) {
+// diffTiles compares the current frame against the cache's per-tile hashes,
+// returning changed rects [x,y,w,h], the changed-pixel ratio, and the fresh
+// hashes (the caller stores them back). One hash pass per frame: the old
+// diffRects hashed every tile twice (cur AND prev); the prev side is now
+// free. A short/missing prevHash (geometry change) reports everything
+// changed — the caller keyframes on geometry change before diffing, so this
+// is pure defense.
+func diffTiles(cur []byte, stride, w, h int, prevHash []uint64) (changed [][4]int, ratio float64, fresh []uint64) {
 	nx, ny := (w+tileSize-1)/tileSize, (h+tileSize-1)/tileSize
+	fresh = make([]uint64, 0, nx*ny)
 	for ty := 0; ty < ny; ty++ {
 		for tx := 0; tx < nx; tx++ {
 			x, y := tx*tileSize, ty*tileSize
@@ -241,15 +247,18 @@ func diffRects(cur, prev []byte, stride, w, h int) (changed [][4]int, ratio floa
 			if y+th > h {
 				th = h - y
 			}
-			if hashTile(cur, stride, x, y, tw, th) != hashTile(prev, stride, x, y, tw, th) {
+			fh := hashTile(cur, stride, x, y, tw, th)
+			fresh = append(fresh, fh)
+			idx := ty*nx + tx
+			if idx >= len(prevHash) || fh != prevHash[idx] {
 				changed = append(changed, [4]int{x, y, tw, th})
 			}
 		}
 	}
 	if w*h == 0 {
-		return changed, 0
+		return changed, 0, fresh
 	}
-	return changed, float64(len(changed)*tileSize*tileSize) / float64(w*h)
+	return changed, float64(len(changed)*tileSize*tileSize) / float64(w*h), fresh
 }
 
 // captureTiled captures and diffs against the last-sent frame, returning
@@ -295,9 +304,10 @@ func captureTiled(quality, monitor int, all bool, scale float64) (msgs []protoco
 	cur := img.Pix
 	gen := nextFrameSeq()
 	if !keyframe {
-		ch, ratio := diffRects(cur, tileCur.pix, img.Stride, w, h)
+		ch, ratio, fresh := diffTiles(cur, img.Stride, w, h, tileCur.hash)
 		if len(ch) == 0 {
 			tileCur.gen = gen
+			tileCur.hash = fresh
 			tileMu.Unlock()
 			return []protocol.Message{{Type: protocol.TypeScreen, Width: w, Height: h, OX: ox, OY: oy, FSeq: gen, Scale: es}}, nil
 		}
@@ -309,6 +319,7 @@ func captureTiled(quality, monitor int, all bool, scale float64) (msgs []protoco
 			chCopy := append([][4]int(nil), ch...)
 			mn := img.Bounds().Min
 			tileCur.pix = append([]byte(nil), cur...)
+			tileCur.hash = fresh
 			tileCur.gen = gen
 			tileMu.Unlock()
 			for _, c := range chCopy {
@@ -331,7 +342,8 @@ func captureTiled(quality, monitor int, all bool, scale float64) (msgs []protoco
 		return nil, err
 	}
 	tileMu.Lock()
-	tileCur = &tileCache{key: key, w: w, h: h, stride: img.Stride, pix: append([]byte(nil), cur...), gen: gen}
+	_, _, freshKey := diffTiles(cur, img.Stride, w, h, nil) // all-changed; harvest hashes for the next diff
+	tileCur = &tileCache{key: key, w: w, h: h, stride: img.Stride, pix: append([]byte(nil), cur...), hash: freshKey, gen: gen}
 	tileMu.Unlock()
 	return []protocol.Message{{Type: protocol.TypeScreen, Width: w, Height: h, OX: ox, OY: oy, Data: base64.StdEncoding.EncodeToString(data), Format: format, FSeq: gen, Scale: es}}, nil
 }
@@ -831,7 +843,7 @@ func (a *agent) startPushStream(quality, monitor int, all bool, scale float64) {
 
 	go func() {
 		defer cancel()
-		interval := 33 * time.Millisecond // ~30fps target; slow captures pace the loop naturally
+		interval := 25 * time.Millisecond // ~40fps target; slow captures pace the loop naturally
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		q := quality

@@ -425,6 +425,7 @@ html{touch-action:manipulation}
       </div>
       <div class="audio-card" style="margin-top:12px">
         <h4>🎧 Local playback <span style="font-size:10px;color:#666">(my PC — this controller)</span></h4>
+        <div><label class="toggle" id="browserAudioToggle" title="Play the remote stream in THIS browser/tab instead of the controller PC's speakers — this is how tablets hear it"><input type="checkbox"/> 🔊 Play here (this browser — for tablets)</label></div>
         <div style="font-size:11px;color:#888">Which of <b>your</b> speakers/headphones future remote audio plays on. Saved per agent. No browser needed — listed natively by the controller.</div>
         <div style="margin-top:12px"><label style="font-size:11px;color:#888">My output device</label><select id="localOutDev" class="select" style="width:100%;margin-top:6px"><option value="">Default</option></select></div>
         <div style="margin-top:8px;display:flex;gap:8px"><button class="btn btn-small" id="localAudioRefresh">⟳ Refresh mine</button><button class="btn btn-small" id="localAudioTest">🔔 Test tone</button></div>
@@ -776,6 +777,7 @@ function connectWS(){
       else if(m.type==="mouse"){ $("mousePos").textContent=m.x+","+m.y; if(m.id===(selected&&selected.id)) positionRemoteCursor(m.x,m.y); }
       else if(m.type==="filelist"){ renderFileList(m.isRemote?"remoteList":"localList", m.data);}
       else if(m.type==="audiolist"){ renderAudioDevices(m.data); }
+      else if(m.type==="browser_audio"){ browserAudioChunk(m); }
       else if(m.type==="pong"){ const ms=Date.now()-latencyStart; if(selected) selected.latency=ms; $("latency").textContent=ms+" ms"; $("latency").className="latency"+(ms<80?"":ms<180?" warn":" bad");}
     }catch(err){ console.error(err); }
   };
@@ -1545,7 +1547,7 @@ $("showTokenBtn").onclick=()=>{
   }).catch(e=>addTerm("Token fetch failed: "+(e.message||e),"err"));
 };
 
-$("audioStart").onclick=()=>{ if(!selected){ toast("No agent", "err"); return; } sendCmdVal("get-audio-devices"); sendCmdVal(audioStreamCmd()); addConsole("Audio streaming requested ("+audioSrc+") — plays on your ["+localOutName()+"] (~250ms delay)"); $("audioStart").disabled=true; $("audioStop").disabled=false; };
+$("audioStart").onclick=()=>{ if(!selected){ toast("No agent", "err"); return; } const here=browserPlayHere(); sendCmdVal("get-audio-devices"); sendCmdVal(audioStreamCmd()); if(here){ browserAudioStart(); addConsole("Audio streaming ("+audioSrc+") — playing HERE in this browser (~300ms delay)"); } else addConsole("Audio streaming requested ("+audioSrc+") — plays on your ["+localOutName()+"] (~250ms delay)"); $("audioStart").disabled=true; $("audioStop").disabled=false; };
 $("audioStop").onclick=()=>{ if(selected) sendCmdVal("stop-audio-stream"); stopLocalPlayback(); addConsole("Audio stream stopped"); $("audioStart").disabled=false; $("audioStop").disabled=true; };
 $("muteBtn").onclick=()=>{ if(!selected) return; sendCmdVal("set-mic-mute on"); addConsole("Mute toggled"); };
 $("volSlider").oninput=e=>{ $("volLabel").textContent=e.target.value+"%"; };
@@ -2446,7 +2448,85 @@ document.querySelectorAll('[data-src]').forEach(btn=>{
 });
 async function stopLocalPlayback(){
   try{ await fetch("/api/local-audio-stop", {method:"POST"}); }catch{}
+  browserAudioStop(); // also drop any browser (tablet) subscription
 }
+// Browser playback (v1.46.58+): tablets/remote browsers can't hear the
+// controller PC's speakers, so decoded PCM is fanned out over WS and
+// played here via Web Audio. s16 mono 22050Hz, 50ms blocks, seq-ordered
+// jitter buffer (~200ms), silence concealment on gaps.
+const browserAudio={ ctx:null, gain:null, next:0, pending:new Map(), expect:-1, played:0, dropped:0, concealed:0 };
+function browserAudioOn(){
+  if(browserAudio.ctx) { if(browserAudio.ctx.state==="suspended") browserAudio.ctx.resume().catch(()=>{}); return true; }
+  try{
+    const AC=window.AudioContext||window.webkitAudioContext; if(!AC) return false;
+    browserAudio.ctx=new AC({sampleRate:22050});
+    browserAudio.gain=browserAudio.ctx.createGain();
+    browserAudio.gain.gain.value=Math.pow(localVolVal()/100,1.5);
+    browserAudio.gain.connect(browserAudio.ctx.destination);
+    browserAudio.next=0; browserAudio.pending.clear(); browserAudio.expect=-1;
+    setInterval(browserAudioPump, 50);
+    return true;
+  }catch{ return false; }
+}
+function browserAudioChunk(m){
+  if(!browserAudio.ctx||!selected) return;
+  if(m.id&&selected.hostname&&m.id!==selected.hostname) return; // another agent's stream
+  let raw; try{ raw=atob(m.data||""); }catch{ return; }
+  if(!raw.length||raw.length%2) return;
+  const n=raw.length/2, f=new Float32Array(n);
+  for(let i=0;i<n;i++){ const v=(raw.charCodeAt(2*i)|(raw.charCodeAt(2*i+1)<<8)); f[i]=(v>32767?v-65536:v)/32768; }
+  const seq=m.seq|0;
+  if(browserAudio.expect>=0&&seq<browserAudio.expect-5) return; // stale resend
+  if(browserAudio.pending.has(seq)) return;
+  if(browserAudio.pending.size>40){ browserAudio.dropped++; return; } // saturated: shed, don't balloon
+  browserAudio.pending.set(seq, f);
+}
+function browserAudioPump(){
+  const B=browserAudio; if(!B.ctx||B.ctx.state!=="running") return;
+  const ctx=B.ctx, sr=ctx.sampleRate, blkLen=1102/sr;
+  if(B.next<ctx.currentTime) B.next=ctx.currentTime+0.05;
+  if(B.next>ctx.currentTime+0.35) return; // ~200ms buffered: hold
+  let seq=B.expect<0 ? Math.min(...B.pending.keys()) : B.expect;
+  if(!B.pending.has(seq)){
+    if(B.expect<0) return; // priming: wait for first block
+    B.concealed++; B.expect++; // gap: 50ms silence keeps the clock
+    const s=ctx.createBuffer(1, Math.round(sr*0.05), sr); B.next=scheduleBuf(ctx, B.gain, s, B.next); return;
+  }
+  const f=B.pending.get(seq); B.pending.delete(seq); B.expect=seq+1; B.played++;
+  const buf=ctx.createBuffer(1, Math.round(f.length*sr/22050), sr);
+  const d=buf.getChannelData(0);
+  for(let i=0;i<d.length;i++){ const p=i*22050/sr, i0=Math.floor(p), fr=p-i0; d[i]=f[i0]*(1-fr)+(f[Math.min(i0+1,f.length-1)]*fr); }
+  B.next=scheduleBuf(ctx, B.gain, buf, B.next);
+  const el=$("audioHealth"); if(el&&B.played%20===0) el.textContent=`browser: played ${B.played} dropped ${B.dropped} concealed ${B.concealed}`;
+}
+function scheduleBuf(ctx, gain, buf, when){
+  const src=ctx.createBufferSource(); src.buffer=buf; src.connect(gain); src.start(Math.max(when, ctx.currentTime));
+  return Math.max(when, ctx.currentTime)+buf.duration;
+}
+function browserAudioStop(){
+  const B=browserAudio;
+  if(selected&&ws&&ws.readyState===1){ try{ ws.send(JSON.stringify({type:"browser_audio", target:selected.id, on:false})); }catch{} }
+  B.pending.clear(); B.expect=-1; B.next=0;
+  if(B.ctx){ B.ctx.suspend().catch(()=>{}); }
+}
+function browserAudioStart(){
+  if(!selected) return false;
+  if(!browserAudioOn()){ toast("Browser audio unsupported here", "err"); return false; }
+  try{ ws.send(JSON.stringify({type:"browser_audio", target:selected.id, on:true})); }catch{}
+  return true;
+}
+// "Play here" toggle: tablets default ON (the controller's speakers are a
+// different room); desktop defaults OFF (native path unchanged).
+(function(){
+  const box=document.querySelector("#browserAudioToggle input"); if(!box) return;
+  const coarse=matchMedia&&matchMedia("(pointer:coarse)").matches;
+  const small=Math.min(screen.width||9999, screen.height||9999)<700;
+  box.checked=!!(coarse||small);
+  const lbl=document.querySelector("#browserAudioToggle");
+  const paint=()=>{ if(lbl) lbl.childNodes[1].textContent=box.checked?" 🔊 Play here: ON":" 🔊 Play here (this browser — for tablets)"; };
+  box.addEventListener("change", paint); paint();
+})();
+function browserPlayHere(){ return !!document.querySelector("#browserAudioToggle input")?.checked; }
 function localOutName(){ return $("localOutDev")?.value||"Default"; }
 $("audioRefresh")?.addEventListener("click", ()=>{
   if(!selected){ toast("No agent", "err"); return; }
@@ -2551,9 +2631,10 @@ $("localOutDev")?.addEventListener("change", ()=>{
 });
 $("localVol")?.addEventListener("input", e=>{ $("localVolL").textContent=e.target.value+"%"; });
 $("localVol")?.addEventListener("change", ()=>{
-  saveLocalChoice($("localOutDev")?.value||"");
   $("localAudioStatus").textContent=`My volume: ${localVolVal()}% (applies to live streams)`;
+  saveLocalChoice($("localOutDev")?.value||"");
 });
+$("localVol")?.addEventListener("input", ()=>{ if(browserAudio.gain) browserAudio.gain.gain.value=Math.pow(localVolVal()/100,1.5); });
 $("clarityToggle")?.addEventListener("click", e=>{
   const t=e.currentTarget, cb=t.querySelector("input");
   cb.checked=!cb.checked; t.classList.toggle("on", cb.checked);

@@ -961,6 +961,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		s.wsMu.Lock()
 		delete(s.wsClients, c)
 		s.wsMu.Unlock()
+		s.clearBrowserAudioSub(c)
 		raw.Close()
 	}()
 	_ = raw.SetReadDeadline(time.Now().Add(60 * time.Second))
@@ -1006,6 +1007,19 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			_ = s.sendToAgent(ac, protocol.Message{Type: protocol.TypeCommand, Cmd: cmd, CmdID: cmdID})
+		case "browser_audio":
+			// Tablet/remote-browser listening: subscribe this UI to the
+			// agent's decoded PCM (played via Web Audio). on=false or
+			// missing target unsubscribes. Host-keyed: ingestAudioChunk
+			// fans out by hostname.
+			on, _ := msg["on"].(bool)
+			host := ""
+			if on {
+				if ac := s.getAgentByID(target); ac != nil {
+					host = ac.hostname
+				}
+			}
+			s.setBrowserAudioSub(c, host)
 		case "screenshot_request":
 			ac := s.getAgentByID(target)
 			if ac == nil {

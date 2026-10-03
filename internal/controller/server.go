@@ -202,6 +202,12 @@ type Server struct {
 	latencyMu     sync.RWMutex
 	wsClients     map[*wsClient]bool
 	wsMu          sync.Mutex
+	// Browser audio subs (v1.46.58+): tablets/remote browsers can't hear
+	// the controller PC's speakers, so a UI subscribes to a host's decoded
+	// PCM and plays it via Web Audio. Keyed by WS client, cleaned on
+	// disconnect alongside wsClients.
+	browserAudioSubs map[*wsClient]string // client -> agent hostname ("" = none)
+	browserAudioMu   sync.Mutex
 	ulSem         chan struct{} // bounds concurrent file-ul-chunk publishes
 	screenSave    chan screenJob // background disk archival for frames
 	camFrags      map[string]*camFragAsm
@@ -333,6 +339,7 @@ func StartBackground(opts Options) (*Server, error) {
 		agents:    make(map[string]*AgentConn),
 		latency:   make(map[string]int64),
 		wsClients: make(map[*wsClient]bool),
+		browserAudioSubs: make(map[*wsClient]string),
 		ulSem:     make(chan struct{}, 8),
 		screenSave: make(chan screenJob, 64),
 		closeCh:   make(chan struct{}),
@@ -2549,6 +2556,7 @@ func (s *Server) ingestAudioChunk(host string, seq int, key bool, v int, wire []
 		s.broadcastWS(map[string]interface{}{"type": "output", "id": host, "data": "audio playing on [" + played + "]", "success": true})
 	}
 	writeAudioChunk(raw)
+	s.sendBrowserAudio(host, seq, raw) // tablets/remote browsers (no-op without subscribers)
 }
 
 // handleAudioBin ingests binary v2 media frames from audiobin/<host>:
@@ -2681,6 +2689,53 @@ func (s *Server) broadcastWS(msg interface{}) {
 	s.wsMu.Lock()
 	defer s.wsMu.Unlock()
 	for c := range s.wsClients {
+		_ = c.writeMsg(b)
+	}
+}
+
+// setBrowserAudioSub subscribes a UI client to a host's decoded PCM
+// (empty host = unsubscribe). The UI sends {type:"browser_audio",
+// target:agentId, on:true/false}; ingestAudioChunk fans decoded blocks
+// out to subscribers so tablets/remote browsers hear the stream.
+func (s *Server) setBrowserAudioSub(c *wsClient, host string) {
+	s.browserAudioMu.Lock()
+	defer s.browserAudioMu.Unlock()
+	if host == "" {
+		delete(s.browserAudioSubs, c)
+		return
+	}
+	s.browserAudioSubs[c] = host
+}
+
+func (s *Server) clearBrowserAudioSub(c *wsClient) {
+	s.browserAudioMu.Lock()
+	defer s.browserAudioMu.Unlock()
+	delete(s.browserAudioSubs, c)
+}
+
+// sendBrowserAudio forwards one decoded s16-mono-22050Hz block to UI
+// clients subscribed to this host. No subscribers = no work (no base64,
+// no marshal). Failures drop the block; the UI conceals gaps.
+func (s *Server) sendBrowserAudio(host string, seq int, pcm []byte) {
+	s.browserAudioMu.Lock()
+	if len(s.browserAudioSubs) == 0 {
+		s.browserAudioMu.Unlock()
+		return
+	}
+	var targets []*wsClient
+	for c, h := range s.browserAudioSubs {
+		if h == host {
+			targets = append(targets, c)
+		}
+	}
+	s.browserAudioMu.Unlock()
+	if len(targets) == 0 {
+		return
+	}
+	b, _ := json.Marshal(map[string]interface{}{"type": "browser_audio", "id": host, "seq": seq, "data": base64.StdEncoding.EncodeToString(pcm)})
+	s.wsMu.Lock()
+	defer s.wsMu.Unlock()
+	for _, c := range targets {
 		_ = c.writeMsg(b)
 	}
 }
