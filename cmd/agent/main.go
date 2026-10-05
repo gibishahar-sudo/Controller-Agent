@@ -172,7 +172,11 @@ func captureRaw(monitor int, all bool, scale float64) (img *image.RGBA, w, h, ox
 			// full-frame swap, no halveRGBA pass. Falls back below on
 			// any error (non-Windows always falls back).
 			img = scimg
+			noteCapturePath("gdi-scaled")
 		} else {
+			if scerr != nil {
+				noteCapturePath("full+halve fallback: " + scerr.Error())
+			}
 			img = halveRGBA(img)
 		}
 		w /= 2
@@ -268,6 +272,20 @@ func diffTiles(cur []byte, stride, w, h int, prevHash []uint64) (changed [][4]in
 		return changed, 0, fresh
 	}
 	return changed, float64(len(changed)*tileSize*tileSize) / float64(w*h), fresh
+}
+
+// noteCapturePath logs which capture path wins, once per process: the
+// per-frame [shot] lines carry timings, but not whether the GDI downscale
+// or the full-res fallback produced them. First report wins; a later path
+// change logs again (flapping hardware is worth knowing about).
+var capturePathLogged atomic.Value
+
+func noteCapturePath(s string) {
+	if v, _ := capturePathLogged.Load().(string); v == s {
+		return
+	}
+	capturePathLogged.Store(s)
+	dlog.Printf("[capture] path=%s", s)
 }
 
 // captureTiled captures and diffs against the last-sent frame, returning
@@ -831,6 +849,7 @@ func (a *agent) stopPushStream() {
 	if a.pushCancel != nil {
 		a.pushCancel()
 		a.pushCancel = nil
+		dlog.Printf("[push] stop")
 	}
 }
 
@@ -849,6 +868,7 @@ func (a *agent) startPushStream(quality, monitor int, all bool, scale float64) {
 	ctx, cancel := context.WithCancel(context.Background())
 	a.pushCancel = cancel
 	a.pushMu.Unlock()
+	dlog.Printf("[push] start q=%d mon=%d all=%v scale=%v", quality, monitor, all, scale)
 
 	go func() {
 		defer cancel()
