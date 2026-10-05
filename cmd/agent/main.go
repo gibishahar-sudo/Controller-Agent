@@ -885,6 +885,7 @@ func (a *agent) startPushStream(quality, monitor int, all bool, scale float64) {
 			sc = 0.5
 		}
 		var emaMs float64
+		var sendFails, capHangs int
 		for {
 			select {
 			case <-ctx.Done():
@@ -895,9 +896,51 @@ func (a *agent) startPushStream(quality, monitor int, all bool, scale float64) {
 				if !captureSlot() {
 					continue
 				}
+				// Capture hang watchdog: a wedged GDI call (dead driver,
+				// vanished display) blocks forever and would freeze the
+				// loop with zero evidence. Bound it: run the capture
+				// aside, reap the slot on timeout, drop the orphan's
+				// result (buffered chan, no goroutine leak). The orphan's
+				// tile-cache advance may skip one delta on the UI; the
+				// next keyframe heals it. A permanently wedged capture
+				// exits after 3 hangs so a fresh loop (UI re-push) retries
+				// instead of spinning silent timeouts.
+				type capRes struct {
+					msgs []protocol.Message
+					err  error
+				}
+				resCh := make(chan capRes, 1)
 				c0 := time.Now()
-				msgs, err := captureTiled(q, monitor, all, sc)
+				go func() {
+					msgs, err := captureTiled(q, monitor, all, sc)
+					resCh <- capRes{msgs, err}
+				}()
+				var msgs []protocol.Message
+				var err error
+				capOK := true
+				select {
+				case r := <-resCh:
+					msgs, err = r.msgs, r.err
+				case <-time.After(5 * time.Second):
+					capOK = false
+				case <-ctx.Done():
+					releaseSlot()
+					return
+				case <-a.closing:
+					releaseSlot()
+					return
+				}
 				releaseSlot()
+				if !capOK {
+					capHangs++
+					dlog.Printf("[push] capture hung >5s (%d consecutive), slot reaped", capHangs)
+					if capHangs >= 3 {
+						dlog.Printf("[push] capture wedged, exiting loop (re-push retries)")
+						return
+					}
+					continue
+				}
+				capHangs = 0
 				if err != nil {
 					continue
 				}
@@ -921,9 +964,21 @@ func (a *agent) startPushStream(quality, monitor int, all bool, scale float64) {
 				if len(msgs) == 0 {
 					continue
 				}
+				// Send-failure budget: one failed publish used to kill the
+				// whole loop (a transient blip cost a 3s+ stall until the
+				// UI re-pushed). Now a failing publish drops one frame and
+				// the loop survives; only a persistently dead transport
+				// (10 in a row) exits, and the UI re-push retries.
 				if err := sendShotMsgs(a.send, msgs); err != nil {
-					return // transport dead; loop exits, next push restarts
+					sendFails++
+					dlog.Printf("[push] publish failed (%d consecutive): %v", sendFails, err)
+					if sendFails >= 10 {
+						dlog.Printf("[push] transport dead, exiting loop (re-push retries)")
+						return
+					}
+					continue
 				}
+				sendFails = 0
 			}
 		}
 	}()
