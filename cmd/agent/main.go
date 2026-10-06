@@ -348,6 +348,62 @@ func diffTiles(cur []byte, stride, w, h int, prevHash []uint64) (changed [][4]in
 	return changed, float64(len(changed)*tileSize*tileSize) / float64(w*h), fresh
 }
 
+// encodeTiles JPEGs one frame's changed tiles. Fewer than 4 tiles go
+// serial (goroutine overhead exceeds the win); the rest spread over a
+// bounded worker pool — 15 tiles x ~1ms serial was ~15ms of stage B per
+// high-change frame. SubImage shares read-only pixels (safe concurrent
+// use); results rejoin in rect order so output stays deterministic.
+// Pure apart from encoding: safe to unit-test around encodeImage.
+func encodeTiles(img *image.RGBA, mn image.Point, rects [][4]int, ox, oy, quality int, gen uint64, es float64) ([]protocol.Message, error) {
+	mk := func(c [4]int) (protocol.Message, error) {
+		sub := img.SubImage(image.Rect(mn.X+c[0], mn.Y+c[1], mn.X+c[0]+c[2], mn.Y+c[1]+c[3]))
+		data, _, err := encodeImage(sub, quality)
+		if err != nil {
+			return protocol.Message{}, err
+		}
+		return protocol.Message{Type: protocol.TypeTile, Width: c[2], Height: c[3], OX: ox + c[0], OY: oy + c[1], Data: base64.StdEncoding.EncodeToString(data), Format: "jpeg", FSeq: gen, Scale: es}, nil
+	}
+	if len(rects) < 4 {
+		out := make([]protocol.Message, 0, len(rects))
+		for _, c := range rects {
+			m, err := mk(c)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, m)
+		}
+		return out, nil
+	}
+	type slot struct {
+		idx int
+		msg protocol.Message
+		err error
+	}
+	resCh := make(chan slot, len(rects))
+	sem := make(chan struct{}, 4)
+	var wg sync.WaitGroup
+	for i, c := range rects {
+		wg.Add(1)
+		go func(i int, c [4]int) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			m, err := mk(c)
+			resCh <- slot{i, m, err}
+		}(i, c)
+	}
+	wg.Wait()
+	close(resCh)
+	out := make([]protocol.Message, len(rects))
+	for r := range resCh {
+		if r.err != nil {
+			return nil, r.err
+		}
+		out[r.idx] = r.msg
+	}
+	return out, nil
+}
+
 // noteCapturePath logs which capture path wins, once per process: the
 // per-frame [shot] lines carry timings, but not whether the GDI downscale
 // or the full-res fallback produced them. First report wins; a later path
@@ -436,15 +492,11 @@ func diffEncode(img *image.RGBA, w, h, ox, oy int, s0 uint64, capMs int64, quali
 			tileCur.hash = fresh
 			tileCur.gen = gen
 			tileMu.Unlock()
-			for _, c := range chCopy {
-				sub := img.SubImage(image.Rect(mn.X+c[0], mn.Y+c[1], mn.X+c[0]+c[2], mn.Y+c[1]+c[3]))
-				data, _, err := encodeImage(sub, tq)
-				if err != nil {
-					return nil, err
-				}
-				msgs = append(msgs, protocol.Message{Type: protocol.TypeTile, Width: c[2], Height: c[3], OX: ox + c[0], OY: oy + c[1], Data: base64.StdEncoding.EncodeToString(data), Format: "jpeg", FSeq: gen, Scale: es})
+			tmsgs, terr := encodeTiles(img, mn, chCopy, ox, oy, tq, gen, es)
+			if terr != nil {
+				return nil, terr
 			}
-			return msgs, nil
+			return tmsgs, nil
 		}
 		keyframe = true // most of the frame changed: keyframe is cheaper
 		tileMu.Unlock()
@@ -1097,6 +1149,7 @@ func (a *agent) startPushStream(quality, monitor int, all bool, scale float64) {
 		interval := baseInterval
 		var emaMs float64
 		var sendFails, idleBeats int
+		var bEmaMs float64 // stage B's own pace (diff+encode+send): paces stage A
 		lastPace := paceCtl{interval: interval, q: q, sc: scCur}
 		maybeSendPace := func() {
 			p := paceCtl{interval: interval, q: q, sc: scCur}
@@ -1208,11 +1261,20 @@ func (a *agent) startPushStream(quality, monitor int, all bool, scale float64) {
 				// 25ms -> 100ms -> 250ms so an idle box stops burning a
 				// core on identical captures; any real frame snaps back
 				// to full pace within one beat. The UI stall watchdog
-				// (3s) stays fed throughout.
+				// (3s) stays fed throughout. Coupled with stage B's own
+				// measured rate: when B lags (slow link, big keyframes),
+				// A captures at B's pace instead of burning captures B
+				// drops — same throughput, far less wasted GDI work.
 				if len(msgs) == 1 && msgs[0].Type == protocol.TypeScreen && msgs[0].Data == "" {
 					idleBeats++
 				} else {
 					idleBeats = 0
+				}
+				bMs := time.Since(t1).Milliseconds()
+				if bEmaMs == 0 {
+					bEmaMs = float64(bMs)
+				} else {
+					bEmaMs = 0.2*float64(bMs) + 0.8*bEmaMs
 				}
 				prev := interval
 				switch {
@@ -1223,8 +1285,11 @@ func (a *agent) startPushStream(quality, monitor int, all bool, scale float64) {
 				default:
 					interval = baseInterval
 				}
+				if bms := int64(bEmaMs); bms > interval.Milliseconds() {
+					interval = time.Duration(bms) * time.Millisecond
+				}
 				if interval != prev {
-					dlog.Printf("[push] idle %d beats, pace %v", idleBeats, interval)
+					dlog.Printf("[push] pace %v (idle %d, bEma %.0fms)", interval, idleBeats, bEmaMs)
 				}
 				maybeSendPace()
 			}
