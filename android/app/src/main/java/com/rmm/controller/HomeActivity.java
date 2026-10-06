@@ -30,6 +30,8 @@ public class HomeActivity extends Activity {
     private static final String QUEUE_KEY = "rmm_queue"; // ts \u0001 target \u0001 cmd
     private static final String SEP = String.valueOf((char) 1);
     private static final int VOICE_REQ = 0x5A1;
+    /** Intent extra: hotword heard "Jarvis" — jump straight to listening. */
+    public static final String EXTRA_AUTOLISTEN = "rmm_autolisten";
 
     private TextView statusText;
     private ListView agentList;
@@ -78,6 +80,7 @@ public class HomeActivity extends Activity {
             refreshStatus();
             flushQueue(false);
         }
+        consumeAutolisten();
     }
 
     private LinearLayout row() {
@@ -184,6 +187,22 @@ public class HomeActivity extends Activity {
         if (crash != null && !crash.isEmpty()) {
             showCrash(crash);
         }
+        consumeAutolisten();
+    }
+
+    /** Hotword wake: the listener heard "Jarvis" — jump straight into the
+     * recognizer (the P1 flow takes it from there; the operator still taps
+     * Send). Consumed once per wake. */
+    private void consumeAutolisten() {
+        Intent i = getIntent();
+        if (i == null || !i.getBooleanExtra(HotwordService.EXTRA_AUTOLISTEN, false)) {
+            return;
+        }
+        i.removeExtra(HotwordService.EXTRA_AUTOLISTEN);
+        if (cmdInput == null) {
+            return; // init deferred (applock); onResume will retry
+        }
+        startVoiceInput();
     }
 
     private void showCrash(String crash) {

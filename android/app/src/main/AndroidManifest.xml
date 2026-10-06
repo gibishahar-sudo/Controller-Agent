@@ -5,7 +5,12 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Jarvis hotword: on-device only (Porcupine/Vosk never transmit).
+         Runtime grant is asked when listening is enabled, never at install.
+         Android shows a mic indicator while listening — by OS design. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
 
     <application
         android:name=".RmmApp"
@@ -37,6 +42,10 @@
             android:name=".RmmService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
+        <service
+            android:name=".HotwordService"
+            android:exported="false"
+            android:foregroundServiceType="microphone" />
         <receiver
             android:name=".RmmWidget"
             android:exported="false">

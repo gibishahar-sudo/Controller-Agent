@@ -34,6 +34,10 @@ public class SetupActivity extends Activity {
     public static final String PREFS = "rmm_setup";
     public static final String KEY_PASSWORD = "ui_password";
     public static final String KEY_MONBTN = "monbtn";
+    public static final String KEY_HOTWORD = "hotword";
+    public static final String KEY_PORCUPINE = "porcupine_key";
+    private static final int REQ_MIC = 7101;
+    private TextView hwStatusView;
 
     public static boolean monbtnEnabled(Context c) {
         return c.getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(KEY_MONBTN, true);
@@ -169,6 +173,64 @@ public class SetupActivity extends Activity {
         v.addView(save);
         v.addView(anyway);
 
+        // Jarvis hotword: on-device only. Porcupine (free access key) is
+        // primary; empty key falls back to Vosk (~50MB model, hungrier).
+        // Android shows a mic indicator while listening — OS design.
+        TextView hwTitle = new TextView(this);
+        hwTitle.setText("🎤 Listen for Jarvis");
+        hwTitle.setTextColor(0xFFD6DEEB);
+        hwTitle.setTextSize(12);
+        v.addView(hwTitle);
+
+        android.widget.CheckBox hwToggle = new android.widget.CheckBox(this);
+        hwToggle.setText("Always listen on this tablet");
+        hwToggle.setTextColor(0xFFD6DEEB);
+        hwToggle.setTextSize(12);
+        hwToggle.setChecked(pref(this, KEY_HOTWORD, "").equals("1"));
+        v.addView(hwToggle);
+
+        EditText hwKey = new EditText(this);
+        hwKey.setHint("Porcupine access key (empty = Vosk fallback)");
+        hwKey.setHintTextColor(0xFF8B949E);
+        hwKey.setTextColor(0xFFD6DEEB);
+        hwKey.setTypeface(android.graphics.Typeface.MONOSPACE);
+        hwKey.setTextSize(13);
+        hwKey.setInputType(android.text.InputType.TYPE_CLASS_TEXT
+                | android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        hwKey.setText(pref(this, KEY_PORCUPINE, ""));
+        v.addView(hwKey);
+
+        TextView hwStatus = new TextView(this);
+        hwStatus.setTextColor(0xFF8B949E);
+        hwStatus.setTextSize(11);
+        v.addView(hwStatus);
+        hwStatusView = hwStatus;
+        Runnable paintHw = () -> hwStatus.setText("hotword: " + HotwordService.status(this));
+
+        Button hwSave = new Button(this);
+        hwSave.setText("Save hotword settings");
+        hwSave.setOnClickListener(unused2 -> {
+            getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                    .putString(KEY_PORCUPINE, hwKey.getText().toString().trim())
+                    .putString(KEY_HOTWORD, hwToggle.isChecked() ? "1" : "")
+                    .apply();
+            if (!hwToggle.isChecked()) {
+                stopService(new Intent(this, HotwordService.class));
+                paintHw.run();
+                return;
+            }
+            if (checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
+                    == android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                startForegroundService(new Intent(this, HotwordService.class));
+                err.setText("Hotword starting — watch the status line.");
+            } else {
+                requestPermissions(
+                        new String[]{android.Manifest.permission.RECORD_AUDIO}, REQ_MIC);
+            }
+            paintHw.run();
+        });
+        v.addView(hwSave);
+
         TextView diag = new TextView(this);
         String abi = android.os.Build.SUPPORTED_ABIS.length > 0
                 ? android.os.Build.SUPPORTED_ABIS[0] : "?";
@@ -185,6 +247,27 @@ public class SetupActivity extends Activity {
         v.addView(diag);
 
         setContentView(scroll);
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        // Refresh hotword status each visit (service updates it live).
+        if (hwStatusView != null) {
+            hwStatusView.setText("hotword: " + HotwordService.status(this));
+        }
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] results) {
+        super.onRequestPermissionsResult(requestCode, permissions, results);
+        if (requestCode != REQ_MIC) {
+            return;
+        }
+        if (results.length > 0 && results[0] == android.content.pm.PackageManager.PERMISSION_GRANTED
+                && pref(this, KEY_HOTWORD, "").equals("1")) {
+            startForegroundService(new Intent(this, HotwordService.class));
+        }
     }
 
     private void goMain() {

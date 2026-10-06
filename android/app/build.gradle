@@ -11,9 +11,9 @@ android {
         minSdk = 28
         targetSdk = 34
         // Suite version is mirrored manually on each release:
-        // versionName = suite (e.g. 1.46.73), versionCode = M*1000000+m*1000+p.
-        versionCode = 1046073
-        versionName = "1.46.73"
+        // versionName = suite (e.g. 1.46.74), versionCode = M*1000000+m*1000+p.
+        versionCode = 1046074
+        versionName = "1.46.74"
     }
 
     signingConfigs {
@@ -49,6 +49,10 @@ dependencies {
     // gomobile bind -androidapi 28 -target android/arm64
     //   -o android/app/libs/rmm.aar rmm/mobile)
     implementation(files("libs/rmm.aar"))
+    // Jarvis hotword: Porcupine wake-word (primary, needs access key) +
+    // Vosk keyword spotting (fallback, needs ~50MB model at runtime).
+    implementation("ai.picovoice:porcupine-android:4.0.2")
+    implementation("com.alphacephei:vosk-android:0.3.75")
 }
 
 // Bundled controller identity (used by SetupActivity.ensureIdentity):
