@@ -12,7 +12,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"hash/fnv"
 	"image"
 	"image/jpeg"
 	"image/png"
@@ -119,7 +118,9 @@ func halveBGRAsrc(src []byte, stride, w, h int) *image.RGBA {
 					a += uint32(src[i+3])
 				}
 			}
-			j := dst.PixOffset(x, y)
+			// Hand-rolled offset (bounds are loop-guaranteed): PixOffset's
+			// call overhead dominated this loop in profiles.
+			j := (y*dw + x) * 4
 			dst.Pix[j] = uint8(r / 4)
 			dst.Pix[j+1] = uint8(g / 4)
 			dst.Pix[j+2] = uint8(b / 4)
@@ -293,12 +294,24 @@ var tileMu sync.Mutex
 var tileCur *tileCache
 
 func hashTile(pix []byte, stride, x, y, tw, th int) uint64 {
-	h := fnv.New64a()
+	// Inline FNV-1a/64 over row-major bytes: bit-identical values to
+	// hash/fnv (the tile cache compares across builds, so the values must
+	// never change), but one pass with no per-row method calls on the
+	// hottest path (60+ tiles x 128 rows per frame).
+	const (
+		offset64 = 14695981039346656037
+		prime64  = 1099511628211
+	)
+	h := uint64(offset64)
 	for row := 0; row < th; row++ {
 		off := (y+row)*stride + x*4
-		h.Write(pix[off : off+tw*4])
+		end := off + tw*4
+		for i := off; i < end; i++ {
+			h ^= uint64(pix[i])
+			h *= prime64
+		}
 	}
-	return h.Sum64()
+	return h
 }
 
 // diffTiles compares the current frame against the cache's per-tile hashes,
@@ -945,6 +958,7 @@ func (a *agent) startPushStream(quality, monitor int, all bool, scale float64) {
 		if sc <= 0 {
 			sc = 0.5
 		}
+		scCur := sc // adaptive resolution may step this down (never up) within the stream
 		var emaMs float64
 		var sendFails, capHangs, idleBeats int
 		baseInterval := 25 * time.Millisecond // ~40fps target; slow captures pace the loop naturally
@@ -978,7 +992,7 @@ func (a *agent) startPushStream(quality, monitor int, all bool, scale float64) {
 					resCh := make(chan capRes, 1)
 					c0 := time.Now()
 					go func() {
-						msgs, err := captureTiled(q, monitor, all, sc)
+						msgs, err := captureTiled(q, monitor, all, scCur)
 						resCh <- capRes{msgs, err}
 					}()
 					var msgs []protocol.Message
@@ -1043,6 +1057,29 @@ func (a *agent) startPushStream(quality, monitor int, all bool, scale float64) {
 							return true
 						}
 						return false
+					}
+					// Adaptive resolution: quality already floored at 40 and the
+					// box still can't keep up on REAL frames (heartbeats don't
+					// count — stillness must never cost detail). Steps down
+					// 1.0->0.5->0.25, never up within a stream (oscillation
+					// costs a keyframe + geometry jump each way; stability
+					// wins). A stream restart restores the requested scale.
+					// The tile key includes scale, so each step keyframes once.
+					realFrame := false
+					for _, m := range msgs {
+						if m.Data != "" {
+							realFrame = true
+							break
+						}
+					}
+					if realFrame && emaMs > 120 && q <= 40 && scCur > 0.25 {
+						prevSc := scCur
+						if scCur > 0.5 {
+							scCur = 0.5
+						} else {
+							scCur = 0.25
+						}
+						dlog.Printf("[push] weak box: resolution %.2g->%.2g (restores on restart)", prevSc, scCur)
 					}
 					sendFails = 0
 					// Idle backoff: heartbeats (nothing changed) slow the pace

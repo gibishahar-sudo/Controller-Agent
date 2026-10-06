@@ -1,6 +1,7 @@
 package main
 
 import (
+	"hash/fnv"
 	"testing"
 )
 
@@ -58,5 +59,26 @@ func TestDiffTilesShortPrev(t *testing.T) {
 	ch, _, _ := diffTiles(cur, stride, w, h, []uint64{1, 2}) // wrong length
 	if len(ch) != 1 {
 		t.Fatalf("short prev: got %d changed, want 1 (all)", len(ch))
+	}
+}
+
+// hashTile must stay bit-identical to hash/fnv FNV-1a/64: cached hashes
+// are compared across frames (and the inline rewrite must not drift).
+func TestHashTileMatchesFNV(t *testing.T) {
+	stride, h := 300*4, 200
+	pix := make([]byte, stride*h)
+	for i := range pix {
+		pix[i] = byte(i*2654435761 + 97)
+	}
+	for _, tc := range [][4]int{{0, 0, 128, 128}, {128, 0, 128, 128}, {0, 128, 44, 72}, {256, 150, 44, 50}} {
+		x, y, tw, th := tc[0], tc[1], tc[2], tc[3]
+		hf := fnv.New64a()
+		for row := 0; row < th; row++ {
+			off := (y+row)*stride + x*4
+			hf.Write(pix[off : off+tw*4])
+		}
+		if got, want := hashTile(pix, stride, x, y, tw, th), hf.Sum64(); got != want {
+			t.Fatalf("tile %v: inline %x != fnv %x", tc, got, want)
+		}
 	}
 }
