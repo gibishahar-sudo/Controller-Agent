@@ -29,6 +29,7 @@ public class HomeActivity extends Activity {
 
     private static final String QUEUE_KEY = "rmm_queue"; // ts \u0001 target \u0001 cmd
     private static final String SEP = String.valueOf((char) 1);
+    private static final int VOICE_REQ = 0x5A1;
 
     private TextView statusText;
     private ListView agentList;
@@ -160,6 +161,11 @@ public class HomeActivity extends Activity {
         cmdInput.setTypeface(android.graphics.Typeface.MONOSPACE);
         v.addView(cmdInput);
 
+        Button mic = new Button(this);
+        mic.setText("🎤 Voice (fills command — you tap Send)");
+        mic.setOnClickListener(unused -> startVoiceInput());
+        v.addView(mic);
+
         Button send = new Button(this);
         send.setText("Send");
         send.setOnClickListener(unused -> sendCommand());
@@ -279,8 +285,43 @@ public class HomeActivity extends Activity {
         queueText.setText(n == 0 ? "queue: empty" : "queue: " + n + " (sends when core is up)");
     }
 
-    private void sendCommand() {
-        final String cmd = cmdInput.getText().toString().trim();
+    /** Jarvis mic: system recognizer intent (no RECORD_AUDIO needed — the
+     * system activity records on our behalf). Heard text fills the command
+     * box prefixed as voice-cmd; the operator still taps Send (a misheard
+     * destructive command must not run itself). */
+    private void startVoiceInput() {
+        try {
+            Intent i = new Intent(android.speech.RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
+            i.putExtra(android.speech.RecognizerIntent.EXTRA_LANGUAGE_MODEL,
+                    android.speech.RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
+            i.putExtra(android.speech.RecognizerIntent.EXTRA_LANGUAGE, "en-US");
+            i.putExtra(android.speech.RecognizerIntent.EXTRA_PROMPT, "Say it, Jarvis is listening…");
+            startActivityForResult(i, VOICE_REQ);
+        } catch (Exception e) {
+            toast("Voice input unavailable (" + e.getMessage() + ")");
+        }
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode != VOICE_REQ || resultCode != RESULT_OK || data == null) {
+            return;
+        }
+        ArrayList<String> heard = data.getStringArrayListExtra(
+                android.speech.RecognizerIntent.EXTRA_RESULTS);
+        if (heard == null || heard.isEmpty() || heard.get(0) == null) {
+            return;
+        }
+        String text = heard.get(0).trim();
+        if (text.isEmpty()) {
+            return;
+        }
+        cmdInput.setText("voice-cmd " + text);
+        toast("Heard: " + text);
+    }
+
+    private void sendCommand() {        final String cmd = cmdInput.getText().toString().trim();
         if (cmd.isEmpty()) {
             return;
         }

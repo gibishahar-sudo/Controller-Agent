@@ -57,6 +57,17 @@ func RunStdinLoop(s *Server) {
 			continue
 		}
 		var msg protocol.Message
+		// Jarvis: rewrite voice-cmd locally (replies broadcast + printed).
+		if h, run, rep := s.tryVoiceCmd(ac, line); h {
+			if rep != "" {
+				fmt.Println(rep)
+			}
+			if run == "" {
+				fmt.Print("> ")
+				continue
+			}
+			line = run
+		}
 		switch line {
 		case "screenshot":
 			msg = protocol.Message{Type: protocol.TypeScreenshotRequest}

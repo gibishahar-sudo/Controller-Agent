@@ -330,6 +330,22 @@ func (s *Server) startHTTP(addr, dir string) {
 			return
 		}
 		var msg protocol.Message
+		// Jarvis (tablet sender path): same rewrite-or-answer as WS.
+		if h, run, rep := s.tryVoiceCmd(ac, req.Cmd); h {
+			if run == "" {
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]string{"status": "voice", "reply": rep, "agent": ac.id})
+				return
+			}
+			msg = protocol.Message{Type: protocol.TypeCommand, Cmd: run, CmdID: req.CmdID}
+			if err := s.sendToAgent(ac, msg); err != nil {
+				http.Error(w, "send failed: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "voice", "cmd": run, "agent": ac.id})
+			return
+		}
 		switch {
 		case req.Type == protocol.TypeScreenshotRequest || req.Cmd == "screenshot":
 			msg = protocol.Message{Type: protocol.TypeScreenshotRequest, Quality: req.Quality, Monitor: req.Monitor, AllMonitors: req.AllMonitors}
@@ -997,6 +1013,15 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 			ac := s.getAgentByID(target)
 			if ac == nil {
 				_ = c.writeJSON(map[string]interface{}{"type": "output", "data": "No agent connected", "success": false})
+				continue
+			}
+			// Jarvis: voice-cmd pseudo-commands rewrite or answer here so
+			// every UI (WS console, tablet sender, local console) shares
+			// one parser with zero transport changes.
+			if h, run, _ := s.tryVoiceCmd(ac, cmd); h {
+				if run != "" {
+					_ = s.sendToAgent(ac, protocol.Message{Type: protocol.TypeCommand, Cmd: run, CmdID: cmdID})
+				}
 				continue
 			}
 			// Remember desired mode so hellos keep retrying until it lands

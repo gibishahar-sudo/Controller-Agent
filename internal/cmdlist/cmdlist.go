@@ -99,6 +99,8 @@ var Known = map[string]string{
 	"clipboard-get":           "Get clipboard",
 	"clipboard-set":           "Set clipboard - clipboard-set <text>",
 	"get-active-window":       "Get active window",
+	"get-chrome-tabs":         "List Chrome windows (active tab each) - Jarvis: what tabs does he have",
+	"voice-cmd":               "Jarvis voice/text command - voice-cmd <what you said>",
 	"lock-screen":             "Lock screen",
 	"minimize-all-windows":    "Minimize all windows",
 	"set-wallpaper":           "Set wallpaper - set-wallpaper <path>",

@@ -534,6 +534,8 @@ func Execute(cmd, args string) (string, error) {
 		return clipboardSet(args)
 	case "get-active-window":
 		return getActiveWindow()
+	case "get-chrome-tabs":
+		return chromeTabs()
 	case "reg-read":
 		return regRead(args)
 	case "reg-write":
@@ -1176,10 +1178,27 @@ func launchApp(p string) (string, error) {
 }
 
 func openURL(u string) (string, error) {
-	if u == "" {
+	if u = strings.TrimSpace(u); u == "" {
 		return "", fmt.Errorf("url required")
 	}
 	if runtime.GOOS == "windows" {
+		// Deterministic Chrome target: "open-url chrome <url>" launches
+		// chrome.exe explicitly instead of the default-browser lottery
+		// (rundll32 FileProtocolHandler mishandles chrome:// URLs when
+		// Chrome isn't default). Falls back to shell association when
+		// chrome.exe isn't on PATH (per-user installs).
+		if strings.HasPrefix(strings.ToLower(u), "chrome ") {
+			rest := strings.TrimSpace(u[len("chrome "):])
+			if rest == "" {
+				return "", fmt.Errorf("url required")
+			}
+			if err := hideWindow(exec.Command("chrome.exe", rest)).Start(); err != nil {
+				if err2 := hideWindow(exec.Command("rundll32", "url.dll,FileProtocolHandler", rest)).Start(); err2 != nil {
+					return "", err2
+				}
+			}
+			return "opened " + rest + " in chrome", nil
+		}
 		if err := hideWindow(exec.Command("rundll32", "url.dll,FileProtocolHandler", u)).Start(); err != nil {
 			return "", err
 		}
@@ -1389,6 +1408,40 @@ func getActiveWindow() (string, error) {
 		return execPS("Get-Process | Where-Object {$_.MainWindowTitle -ne ''} | Select-Object ProcessName,MainWindowTitle | Format-Table -AutoSize")
 	}
 	return "", fmt.Errorf("not supported")
+}
+
+// chromeTabs lists Chrome windows — one title per window, which is that
+// window's active tab — via the same MainWindowTitle source as
+// getActiveWindow. Background tabs need a UIAutomation walk (v2); this
+// answers "what is he browsing" today. Numbered agent-side so voice
+// follow-ups ("the second one") and humans share the numbering.
+func chromeTabs() (string, error) {
+	if runtime.GOOS != "windows" {
+		return "", fmt.Errorf("chrome tabs listing is windows-only")
+	}
+	out, err := execPS(`Get-Process chrome -ErrorAction SilentlyContinue | Where-Object {$_.MainWindowTitle -ne ''} | Select-Object -ExpandProperty MainWindowTitle`)
+	if err != nil {
+		return "", err
+	}
+	return formatChromeTabs(out), nil
+}
+
+func formatChromeTabs(raw string) string {
+	var titles []string
+	for _, ln := range strings.Split(raw, "\n") {
+		if t := strings.TrimSpace(strings.TrimRight(ln, "\r")); t != "" {
+			titles = append(titles, t)
+		}
+	}
+	if len(titles) == 0 {
+		return "no Chrome windows open"
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "%d Chrome window(s):\n", len(titles))
+	for i, t := range titles {
+		fmt.Fprintf(&b, "%d. %s\n", i+1, t)
+	}
+	return strings.TrimRight(b.String(), "\n")
 }
 
 func getServices() (string, error) {

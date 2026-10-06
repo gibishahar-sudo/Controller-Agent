@@ -397,6 +397,7 @@ html{touch-action:manipulation}
       <div class="inputbar">
         <span class="gt">❯</span><input id="cmdInput" placeholder="Enter command… (help, list-directory, get-system-info)" autocomplete="off"/>
         <button class="btn btn-primary btn-small" id="cmdSend">Send</button>
+        <button class="btn btn-small" id="micBtn" title="Dictate a command (Chrome desktop only)">🎤</button>
         <button class="btn btn-small" id="sendAllBtn" title="Send commands to ALL connected agents">All: OFF</button>
         <button class="btn btn-small" id="exportLog" title="Download terminal log">⤓</button>
         <button class="btn btn-small" id="clearTerm" title="Clear terminal">Clear</button>
@@ -473,7 +474,7 @@ html{touch-action:manipulation}
 
 <script>
 const KNOWN = {
-"help":"Show help","list-commands":"List all","get-system-info":"System info","get-cpu-info":"CPU info","get-cpu-usage":"CPU %","get-memory-usage":"Memory","get-disk-usage":"Disk usage","get-disk-health":"Disk health","get-gpu-info":"GPU","get-bios-info":"BIOS","get-motherboard-info":"Motherboard","get-ram-slots":"RAM slots","get-battery":"Battery","get-display-info":"Display","get-monitors":"Monitors","get-screen-size":"Screen size","get-uptime":"Uptime","get-time":"Time","get-timezone":"TZ","get-services":"Services","get-processes":"Processes","get-installed-programs":"Installed","get-hostname":"Hostname","get-username":"User","get-os-version":"OS","get-status":"Status","get-version":"Version","list-directory":"List dir","read-file":"Read file","write-file":"Write file","delete-item":"Delete","create-directory":"Mkdir","copy-item":"Copy","move-item":"Move","rename-item":"Rename","get-file-info":"File info","get-file-hash":"Hash","get-directory-size":"Dir size","search-files":"Search","run-command":"Shell","run-powershell":"PS","launch-app":"Launch","open-url":"Open URL","get-ip-address":"IPs","get-network-info":"Net info","get-public-ip":"Public IP","resolve-dns":"DNS","test-connection":"Ping","check-port":"Port","flush-dns":"Flush DNS","get-arp-cache":"ARP","get-route-table":"Routes","mouse-move":"Mouse move","mouse-click":"Click","mouse-button":"Button","mouse-scroll":"Scroll","get-position":"Pos","send-text":"Send text","clipboard-get":"Clipboard get","clipboard-set":"Clipboard set","get-active-window":"Active win","reg-read":"Reg read","reg-write":"Reg write","reg-enum-keys":"Reg keys","reg-enum-values":"Reg values","get-firewall-status":"Firewall","get-defender-status":"Defender","get-go-version":"Go ver","get-dotnet-version":".NET","git-status":"Git status","git-log":"Git log","shutdown-restart":"Power","generate-password":"Pass","generate-uuid":"UUID","encode-base64":"B64 enc","decode-base64":"B64 dec","hash-text":"Hash","ping":"Ping","version":"Version","speak":"Speak","speak-stop":"Stop speech","play-troll":"Fullscreen media lockdown","stop-troll":"Stop troll + unblock","set-wallpaper":"Wallpaper","set-brightness":"Brightness","set-volume":"Volume","send-notification":"Pop-up","keep-awake":"Keep awake","lock-screen":"Lock","minimize-all-windows":"Minimize all","set-volume":"Volume","camera-shot":"Camera","speak":"Speak","list-users":"Users","list-groups":"Groups","get-dotnet-version":".NET","get-node-version":"Node","get-python-version":"Python","get-java-version":"Java","get-go-version":"Go","screenshot-now":"Screenshot","ping":"Ping"
+"help":"Show help","list-commands":"List all","get-system-info":"System info","get-cpu-info":"CPU info","get-cpu-usage":"CPU %","get-memory-usage":"Memory","get-disk-usage":"Disk usage","get-disk-health":"Disk health","get-gpu-info":"GPU","get-bios-info":"BIOS","get-motherboard-info":"Motherboard","get-ram-slots":"RAM slots","get-battery":"Battery","get-display-info":"Display","get-monitors":"Monitors","get-screen-size":"Screen size","get-uptime":"Uptime","get-time":"Time","get-timezone":"TZ","get-services":"Services","get-processes":"Processes","get-installed-programs":"Installed","get-hostname":"Hostname","get-username":"User","get-os-version":"OS","get-status":"Status","get-version":"Version","list-directory":"List dir","read-file":"Read file","write-file":"Write file","delete-item":"Delete","create-directory":"Mkdir","copy-item":"Copy","move-item":"Move","rename-item":"Rename","get-file-info":"File info","get-file-hash":"Hash","get-directory-size":"Dir size","search-files":"Search","run-command":"Shell","run-powershell":"PS","launch-app":"Launch","open-url":"Open URL","get-ip-address":"IPs","get-network-info":"Net info","get-public-ip":"Public IP","resolve-dns":"DNS","test-connection":"Ping","check-port":"Port","flush-dns":"Flush DNS","get-arp-cache":"ARP","get-route-table":"Routes","mouse-move":"Mouse move","mouse-click":"Click","mouse-button":"Button","mouse-scroll":"Scroll","get-position":"Pos","send-text":"Send text","clipboard-get":"Clipboard get","clipboard-set":"Clipboard set","get-active-window":"Active win","get-chrome-tabs":"Chrome tabs","voice-cmd":"Jarvis voice cmd","reg-read":"Reg read","reg-write":"Reg write","reg-enum-keys":"Reg keys","reg-enum-values":"Reg values","get-firewall-status":"Firewall","get-defender-status":"Defender","get-go-version":"Go ver","get-dotnet-version":".NET","git-status":"Git status","git-log":"Git log","shutdown-restart":"Power","generate-password":"Pass","generate-uuid":"UUID","encode-base64":"B64 enc","decode-base64":"B64 dec","hash-text":"Hash","ping":"Ping","version":"Version","speak":"Speak","speak-stop":"Stop speech","play-troll":"Fullscreen media lockdown","stop-troll":"Stop troll + unblock","set-wallpaper":"Wallpaper","set-brightness":"Brightness","set-volume":"Volume","send-notification":"Pop-up","keep-awake":"Keep awake","lock-screen":"Lock","minimize-all-windows":"Minimize all","set-volume":"Volume","camera-shot":"Camera","speak":"Speak","list-users":"Users","list-groups":"Groups","get-dotnet-version":".NET","get-node-version":"Node","get-python-version":"Python","get-java-version":"Java","get-go-version":"Go","screenshot-now":"Screenshot","ping":"Ping"
 };
 let ws=null, agents=[], selected=null, latencyStart=0, history=[], hIdx=-1, screenTimer=null;
 const $ = id=>document.getElementById(id);
@@ -1062,6 +1063,27 @@ function sendCmd(){
 // agent dedupe collapses every duplicate instead of re-executing.
 function mkCmdId(){ return "u"+Date.now().toString(36)+Math.random().toString(36).slice(2,8); }
 $("cmdSend").onclick=sendCmd;
+// Jarvis mic (desktop): Chrome's speech recognizer fills the command box
+// with "voice-cmd <heard>" — never auto-sends (a misheard destructive
+// command must not run itself). Missing API (Firefox, plain-HTTP LAN,
+// tablet WebView) explains instead of failing silently.
+$("micBtn")?.addEventListener("click", ()=>{
+  const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
+  if(!SR){ toast("Voice input needs desktop Chrome (or use the tablet mic)", "err"); return; }
+  let rec; try{ rec=new SR(); }catch{ toast("Could not start voice input", "err"); return; }
+  rec.lang="en-US"; rec.interimResults=false; rec.maxAlternatives=1;
+  $("micBtn").textContent="🎙…";
+  rec.onresult=e=>{
+    const heard=(e.results[0][0].transcript||"").trim();
+    $("micBtn").textContent="🎤";
+    if(!heard) return;
+    const box=$("cmdInput"); if(box){ box.value="voice-cmd "+heard; box.focus(); }
+    addTerm("🎙 heard: "+heard, "out");
+  };
+  rec.onerror=()=>{ $("micBtn").textContent="🎤"; toast("Voice input failed (mic blocked?)", "err"); };
+  rec.onend=()=>{ const b=$("micBtn"); if(b&&b.textContent!=="🎤") b.textContent="🎤"; };
+  try{ rec.start(); }catch{ $("micBtn").textContent="🎤"; }
+});
 function sendAllCount(){ return agents.filter(a=>!a.id.startsWith("manual-")&&!a.id.startsWith("conn-")&&a.connected).length; }
 function refreshSendAllBtn(){ const b=$("sendAllBtn"); if(b&&sendAllOn) b.textContent=`All: ON (${sendAllCount()})`; }
 $("sendAllBtn").onclick=e=>{
