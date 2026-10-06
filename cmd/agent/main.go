@@ -367,23 +367,36 @@ func noteCapturePath(s string) {
 // (same FSeq generation). Zero tiles = single empty TypeScreen heartbeat so
 // the UI knows the stream is alive with nothing changed. (nil, nil) means
 // superseded mid-capture: a newer frame already published, drop silently.
+// Thin wrapper now: stage A (captureRaw) + stage B (diffEncode), same as
+// the push pipeline runs across goroutines.
 func captureTiled(quality, monitor int, all bool, scale float64) (msgs []protocol.Message, err error) {
 	if !modeCanScreen() {
 		return nil, fmt.Errorf("%s", commands.ModeDenied(agentMode))
 	}
-	// Per-frame stage timing (debug log): separates capture+encode cost
-	// from publish drain (logged per send batch) when diagnosing fps.
 	t0 := time.Now()
-	var capMs int64
-	defer func() {
-		dlog.Printf("[shot] frames=%d cap=%dms total=%dms err=%v", len(msgs), capMs, time.Since(t0).Milliseconds(), err)
-	}()
 	s0 := frameSeq.Load()
 	img, w, h, ox, oy, err := captureRaw(monitor, all, scale)
 	if err != nil {
 		return nil, err
 	}
-	capMs = time.Since(t0).Milliseconds()
+	capMs := time.Since(t0).Milliseconds()
+	return diffEncode(img, w, h, ox, oy, s0, capMs, quality, monitor, all, scale)
+}
+
+// diffEncode is the second half of captureTiled: diff the captured pixels
+// against the tile cache, encode tiles or a keyframe. Split out so the push
+// loop can pipeline it (stage B: diff+encode+send) while stage A captures
+// the next frame; stage B stays serial so generation order is preserved.
+// s0/capMs come from stage A's pre/post capture clock: the supersede check
+// and the honest [shot] timings (total = capture + this stage).
+func diffEncode(img *image.RGBA, w, h, ox, oy int, s0 uint64, capMs int64, quality, monitor int, all bool, scale float64) (msgs []protocol.Message, err error) {
+	t1 := time.Now()
+	defer func() {
+		dlog.Printf("[shot] frames=%d cap=%dms total=%dms err=%v", len(msgs), capMs, capMs+time.Since(t1).Milliseconds(), err)
+	}()
+	if !modeCanScreen() {
+		return nil, fmt.Errorf("%s", commands.ModeDenied(agentMode))
+	}
 	if frameSeq.Load() != s0 {
 		return nil, nil // superseded during capture; UI would drop this frame
 	}
@@ -937,6 +950,12 @@ func (a *agent) stopPushStream() {
 // off while the screen sits static (25ms -> 100ms -> 250ms) so an idle
 // box stops burning a core on identical captures; any change snaps
 // back to full pace within one beat.
+//
+// Internals: a two-stage pipeline. Stage A captures (GDI-bound, ~90ms
+// on weak boxes) while stage B diffs+encodes+sends the previous frame,
+// so throughput is 1/max(stage) instead of 1/sum. Depth-1 channel with
+// drop (never block): when B lags, A sheds load instead of queueing
+// stale frames. Stage B stays serial so tile generations keep order.
 func (a *agent) startPushStream(quality, monitor int, all bool, scale float64) {
 	a.pushMu.Lock()
 	if a.pushCancel != nil {
@@ -947,169 +966,267 @@ func (a *agent) startPushStream(quality, monitor int, all bool, scale float64) {
 	a.pushMu.Unlock()
 	dlog.Printf("[push] start q=%d mon=%d all=%v scale=%v", quality, monitor, all, scale)
 
+	type capItem struct {
+		img    *image.RGBA
+		w, h   int
+		ox, oy int
+		s0     uint64
+		capMs  int64
+		q      int
+		sc     float64
+	}
+	type paceCtl struct {
+		interval time.Duration
+		q        int
+		sc       float64
+	}
+	q0 := quality
+	if q0 <= 0 {
+		q0 = 70
+	}
+	sc0 := scale
+	if sc0 <= 0 {
+		sc0 = 0.5
+	}
+	baseInterval := 25 * time.Millisecond // ~40fps target; slow captures pace the loop naturally
+	capCh := make(chan capItem, 1)
+	paceCh := make(chan paceCtl, 1)
+
+	// Stage A: paced capture.
 	go func() {
-		defer cancel()
-		q := quality
-		if q <= 0 {
-			q = 70
-		}
-		qHi := q
-		sc := scale
-		if sc <= 0 {
-			sc = 0.5
-		}
-		scCur := sc // adaptive resolution may step this down (never up) within the stream
-		var emaMs float64
-		var sendFails, capHangs, idleBeats int
-		baseInterval := 25 * time.Millisecond // ~40fps target; slow captures pace the loop naturally
+		defer close(capCh)
 		interval := baseInterval
+		q, sc := q0, sc0
 		timer := time.NewTimer(interval)
 		defer timer.Stop()
+		arm := func() {
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(interval)
+		}
+		var capHangs, capErrs, drops int
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-a.closing:
 				return
+			case p := <-paceCh:
+				interval, q, sc = p.interval, p.q, p.sc
+				arm()
 			case <-timer.C:
-				exit := func() bool {
-					if !captureSlot() {
-						return false
-					}
-					// Capture hang watchdog: a wedged GDI call (dead driver,
-					// vanished display) blocks forever and would freeze the
-					// loop with zero evidence. Bound it: run the capture
-					// aside, reap the slot on timeout, drop the orphan's
-					// result (buffered chan, no goroutine leak). The orphan's
-					// tile-cache advance may skip one delta on the UI; the
-					// next keyframe heals it. A permanently wedged capture
-					// exits after 3 hangs so a fresh loop (UI re-push) retries
-					// instead of spinning silent timeouts.
-					type capRes struct {
-						msgs []protocol.Message
-						err  error
-					}
-					resCh := make(chan capRes, 1)
-					c0 := time.Now()
-					go func() {
-						msgs, err := captureTiled(q, monitor, all, scCur)
-						resCh <- capRes{msgs, err}
-					}()
-					var msgs []protocol.Message
-					var err error
-					capOK := true
-					select {
-					case r := <-resCh:
-						msgs, err = r.msgs, r.err
-					case <-time.After(5 * time.Second):
-						capOK = false
-					case <-ctx.Done():
-						releaseSlot()
-						return true
-					case <-a.closing:
-						releaseSlot()
-						return true
-					}
-					releaseSlot()
-					if !capOK {
-						capHangs++
-						dlog.Printf("[push] capture hung >5s (%d consecutive), slot reaped", capHangs)
-						if capHangs >= 3 {
-							dlog.Printf("[push] capture wedged, exiting loop (re-push retries)")
-							return true
-						}
-						return false
-					}
-					capHangs = 0
-					if err != nil {
-						return false
-					}
-					ms := time.Since(c0).Milliseconds()
-					if emaMs == 0 {
-						emaMs = float64(ms)
-					} else {
-						emaMs = 0.2*float64(ms) + 0.8*emaMs
-					}
-					// Adaptive quality: slow box -> cheaper frames, fast box -> recover.
-					if emaMs > 100 && q > 40 {
-						q -= 10
-						dlog.Printf("[push] slow cycle ema=%.0fms, quality %d->%d", emaMs, q+10, q)
-					} else if emaMs < 40 && q < qHi {
-						q += 5
-						if q > qHi {
-							q = qHi
-						}
-						dlog.Printf("[push] fast cycle ema=%.0fms, quality recovered to %d", emaMs, q)
-					}
-					if len(msgs) == 0 {
-						return false
-					}
-					// Send-failure budget: one failed publish used to kill the
-					// whole loop (a transient blip cost a 3s+ stall until the
-					// UI re-pushed). Now a failing publish drops one frame and
-					// the loop survives; only a persistently dead transport
-					// (10 in a row) exits, and the UI re-push retries.
-					if err := sendShotMsgs(a.send, msgs); err != nil {
-						sendFails++
-						dlog.Printf("[push] publish failed (%d consecutive): %v", sendFails, err)
-						if sendFails >= 10 {
-							dlog.Printf("[push] transport dead, exiting loop (re-push retries)")
-							return true
-						}
-						return false
-					}
-					// Adaptive resolution: quality already floored at 40 and the
-					// box still can't keep up on REAL frames (heartbeats don't
-					// count — stillness must never cost detail). Steps down
-					// 1.0->0.5->0.25, never up within a stream (oscillation
-					// costs a keyframe + geometry jump each way; stability
-					// wins). A stream restart restores the requested scale.
-					// The tile key includes scale, so each step keyframes once.
-					realFrame := false
-					for _, m := range msgs {
-						if m.Data != "" {
-							realFrame = true
-							break
-						}
-					}
-					if realFrame && emaMs > 120 && q <= 40 && scCur > 0.25 {
-						prevSc := scCur
-						if scCur > 0.5 {
-							scCur = 0.5
-						} else {
-							scCur = 0.25
-						}
-						dlog.Printf("[push] weak box: resolution %.2g->%.2g (restores on restart)", prevSc, scCur)
-					}
-					sendFails = 0
-					// Idle backoff: heartbeats (nothing changed) slow the pace
-					// 25ms -> 100ms -> 250ms so an idle box stops burning a
-					// core on identical captures; any real frame snaps back
-					// to full pace within one beat. The UI stall watchdog
-					// (3s) stays fed throughout.
-					if len(msgs) == 1 && msgs[0].Type == protocol.TypeScreen && msgs[0].Data == "" {
-						idleBeats++
-					} else {
-						idleBeats = 0
-					}
-					prev := interval
-					switch {
-					case idleBeats > 40:
-						interval = 250 * time.Millisecond
-					case idleBeats > 12:
-						interval = 100 * time.Millisecond
-					default:
-						interval = baseInterval
-					}
-					if interval != prev {
-						dlog.Printf("[push] idle %d beats, pace %v", idleBeats, interval)
-					}
-					return false
+				if !modeCanScreen() {
+					arm()
+					continue
+				}
+				if !captureSlot() {
+					arm()
+					continue
+				}
+				s0 := frameSeq.Load()
+				c0 := time.Now()
+				type capRes struct {
+					img    *image.RGBA
+					w, h   int
+					ox, oy int
+					err    error
+				}
+				resCh := make(chan capRes, 1)
+				go func() {
+					img, w, h, ox, oy, err := captureRaw(monitor, all, sc)
+					resCh <- capRes{img, w, h, ox, oy, err}
 				}()
-				if exit {
+				var r capRes
+				capOK := true
+				select {
+				case r = <-resCh:
+				case <-time.After(5 * time.Second):
+					capOK = false
+				case <-ctx.Done():
+					releaseSlot()
+					return
+				case <-a.closing:
+					releaseSlot()
 					return
 				}
-				timer.Reset(interval)
+				if !capOK {
+					releaseSlot()
+					capHangs++
+					dlog.Printf("[push] capture hung >5s (%d consecutive), slot reaped", capHangs)
+					if capHangs >= 3 {
+						dlog.Printf("[push] capture wedged, stage A exiting")
+						return
+					}
+					arm()
+					continue
+				}
+				capHangs = 0
+				if r.err != nil {
+					releaseSlot()
+					capErrs++
+					if capErrs%20 == 1 {
+						dlog.Printf("[push] capture error: %v", r.err)
+					}
+					arm()
+					continue
+				}
+				capErrs = 0
+				it := capItem{img: r.img, w: r.w, h: r.h, ox: r.ox, oy: r.oy, s0: s0, capMs: time.Since(c0).Milliseconds(), q: q, sc: sc}
+				select {
+				case capCh <- it:
+				default:
+					releaseSlot()
+					drops++
+					if drops%100 == 1 {
+						dlog.Printf("[push] stage B lagging, dropped %d captures", drops)
+					}
+				}
+				arm()
+			}
+		}
+	}()
+
+	// Stage B: diff, encode, send, adapt — serial, order-preserving.
+	go func() {
+		defer cancel()
+		q, qHi, scCur := q0, q0, sc0
+		interval := baseInterval
+		var emaMs float64
+		var sendFails, idleBeats int
+		lastPace := paceCtl{interval: interval, q: q, sc: scCur}
+		maybeSendPace := func() {
+			p := paceCtl{interval: interval, q: q, sc: scCur}
+			if p == lastPace {
+				return
+			}
+			lastPace = p
+			select {
+			case <-paceCh:
+			default:
+			}
+			select {
+			case paceCh <- p:
+			default:
+			}
+		}
+		drainClosed := func() {
+			// Release every in-flight slot. Ranges until stage A closes
+			// the channel (it always does on ctx/closing — bounded wait);
+			// without this, an item buffered while we exit leaks its slot,
+			// and six such races wedge the semaphore across restarts.
+			for range capCh {
+				releaseSlot()
+			}
+		}
+		for {
+			select {
+			case <-ctx.Done():
+				drainClosed()
+				return
+			case <-a.closing:
+				drainClosed()
+				return
+			case it, ok := <-capCh:
+				if !ok {
+					return // stage A exited; range already drained
+				}
+				t1 := time.Now()
+				// Fresh s0: the item waited behind stage B, so its
+				// capture-time s0 is stale by design — order here is
+				// inherently correct (FIFO), no supersede possible.
+				msgs, err := diffEncode(it.img, it.w, it.h, it.ox, it.oy, frameSeq.Load(), it.capMs, it.q, monitor, all, it.sc)
+				releaseSlot()
+				if err != nil {
+					maybeSendPace()
+					continue
+				}
+				ms := it.capMs + time.Since(t1).Milliseconds()
+				if emaMs == 0 {
+					emaMs = float64(ms)
+				} else {
+					emaMs = 0.2*float64(ms) + 0.8*emaMs
+				}
+				// Adaptive quality: slow box -> cheaper frames, fast box -> recover.
+				if emaMs > 100 && q > 40 {
+					q -= 10
+					dlog.Printf("[push] slow cycle ema=%.0fms, quality %d->%d", emaMs, q+10, q)
+				} else if emaMs < 40 && q < qHi {
+					q += 5
+					if q > qHi {
+						q = qHi
+					}
+					dlog.Printf("[push] fast cycle ema=%.0fms, quality recovered to %d", emaMs, q)
+				}
+				if len(msgs) == 0 {
+					maybeSendPace()
+					continue
+				}
+				// Send-failure budget: one failed publish used to kill the
+				// whole loop (a transient blip cost a 3s+ stall until the
+				// UI re-pushed). Now a failing publish drops one frame and
+				// the loop survives; only a persistently dead transport
+				// (10 in a row) exits, and the UI re-push retries.
+				if err := sendShotMsgs(a.send, msgs); err != nil {
+					sendFails++
+					dlog.Printf("[push] publish failed (%d consecutive): %v", sendFails, err)
+					if sendFails >= 10 {
+						dlog.Printf("[push] transport dead, exiting loop (re-push retries)")
+						return
+					}
+					maybeSendPace()
+					continue
+				}
+				// Adaptive resolution: quality already floored at 40 and the
+				// box still can't keep up on REAL frames (heartbeats don't
+				// count — stillness must never cost detail). Steps down
+				// 1.0->0.5->0.25, never up within a stream (oscillation
+				// costs a keyframe + geometry jump each way; stability
+				// wins). A stream restart restores the requested scale.
+				// The tile key includes scale, so each step keyframes once.
+				realFrame := false
+				for _, m := range msgs {
+					if m.Data != "" {
+						realFrame = true
+						break
+					}
+				}
+				if realFrame && emaMs > 120 && q <= 40 && scCur > 0.25 {
+					prevSc := scCur
+					if scCur > 0.5 {
+						scCur = 0.5
+					} else {
+						scCur = 0.25
+					}
+					dlog.Printf("[push] weak box: resolution %.2g->%.2g (restores on restart)", prevSc, scCur)
+				}
+				sendFails = 0
+				// Idle backoff: heartbeats (nothing changed) slow the pace
+				// 25ms -> 100ms -> 250ms so an idle box stops burning a
+				// core on identical captures; any real frame snaps back
+				// to full pace within one beat. The UI stall watchdog
+				// (3s) stays fed throughout.
+				if len(msgs) == 1 && msgs[0].Type == protocol.TypeScreen && msgs[0].Data == "" {
+					idleBeats++
+				} else {
+					idleBeats = 0
+				}
+				prev := interval
+				switch {
+				case idleBeats > 40:
+					interval = 250 * time.Millisecond
+				case idleBeats > 12:
+					interval = 100 * time.Millisecond
+				default:
+					interval = baseInterval
+				}
+				if interval != prev {
+					dlog.Printf("[push] idle %d beats, pace %v", idleBeats, interval)
+				}
+				maybeSendPace()
 			}
 		}
 	}()
