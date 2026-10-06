@@ -289,6 +289,9 @@ type Server struct {
 	voice    *voiceCtx
 	voiceMu  sync.Mutex
 
+	// Local LLM sidecar (phrasing only): supervised llama-server process.
+	llm *llmState
+
 	// Scheduler v1.41: per-agent cron entries persisted to scheduler.json.
 	jobs   []schedJob
 	jobsMu sync.Mutex
@@ -379,6 +382,7 @@ func StartBackground(opts Options) (*Server, error) {
 	s.macros = make(map[string][]string)
 	s.memory = loadMemoryFile()
 	s.voice = newVoiceCtx()
+	s.llm = newLLMState()
 	s.authLog = make(map[string]time.Time)
 	s.loadAgentToken()
 	s.loadHeldRollbacks()

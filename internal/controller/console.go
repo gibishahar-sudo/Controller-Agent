@@ -30,7 +30,7 @@ func RunStdinLoop(s *Server) {
 			s.Close()
 			os.Exit(0)
 		case "help":
-			fmt.Println("Commands: <shell> | screenshot | ping | status | version | exit")
+			fmt.Println("Commands: <shell> | screenshot | ping | status | version | voice-cmd ... | memory ... | llm-say ... | llm-status | exit")
 			fmt.Print("> ")
 			continue
 		case "version":
@@ -46,6 +46,14 @@ func RunStdinLoop(s *Server) {
 					fmt.Printf("Agent %s: %s (%s) remote=%s latency=%vms\n",
 						a["id"], a["hostname"], a["user"], a["remote"], a["latency"])
 				}
+			}
+			fmt.Print("> ")
+			continue
+		}
+		// Controller-side llm pseudo-commands first (need no agent).
+		if h, rep := s.tryLLMCmd(line); h {
+			if rep != "" {
+				fmt.Println(rep)
 			}
 			fmt.Print("> ")
 			continue

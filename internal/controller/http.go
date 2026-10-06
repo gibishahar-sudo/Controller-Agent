@@ -328,6 +328,13 @@ func (s *Server) startHTTP(addr, dir string) {
 		if ac == nil {
 			ac = s.voiceTarget(nil, req.Cmd)
 		}
+		// Controller-side llm pseudo-commands (need no agent; replies
+		// broadcast, body carries the text too).
+		if h, rep := s.tryLLMCmd(req.Cmd); h {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "llm", "reply": rep})
+			return
+		}
 		if ac == nil {
 			http.Error(w, "no agent connected", http.StatusServiceUnavailable)
 			return
@@ -1068,6 +1075,11 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 			ac := s.getAgentByID(target)
 			if ac == nil {
 				ac = s.voiceTarget(nil, cmd)
+			}
+			// Controller-side llm pseudo-commands (need no agent).
+			if h, rep := s.tryLLMCmd(cmd); h {
+				_ = rep
+				continue
 			}
 			if ac == nil {
 				_ = c.writeJSON(map[string]interface{}{"type": "output", "data": "No agent connected", "success": false})
