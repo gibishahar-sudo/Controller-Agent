@@ -281,6 +281,12 @@ func captureScreen() ([]byte, int, int, error) {
 const tileSize = 128
 const tileKeyframeEvery = 120
 
+// tileKeyframeRatio bounds the tile path: above this changed fraction a
+// keyframe wins. 0.5 (was 0.7): the link runs 0ms publishes, so bytes are
+// free — but every tile costs the tablet a JPEG decode, and 40 decodes
+// stutter worse than one keyframe. Motion hides the keyframe's compression.
+const tileKeyframeRatio = 0.5
+
 type tileCache struct {
 	key    string // dims+scale+monitor+all: any change forces a keyframe
 	w, h   int
@@ -481,7 +487,7 @@ func diffEncode(img *image.RGBA, w, h, ox, oy int, s0 uint64, capMs int64, quali
 			tileMu.Unlock()
 			return []protocol.Message{{Type: protocol.TypeScreen, Width: w, Height: h, OX: ox, OY: oy, FSeq: gen, Scale: es}}, nil
 		}
-		if ratio < 0.7 {
+		if ratio < tileKeyframeRatio {
 			// Changed region is small: send tiles. Snapshot the rect
 			// list; pixels encode from img (call-local) after unlock.
 			// (SubImage rect is in image space: offset by Bounds Min
@@ -503,7 +509,14 @@ func diffEncode(img *image.RGBA, w, h, ox, oy int, s0 uint64, capMs int64, quali
 	} else {
 		tileMu.Unlock()
 	}
-	data, format, err := encodeImage(img, quality)
+	// Keyframes encode cheaper than tiles (q-10, floor ~25): motion masks
+	// the difference, and one fast decode beats 40 slow ones on the
+	// tablet. PNG path (quality<=0) passes through untouched.
+	kq := quality
+	if kq > 35 {
+		kq -= 10
+	}
+	data, format, err := encodeImage(img, kq)
 	if err != nil {
 		return nil, err
 	}
@@ -1247,7 +1260,7 @@ func (a *agent) startPushStream(quality, monitor int, all bool, scale float64) {
 						break
 					}
 				}
-				if realFrame && emaMs > 120 && q <= 40 && scCur > 0.25 {
+				if realFrame && emaMs > 100 && q <= 40 && scCur > 0.25 {
 					prevSc := scCur
 					if scCur > 0.5 {
 						scCur = 0.5
