@@ -85,6 +85,50 @@ func halveRGBA(src *image.RGBA) *image.RGBA {
 	return dst
 }
 
+// halveBGRAsrc downscales BGRA bytes (GDI order) by 2x2 box average
+// straight to RGBA, fusing the channel swap and the halve into one pass:
+// the full-res fallback drops a whole frame read+write+alloc (the swap
+// loop) entirely. Pure function, unit-tested.
+func halveBGRAsrc(src []byte, stride, w, h int) *image.RGBA {
+	dw, dh := w/2, h/2
+	if dw < 1 {
+		dw = 1
+	}
+	if dh < 1 {
+		dh = 1
+	}
+	dst := image.NewRGBA(image.Rect(0, 0, dw, dh))
+	maxX, maxY := w-1, h-1
+	for y := 0; y < dh; y++ {
+		for x := 0; x < dw; x++ {
+			var r, g, b, a uint32
+			for dy := 0; dy < 2; dy++ {
+				for dx := 0; dx < 2; dx++ {
+					sx := x*2 + dx
+					if sx > maxX {
+						sx = maxX
+					}
+					sy := y*2 + dy
+					if sy > maxY {
+						sy = maxY
+					}
+					i := sy*stride + sx*4
+					b += uint32(src[i])
+					g += uint32(src[i+1])
+					r += uint32(src[i+2])
+					a += uint32(src[i+3])
+				}
+			}
+			j := dst.PixOffset(x, y)
+			dst.Pix[j] = uint8(r / 4)
+			dst.Pix[j+1] = uint8(g / 4)
+			dst.Pix[j+2] = uint8(b / 4)
+			dst.Pix[j+3] = uint8(a / 4)
+		}
+	}
+	return dst
+}
+
 // encodeImage compresses one frame/tile: JPEG at quality, PNG when quality<=0.
 func encodeImage(img image.Image, quality int) (data []byte, format string, err error) {
 	var buf bytes.Buffer
@@ -148,7 +192,11 @@ func captureRaw(monitor int, all bool, scale float64) (img *image.RGBA, w, h, ox
 	// instead of black); kbinani fallback on any error. kbinani alone
 	// "succeeds" over video with black pixels, which no error check
 	// can catch — so the richer capture must lead, not follow.
-	cimg, cerr := captureLayered(bounds)
+	// Downscaled streams skip the BGRA swap: the fused halve unswaps
+	// while shrinking (one pass instead of two).
+	wantHalf := scale > 0 && scale < 1
+	cimg, cerr := captureLayered(bounds, !wantHalf)
+	layeredBGRA := wantHalf && cerr == nil && cimg != nil
 	if cerr != nil || cimg == nil {
 		kimg, kerr := screenshot.CaptureRect(bounds)
 		if kerr != nil {
@@ -162,14 +210,14 @@ func captureRaw(monitor int, all bool, scale float64) (img *image.RGBA, w, h, ox
 	img = cimg
 	w, h = bounds.Dx(), bounds.Dy()
 	ox, oy = bounds.Min.X, bounds.Min.Y
-	if scale > 0 && scale < 1 {
+	if wantHalf {
 		// Half detail for relay links: origin scales too so w/h/ox/oy
 		// stay in one consistent (scaled) space. The effective scale is
 		// echoed on every frame (FrameScale) so the UI converts clicks
 		// back to real pixels.
 		if scimg, scerr := captureLayeredScaled(bounds); scerr == nil && scimg != nil {
 			// GDI downscaled during the blit: no full-res transfer, no
-			// full-frame swap, no halveRGBA pass. Falls back below on
+			// full-frame swap, no halve pass. Falls back below on
 			// any error (non-Windows always falls back).
 			img = scimg
 			noteCapturePath("gdi-scaled")
@@ -177,12 +225,25 @@ func captureRaw(monitor int, all bool, scale float64) (img *image.RGBA, w, h, ox
 			if scerr != nil {
 				noteCapturePath("full+halve fallback: " + scerr.Error())
 			}
-			img = halveRGBA(img)
+			if layeredBGRA {
+				img = halveBGRAsrc(img.Pix, img.Stride, w, h)
+			} else {
+				img = halveRGBA(img) // kbinani pixels arrive pre-swapped
+			}
 		}
 		w /= 2
 		h /= 2
 		ox /= 2
 		oy /= 2
+		if scale <= 0.25 {
+			// Quarter gear: halve again (16x smaller frames for weak
+			// boxes / fast motion).
+			img = halveRGBA(img)
+			w /= 2
+			h /= 2
+			ox /= 2
+			oy /= 2
+		}
 	}
 	return img, w, h, ox, oy, nil
 }
@@ -220,12 +281,12 @@ const tileSize = 128
 const tileKeyframeEvery = 120
 
 type tileCache struct {
-	key string // dims+scale+monitor+all: any change forces a keyframe
-	w, h int
-	stride int // row bytes of pix (RGBA stride, not assumed == w*4)
-	pix  []byte // last-sent RGBA pixels
-	hash []uint64 // per-tile FNV of pix (row-major nx*ny): diff hashes each tile ONCE per frame instead of twice (cur+prev)
-	gen  uint64
+	key    string // dims+scale+monitor+all: any change forces a keyframe
+	w, h   int
+	stride int      // row bytes of pix (RGBA stride, not assumed == w*4)
+	pix    []byte   // last-sent RGBA pixels
+	hash   []uint64 // per-tile FNV of pix (row-major nx*ny): diff hashes each tile ONCE per frame instead of twice (cur+prev)
+	gen    uint64
 }
 
 var tileMu sync.Mutex
@@ -859,7 +920,10 @@ func (a *agent) stopPushStream() {
 // disconnect or a new push request. Frames go through captureTiled:
 // idle screens cost a heartbeat, small changes cost a few tiles, full
 // motion costs a keyframe. Quality adapts to the measured cycle time
-// (drops when the box can't keep up, recovers when it can).
+// (drops when the box can't keep up, recovers when it can). Pace backs
+// off while the screen sits static (25ms -> 100ms -> 250ms) so an idle
+// box stops burning a core on identical captures; any change snaps
+// back to full pace within one beat.
 func (a *agent) startPushStream(quality, monitor int, all bool, scale float64) {
 	a.pushMu.Lock()
 	if a.pushCancel != nil {
@@ -872,9 +936,6 @@ func (a *agent) startPushStream(quality, monitor int, all bool, scale float64) {
 
 	go func() {
 		defer cancel()
-		interval := 25 * time.Millisecond // ~40fps target; slow captures pace the loop naturally
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
 		q := quality
 		if q <= 0 {
 			q = 70
@@ -885,100 +946,133 @@ func (a *agent) startPushStream(quality, monitor int, all bool, scale float64) {
 			sc = 0.5
 		}
 		var emaMs float64
-		var sendFails, capHangs int
+		var sendFails, capHangs, idleBeats int
+		baseInterval := 25 * time.Millisecond // ~40fps target; slow captures pace the loop naturally
+		interval := baseInterval
+		timer := time.NewTimer(interval)
+		defer timer.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-a.closing:
 				return
-			case <-ticker.C:
-				if !captureSlot() {
-					continue
-				}
-				// Capture hang watchdog: a wedged GDI call (dead driver,
-				// vanished display) blocks forever and would freeze the
-				// loop with zero evidence. Bound it: run the capture
-				// aside, reap the slot on timeout, drop the orphan's
-				// result (buffered chan, no goroutine leak). The orphan's
-				// tile-cache advance may skip one delta on the UI; the
-				// next keyframe heals it. A permanently wedged capture
-				// exits after 3 hangs so a fresh loop (UI re-push) retries
-				// instead of spinning silent timeouts.
-				type capRes struct {
-					msgs []protocol.Message
-					err  error
-				}
-				resCh := make(chan capRes, 1)
-				c0 := time.Now()
-				go func() {
-					msgs, err := captureTiled(q, monitor, all, sc)
-					resCh <- capRes{msgs, err}
+			case <-timer.C:
+				exit := func() bool {
+					if !captureSlot() {
+						return false
+					}
+					// Capture hang watchdog: a wedged GDI call (dead driver,
+					// vanished display) blocks forever and would freeze the
+					// loop with zero evidence. Bound it: run the capture
+					// aside, reap the slot on timeout, drop the orphan's
+					// result (buffered chan, no goroutine leak). The orphan's
+					// tile-cache advance may skip one delta on the UI; the
+					// next keyframe heals it. A permanently wedged capture
+					// exits after 3 hangs so a fresh loop (UI re-push) retries
+					// instead of spinning silent timeouts.
+					type capRes struct {
+						msgs []protocol.Message
+						err  error
+					}
+					resCh := make(chan capRes, 1)
+					c0 := time.Now()
+					go func() {
+						msgs, err := captureTiled(q, monitor, all, sc)
+						resCh <- capRes{msgs, err}
+					}()
+					var msgs []protocol.Message
+					var err error
+					capOK := true
+					select {
+					case r := <-resCh:
+						msgs, err = r.msgs, r.err
+					case <-time.After(5 * time.Second):
+						capOK = false
+					case <-ctx.Done():
+						releaseSlot()
+						return true
+					case <-a.closing:
+						releaseSlot()
+						return true
+					}
+					releaseSlot()
+					if !capOK {
+						capHangs++
+						dlog.Printf("[push] capture hung >5s (%d consecutive), slot reaped", capHangs)
+						if capHangs >= 3 {
+							dlog.Printf("[push] capture wedged, exiting loop (re-push retries)")
+							return true
+						}
+						return false
+					}
+					capHangs = 0
+					if err != nil {
+						return false
+					}
+					ms := time.Since(c0).Milliseconds()
+					if emaMs == 0 {
+						emaMs = float64(ms)
+					} else {
+						emaMs = 0.2*float64(ms) + 0.8*emaMs
+					}
+					// Adaptive quality: slow box -> cheaper frames, fast box -> recover.
+					if emaMs > 100 && q > 40 {
+						q -= 10
+						dlog.Printf("[push] slow cycle ema=%.0fms, quality %d->%d", emaMs, q+10, q)
+					} else if emaMs < 40 && q < qHi {
+						q += 5
+						if q > qHi {
+							q = qHi
+						}
+						dlog.Printf("[push] fast cycle ema=%.0fms, quality recovered to %d", emaMs, q)
+					}
+					if len(msgs) == 0 {
+						return false
+					}
+					// Send-failure budget: one failed publish used to kill the
+					// whole loop (a transient blip cost a 3s+ stall until the
+					// UI re-pushed). Now a failing publish drops one frame and
+					// the loop survives; only a persistently dead transport
+					// (10 in a row) exits, and the UI re-push retries.
+					if err := sendShotMsgs(a.send, msgs); err != nil {
+						sendFails++
+						dlog.Printf("[push] publish failed (%d consecutive): %v", sendFails, err)
+						if sendFails >= 10 {
+							dlog.Printf("[push] transport dead, exiting loop (re-push retries)")
+							return true
+						}
+						return false
+					}
+					sendFails = 0
+					// Idle backoff: heartbeats (nothing changed) slow the pace
+					// 25ms -> 100ms -> 250ms so an idle box stops burning a
+					// core on identical captures; any real frame snaps back
+					// to full pace within one beat. The UI stall watchdog
+					// (3s) stays fed throughout.
+					if len(msgs) == 1 && msgs[0].Type == protocol.TypeScreen && msgs[0].Data == "" {
+						idleBeats++
+					} else {
+						idleBeats = 0
+					}
+					prev := interval
+					switch {
+					case idleBeats > 40:
+						interval = 250 * time.Millisecond
+					case idleBeats > 12:
+						interval = 100 * time.Millisecond
+					default:
+						interval = baseInterval
+					}
+					if interval != prev {
+						dlog.Printf("[push] idle %d beats, pace %v", idleBeats, interval)
+					}
+					return false
 				}()
-				var msgs []protocol.Message
-				var err error
-				capOK := true
-				select {
-				case r := <-resCh:
-					msgs, err = r.msgs, r.err
-				case <-time.After(5 * time.Second):
-					capOK = false
-				case <-ctx.Done():
-					releaseSlot()
-					return
-				case <-a.closing:
-					releaseSlot()
+				if exit {
 					return
 				}
-				releaseSlot()
-				if !capOK {
-					capHangs++
-					dlog.Printf("[push] capture hung >5s (%d consecutive), slot reaped", capHangs)
-					if capHangs >= 3 {
-						dlog.Printf("[push] capture wedged, exiting loop (re-push retries)")
-						return
-					}
-					continue
-				}
-				capHangs = 0
-				if err != nil {
-					continue
-				}
-				ms := time.Since(c0).Milliseconds()
-				if emaMs == 0 {
-					emaMs = float64(ms)
-				} else {
-					emaMs = 0.2*float64(ms) + 0.8*emaMs
-				}
-				// Adaptive quality: slow box -> cheaper frames, fast box -> recover.
-				if emaMs > 100 && q > 40 {
-					q -= 10
-					dlog.Printf("[push] slow cycle ema=%.0fms, quality %d->%d", emaMs, q+10, q)
-				} else if emaMs < 40 && q < qHi {
-					q += 5
-					if q > qHi {
-						q = qHi
-					}
-					dlog.Printf("[push] fast cycle ema=%.0fms, quality recovered to %d", emaMs, q)
-				}
-				if len(msgs) == 0 {
-					continue
-				}
-				// Send-failure budget: one failed publish used to kill the
-				// whole loop (a transient blip cost a 3s+ stall until the
-				// UI re-pushed). Now a failing publish drops one frame and
-				// the loop survives; only a persistently dead transport
-				// (10 in a row) exits, and the UI re-push retries.
-				if err := sendShotMsgs(a.send, msgs); err != nil {
-					sendFails++
-					dlog.Printf("[push] publish failed (%d consecutive): %v", sendFails, err)
-					if sendFails >= 10 {
-						dlog.Printf("[push] transport dead, exiting loop (re-push retries)")
-						return
-					}
-					continue
-				}
-				sendFails = 0
+				timer.Reset(interval)
 			}
 		}
 	}()
@@ -1301,11 +1395,11 @@ func (a *agent) connectOnce() error {
 					}
 					// Dedupe: a second controller may deliver the same command.
 					// (ExecuteChecked runs it only on first sight.)
-				result, suppressed, err := commands.ExecuteChecked(m.CmdID, cmdName, args)
-				if suppressed {
-					log.Printf("[*] Duplicate %s suppressed (first delivery owns the reply)", m.CmdID)
-					return
-				}
+					result, suppressed, err := commands.ExecuteChecked(m.CmdID, cmdName, args)
+					if suppressed {
+						log.Printf("[*] Duplicate %s suppressed (first delivery owns the reply)", m.CmdID)
+						return
+					}
 					errStr := ""
 					if err != nil {
 						errStr = err.Error()
@@ -1319,36 +1413,36 @@ func (a *agent) connectOnce() error {
 					if len(result) > 1024*1024 {
 						result = result[:1024*1024] + "\n... truncated"
 					}
-				sendCamFrags(m.CmdID, result, errStr, a.send)
-				log.Printf("[*] Sent output (%d bytes)", len(result))
+					sendCamFrags(m.CmdID, result, errStr, a.send)
+					log.Printf("[*] Sent output (%d bytes)", len(result))
 				}(msg)
 			case protocol.TypeScreenshotRequest:
-			log.Printf("[*] Screenshot requested (quality=%d monitor=%d all=%v scale=%v push=%v)", msg.Quality, msg.Monitor, msg.AllMonitors, msg.Scale, msg.Push)
-			if msg.Push {
-				a.startPushStream(msg.Quality, msg.Monitor, msg.AllMonitors, msg.Scale)
-				continue
-			}
-			a.stopPushStream()
-			go func(quality, monitor int, all bool, scale float64, tiles bool) {
-				if !captureSlot() {
-					_ = a.send(protocol.Message{Type: protocol.TypeScreen})
-					return
+				log.Printf("[*] Screenshot requested (quality=%d monitor=%d all=%v scale=%v push=%v)", msg.Quality, msg.Monitor, msg.AllMonitors, msg.Scale, msg.Push)
+				if msg.Push {
+					a.startPushStream(msg.Quality, msg.Monitor, msg.AllMonitors, msg.Scale)
+					continue
 				}
-				defer releaseSlot()
-				if tiles {
-					msgs, err := captureTiled(quality, monitor, all, scale)
-					if err != nil {
-						log.Printf("[!] capture: %v", err)
-						_ = a.send(protocol.Message{Type: protocol.TypeScreen, Error: err.Error()})
+				a.stopPushStream()
+				go func(quality, monitor int, all bool, scale float64, tiles bool) {
+					if !captureSlot() {
+						_ = a.send(protocol.Message{Type: protocol.TypeScreen})
 						return
 					}
-					if err := sendShotMsgs(a.send, msgs); err != nil {
-						log.Printf("[!] send screen: %v", err)
+					defer releaseSlot()
+					if tiles {
+						msgs, err := captureTiled(quality, monitor, all, scale)
+						if err != nil {
+							log.Printf("[!] capture: %v", err)
+							_ = a.send(protocol.Message{Type: protocol.TypeScreen, Error: err.Error()})
+							return
+						}
+						if err := sendShotMsgs(a.send, msgs); err != nil {
+							log.Printf("[!] send screen: %v", err)
+						}
+						return
 					}
-					return
-				}
-				s0 := frameSeq.Load()
-				data, w, h, ox, oy, format, err := captureImage(quality, monitor, all, scale)
+					s0 := frameSeq.Load()
+					data, w, h, ox, oy, format, err := captureImage(quality, monitor, all, scale)
 					if err != nil {
 						log.Printf("[!] capture: %v", err)
 						_ = a.send(protocol.Message{Type: protocol.TypeScreen, Error: err.Error()})
@@ -1463,7 +1557,6 @@ func (a *agent) connectOnce() error {
 		}
 	}
 }
-
 
 // relaySessionActive marks a full relay session (MQTT main loop) in
 // progress. The listen-only loop below stands down while set, so two relay
@@ -1595,7 +1688,7 @@ func relayListenOnce(a *agent, hn, user, me, caFile string) error {
 				}) {
 					return
 				}
-			execCommand(m.Cmd, m.CmdID, 1024*1024, "\n... truncated", mout)
+				execCommand(m.Cmd, m.CmdID, 1024*1024, "\n... truncated", mout)
 			}(msg)
 		case protocol.TypeScreenshotRequest:
 			if msg.Push {
@@ -1882,13 +1975,13 @@ func (a *agent) connectViaMQTT() error {
 				}) {
 					return
 				}
-			execCommand(cmdStr, m.CmdID, 1024*1024, "\n... truncated", func(resp protocol.Message) error {
-				if err := mout(resp); err != nil {
-					log.Printf("[!] MQTT publish output: %v", err)
-					return err
-				}
-				return nil
-			})
+				execCommand(cmdStr, m.CmdID, 1024*1024, "\n... truncated", func(resp protocol.Message) error {
+					if err := mout(resp); err != nil {
+						log.Printf("[!] MQTT publish output: %v", err)
+						return err
+					}
+					return nil
+				})
 			}(msg)
 		case protocol.TypeScreenshotRequest:
 			if msg.Push {
@@ -1926,14 +2019,14 @@ func (a *agent) connectViaMQTT() error {
 				_ = mout(protocol.Message{Type: protocol.TypeScreen, Width: w, Height: h, OX: ox, OY: oy, Data: b64, Format: format, FSeq: nextFrameSeq(), Scale: effectiveScale(scale)})
 			}(msg.Quality, msg.Monitor, msg.AllMonitors, msg.Scale, msg.Tiles)
 		case protocol.TypePing:
-				_ = bus.Publish("out/"+hn, relay.Envelope{From: me, To: "controller", Payload: mustJSON(protocol.Message{Type: protocol.TypePong}), Time: nowMillis()})
+			_ = bus.Publish("out/"+hn, relay.Envelope{From: me, To: "controller", Payload: mustJSON(protocol.Message{Type: protocol.TypePong}), Time: nowMillis()})
 		case protocol.TypeDisconnect:
-				// User ended the session: go quiet, then break the main loop.
-				a.setQuiet(disconnectQuiet)
-				select {
-				case discCh <- struct{}{}:
-				default:
-				}
+			// User ended the session: go quiet, then break the main loop.
+			a.setQuiet(disconnectQuiet)
+			select {
+			case discCh <- struct{}{}:
+			default:
+			}
 		}
 	}
 	if err := bus.SubscribeCmd(onCmd); err != nil {

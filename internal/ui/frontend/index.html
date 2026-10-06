@@ -269,7 +269,7 @@ html{touch-action:manipulation}
         <span style="font-size:11px;color:#888">Mon:</span><select id="monitorSel" class="select" title="Capture monitor"><option value="0">Primary (0)</option><option value="1">Monitor 1</option><option value="-1">All</option></select><button class="btn btn-small" id="monRefresh" title="Refresh monitor list">⟳</button>
         <span style="font-size:11px;color:#888">FPS:</span><select id="fpsSel" class="select" title="Stream frame rate"><option value="0">On-demand</option><option value="1" selected>1</option><option value="2">2</option><option value="5">5</option><option value="10">10</option><option value="15">15</option><option value="20">20</option><option value="30">30</option><option value="60">60</option></select>
         <span style="font-size:11px;color:#888">Pipe:</span><select id="pipeSel" class="select" title="Frames allowed in flight: overlaps round trips for higher fps"><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option><option value="5">5</option><option value="6" selected>6</option></select>
-        <span style="font-size:11px;color:#888">Detail:</span><select id="detailSel" class="select" title="Capture detail: Auto uses full-res on direct links, half-res on relay links"><option value="auto" selected>Auto</option><option value="full">Full</option><option value="half">Half</option></select>
+        <span style="font-size:11px;color:#888">Detail:</span><select id="detailSel" class="select" title="Capture detail: Auto uses full-res on direct links, half-res on relay links"><option value="auto" selected>Auto</option><option value="full">Full</option><option value="half">Half</option><option value="quarter">Quarter</option></select>
         <div class="sep"></div>
         <span style="font-size:11px;color:#888">Preset:</span><select id="presetSel" class="select" title="One-click display presets (sets Quality+FPS+Detail+Pipe)"><option value="custom">Custom</option><option value="fast">Fast</option><option value="balanced" selected>Balanced</option><option value="crisp">Crisp</option></select>
         <button class="btn btn-small" id="clipPullBtn" title="Copy remote clipboard text to this PC">⧉ Get Clip</button>
@@ -1213,6 +1213,7 @@ function streamScale(){
   const d=$("detailSel")?.value||"auto";
   if(d==="full") return 1;
   if(d==="half") return 0.5;
+  if(d==="quarter") return 0.25; // weak boxes / fast motion: 16x smaller frames
   return isRelay(selected)?0.5:1;
 }
 function requestShot(){

@@ -19,7 +19,9 @@ import (
 // nominal rate looks fine). Pure Win32, no new dependencies.
 // Negative origins (multi-monitor left/above primary) are fine: the
 // source coords truncate to 32-bit at the ABI like GDI expects.
-func captureLayered(rect image.Rectangle) (*image.RGBA, error) {
+// swap=false leaves GDI's BGRA order for callers that fuse the swap
+// into a downscale (halveBGRAsrc); swap=true returns standard RGBA.
+func captureLayered(rect image.Rectangle, swap bool) (*image.RGBA, error) {
 	w, h := rect.Dx(), rect.Dy()
 	if w <= 0 || h <= 0 {
 		return nil, fmt.Errorf("empty rect")
@@ -74,9 +76,12 @@ func captureLayered(rect image.Rectangle) (*image.RGBA, error) {
 	if ret == 0 {
 		return nil, fmt.Errorf("GetDIBits failed")
 	}
-	// GDI delivers BGRA; image.RGBA wants RGBA.
-	for i := 0; i < len(img.Pix); i += 4 {
-		img.Pix[i], img.Pix[i+2] = img.Pix[i+2], img.Pix[i]
+	// GDI delivers BGRA; image.RGBA wants RGBA (skipped when the
+	// caller fuses the swap into a downscale pass).
+	if swap {
+		for i := 0; i < len(img.Pix); i += 4 {
+			img.Pix[i], img.Pix[i+2] = img.Pix[i+2], img.Pix[i]
+		}
 	}
 	return img, nil
 }
