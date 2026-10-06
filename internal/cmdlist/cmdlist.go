@@ -101,6 +101,7 @@ var Known = map[string]string{
 	"get-active-window":       "Get active window",
 	"get-chrome-tabs":         "List Chrome windows (active tab each) - Jarvis: what tabs does he have",
 	"voice-cmd":               "Jarvis voice/text command - voice-cmd <what you said>",
+	"memory":                  "Jarvis memory - memory remember|recall|forget|status",
 	"lock-screen":             "Lock screen",
 	"minimize-all-windows":    "Minimize all windows",
 	"set-wallpaper":           "Set wallpaper - set-wallpaper <path>",

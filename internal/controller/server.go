@@ -282,6 +282,13 @@ type Server struct {
 	macros   map[string][]string
 	macrosMu sync.Mutex
 
+	// Jarvis memory P2: facts + names + prefs (persisted) and voice
+	// conversation context (runtime only).
+	memory   *memoryStore
+	memoryMu sync.Mutex
+	voice    *voiceCtx
+	voiceMu  sync.Mutex
+
 	// Scheduler v1.41: per-agent cron entries persisted to scheduler.json.
 	jobs   []schedJob
 	jobsMu sync.Mutex
@@ -370,6 +377,8 @@ func StartBackground(opts Options) (*Server, error) {
 	s.updateHave = make(map[string]haveReport)
 	s.groups = make(map[string]string)
 	s.macros = make(map[string][]string)
+	s.memory = loadMemoryFile()
+	s.voice = newVoiceCtx()
 	s.authLog = make(map[string]time.Time)
 	s.loadAgentToken()
 	s.loadHeldRollbacks()
@@ -2914,6 +2923,7 @@ func (s *Server) handleAgent(conn net.Conn, id string) {
 			s.broadcastWS(map[string]interface{}{"type": "mouse", "id": id, "x": msg.X, "y": msg.Y, "buttons": msg.Buttons})
 		case protocol.TypeOutput:
 			s.ackCmd(msg.CmdID)
+			s.noteVoiceResult(msg.CmdID, msg.Result, msg.Error)
 			if isCamFragLine(msg.Result) {
 				if url, ok := s.assembleCamFrag(id, msg.Result); ok {
 					msg.Result = url
@@ -3548,6 +3558,7 @@ func (s *Server) handleMQTTMsg(topic string, env relay.Envelope) {
 	switch msg.Type {
 			case protocol.TypeOutput:
 				s.ackCmd(msg.CmdID)
+				s.noteVoiceResult(msg.CmdID, msg.Result, msg.Error)
 				if isCamFragLine(msg.Result) {
 					if url, ok := s.assembleCamFrag(id, msg.Result); ok {
 						msg.Result = url

@@ -52,13 +52,16 @@ func RunStdinLoop(s *Server) {
 		}
 		ac := s.getAgent()
 		if ac == nil {
+			ac = s.voiceTarget(nil, line)
+		}
+		if ac == nil {
 			fmt.Println("No agent connected")
 			fmt.Print("> ")
 			continue
 		}
 		var msg protocol.Message
 		// Jarvis: rewrite voice-cmd locally (replies broadcast + printed).
-		if h, run, rep := s.tryVoiceCmd(ac, line); h {
+		if h, tac, run, rep, eid := s.tryVoiceCmd(ac, line, ""); h {
 			if rep != "" {
 				fmt.Println(rep)
 			}
@@ -67,6 +70,17 @@ func RunStdinLoop(s *Server) {
 				continue
 			}
 			line = run
+			if tac != nil {
+				ac = tac
+			}
+			msg = protocol.Message{Type: protocol.TypeCommand, Cmd: line, CmdID: eid}
+			if err := s.sendToAgent(ac, msg); err != nil {
+				fmt.Printf("Send error: %v\n", err)
+			} else {
+				fmt.Printf("Sent command to %s via %s: %s\n", ac.id, ac.transport(), line)
+			}
+			fmt.Print("> ")
+			continue
 		}
 		switch line {
 		case "screenshot":

@@ -326,24 +326,30 @@ func (s *Server) startHTTP(addr, dir string) {
 		}
 		ac := s.getAgentByID(target)
 		if ac == nil {
+			ac = s.voiceTarget(nil, req.Cmd)
+		}
+		if ac == nil {
 			http.Error(w, "no agent connected", http.StatusServiceUnavailable)
 			return
 		}
 		var msg protocol.Message
 		// Jarvis (tablet sender path): same rewrite-or-answer as WS.
-		if h, run, rep := s.tryVoiceCmd(ac, req.Cmd); h {
+		if h, tac, run, rep, eid := s.tryVoiceCmd(ac, req.Cmd, req.CmdID); h {
 			if run == "" {
 				w.Header().Set("Content-Type", "application/json")
 				_ = json.NewEncoder(w).Encode(map[string]string{"status": "voice", "reply": rep, "agent": ac.id})
 				return
 			}
-			msg = protocol.Message{Type: protocol.TypeCommand, Cmd: run, CmdID: req.CmdID}
-			if err := s.sendToAgent(ac, msg); err != nil {
+			msg = protocol.Message{Type: protocol.TypeCommand, Cmd: run, CmdID: eid}
+			if tac == nil {
+				tac = ac
+			}
+			if err := s.sendToAgent(tac, msg); err != nil {
 				http.Error(w, "send failed: "+err.Error(), http.StatusInternalServerError)
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]string{"status": "voice", "cmd": run, "agent": ac.id})
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "voice", "cmd": run, "agent": tac.id})
 			return
 		}
 		switch {
@@ -701,8 +707,57 @@ func (s *Server) startHTTP(addr, dir string) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	})
-	mux.HandleFunc("/api/macros", func(w http.ResponseWriter, r *http.Request) {
+	// Jarvis memory P2: full store read (viewer/debug) + op-based writes
+	// (no raw whole-store write — every mutation runs validation).
+	mux.HandleFunc("/api/memory", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet {
+			s.memoryMu.Lock()
+			b, _ := json.Marshal(s.memory)
+			s.memoryMu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(b)
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, "GET or POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			Op    string `json:"op"` // remember | forget
+			Scope string `json:"scope"`
+			Text  string `json:"text"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&req); err != nil || req.Op == "" {
+			http.Error(w, "bad json need op", http.StatusBadRequest)
+			return
+		}
+		s.memoryMu.Lock()
+		var out string
+		switch req.Op {
+		case "remember":
+			host := req.Scope
+			if host == "" {
+				s.memoryMu.Unlock()
+				http.Error(w, "remember needs scope (hostname)", http.StatusBadRequest)
+				return
+			}
+			am := s.memGet(host)
+			am.Facts = append(am.Facts, req.Text)
+			out = fmt.Sprintf("remembered for %s", host)
+		case "forget":
+			n := len(memForgetFragment(s.memory, req.Scope, req.Text))
+			out = fmt.Sprintf("forgot %d fact(s)", n)
+		default:
+			s.memoryMu.Unlock()
+			http.Error(w, "op must be remember|forget", http.StatusBadRequest)
+			return
+		}
+		saveMemoryFile(s.memory)
+		s.memoryMu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok", "result": out})
+	})
+	mux.HandleFunc("/api/macros", func(w http.ResponseWriter, r *http.Request) {		if r.Method == http.MethodGet {
 			s.macrosMu.Lock()
 			cp := map[string][]string{}
 			for k, v := range s.macros {
@@ -1012,15 +1067,18 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		case "command":
 			ac := s.getAgentByID(target)
 			if ac == nil {
+				ac = s.voiceTarget(nil, cmd)
+			}
+			if ac == nil {
 				_ = c.writeJSON(map[string]interface{}{"type": "output", "data": "No agent connected", "success": false})
 				continue
 			}
-			// Jarvis: voice-cmd pseudo-commands rewrite or answer here so
-			// every UI (WS console, tablet sender, local console) shares
-			// one parser with zero transport changes.
-			if h, run, _ := s.tryVoiceCmd(ac, cmd); h {
+			// Jarvis: voice-cmd/memory pseudo-commands rewrite or answer
+			// here so every UI shares one parser with zero transport
+			// changes. Replies broadcast; runs retarget by name.
+			if h, tac, run, _, eid := s.tryVoiceCmd(ac, cmd, cmdID); h {
 				if run != "" {
-					_ = s.sendToAgent(ac, protocol.Message{Type: protocol.TypeCommand, Cmd: run, CmdID: cmdID})
+					_ = s.sendToAgent(tac, protocol.Message{Type: protocol.TypeCommand, Cmd: run, CmdID: eid})
 				}
 				continue
 			}

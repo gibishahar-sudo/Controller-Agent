@@ -31,10 +31,10 @@ func TestParseVoiceCmd(t *testing.T) {
 		{"open", true, "", "Open what"},
 		{"open that", true, "", "Open what"},
 		{"open somewhere over the rainbow", true, "", "Don't know"},
-		{"remember his name is Dave", true, "", "memory ships next"},
-		{"what do you remember about Dave", true, "", "memory ships next"},
-		{"forget his wifi password", true, "", "memory ships next"},
-		{"who is Dave", true, "", "memory ships next"},
+		{"remember his name is Dave", true, "", "Say it fuller"},
+		{"what do you remember about Dave", true, "", "Say it fuller"},
+		{"forget his wifi password", true, "", "Say it fuller"},
+		{"who is Dave", true, "", "Say it fuller"},
 		{"open the third one", true, "", "Don't know"}, // ordinal + open: clarify wins over memory pointer
 		{"open superman.com", true, "open-url chrome https://superman.com", ""}, // "up" must not eat the domain
 		{"play that on his screen", false, "", ""},    // unknown: raw flow
