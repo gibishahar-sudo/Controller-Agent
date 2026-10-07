@@ -4,6 +4,8 @@ import (
 	"crypto/sha256"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -263,5 +265,41 @@ func TestUITrimmedLogin(t *testing.T) {
 	// Genuinely wrong stays wrong.
 	if code := login("nope"); code != http.StatusUnauthorized {
 		t.Fatalf("wrong password: code %d want 401", code)
+	}
+}
+
+func TestUIActiveSource(t *testing.T) {
+	t.Setenv("RMM_UI_PASSWORD", "whatever")
+	if got := uiActiveSource(); got != "RMM_UI_PASSWORD" {
+		t.Fatalf("env set: source %q", got)
+	}
+	t.Setenv("RMM_UI_PASSWORD", "")
+	dir := t.TempDir()
+	old, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chdir(old) }()
+	if got := uiActiveSource(); strings.Contains(got, "RMM_UI_PASSWORD") {
+		t.Fatalf("env empty: source %q", got)
+	}
+	// No file anywhere: the none-yet branch (must not generate).
+	before, _ := os.ReadDir(dir)
+	if got := uiActiveSource(); got == "" || strings.Contains(got, "RMM_UI_PASSWORD") {
+		t.Fatalf("nothing configured: source %q", got)
+	}
+	after, _ := os.ReadDir(dir)
+	if len(before) != len(after) {
+		t.Fatal("source probe must never generate a password file")
+	}
+	// A ui_password.txt in CWD wins when env is empty.
+	if err := os.WriteFile(filepath.Join(dir, uiPassFile), []byte("f\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if got := uiActiveSource(); !strings.HasSuffix(got, uiPassFile) {
+		t.Fatalf("file present: source %q", got)
 	}
 }

@@ -27,9 +27,10 @@ import (
 // Password source (first hit wins, no new CLI flags by design):
 // RMM_UI_PASSWORD env → ui_password.txt beside the exe (or CWD, 0600)
 // → generated once, persisted, logged (never the secret itself).
-// The env password is read LIVE on every attempt (not from the boot hash),
-// so setting it takes effect without a controller restart; file/generated
-// passwords use the cached hash.
+// The env is read live on every attempt (no boot-cache staleness), but the
+// OS rule still applies: a process inherits its environment ONCE at spawn,
+// so a new/changed user variable needs a controller restart to arrive.
+// File/generated passwords use the cached hash.
 // Sessions: 32-byte random tokens, 12h fixed TTL, server-side store.
 // Brute force: 5 bad passwords per source IP → 5-minute block (429).
 // Sessions: 32-byte random tokens, 12h fixed TTL, server-side store.
@@ -115,9 +116,29 @@ func uiResolvePassword() (string, string) {
 	return pw, "generated " + save
 }
 
+// uiActiveSource names the winning password source WITHOUT side effects
+// (unlike uiResolvePassword, it never generates+saves). Local logs only —
+// never sent to any client. Exists so the next "correct password rejected"
+// is a one-line log read instead of an investigation.
+func uiActiveSource() string {
+	if os.Getenv("RMM_UI_PASSWORD") != "" {
+		return "RMM_UI_PASSWORD"
+	}
+	cands := []string{uiPassFile}
+	if exe, err := os.Executable(); err == nil {
+		cands = append([]string{filepath.Join(filepath.Dir(exe), uiPassFile)}, cands...)
+	}
+	for _, p := range cands {
+		if st, err := os.Stat(p); err == nil && !st.IsDir() {
+			return p
+		}
+	}
+	return "none-yet (generated at boot)"
+}
+
 // uiVerifyPassword constant-time compares the candidate. The env password
-// is read live (see header): a freshly set RMM_UI_PASSWORD works without
-// a restart. File/generated passwords use the boot-cached hash.
+// is read live (no boot-cache staleness); file/generated passwords use the
+// cached hash. Process environment still arrives once at spawn — see header.
 func (s *Server) uiVerifyPassword(candidate string) bool {
 	if pw := os.Getenv("RMM_UI_PASSWORD"); pw != "" {
 		a := sha256.Sum256([]byte(candidate))
@@ -260,6 +281,7 @@ func (s *Server) handleUILogin(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.uiFail(ip)
+		log.Printf("[http] login failed for %s (password from %s)", ip, uiActiveSource())
 		http.Error(w, "bad password", http.StatusUnauthorized)
 		return
 	}
