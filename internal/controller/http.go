@@ -714,6 +714,23 @@ func (s *Server) startHTTP(addr, dir string) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	})
+	// Jarvis spoken replies (P3b): tablets can't hear the WebView, so they
+	// poll the newest voice answer (direct reply or completed run result)
+	// newer than ?since=<unixms> and speak it natively. 204 = nothing new.
+	mux.HandleFunc("/api/voice-reply", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "GET only", http.StatusMethodNotAllowed)
+			return
+		}
+		var since int64
+		fmt.Sscanf(r.URL.Query().Get("since"), "%d", &since)
+		if text, ts, ok := s.pickVoiceReply(since); ok {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"text": text, "ts": ts})
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
 	// Jarvis memory P2: full store read (viewer/debug) + op-based writes
 	// (no raw whole-store write — every mutation runs validation).
 	mux.HandleFunc("/api/memory", func(w http.ResponseWriter, r *http.Request) {

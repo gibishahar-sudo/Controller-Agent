@@ -44,6 +44,8 @@ public class HomeActivity extends Activity {
     private EditText cmdInput;
     private TextView queueText;
     private Button serviceBtn;
+    private Button speakBtn;
+    private android.speech.tts.TextToSpeech tts;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -71,6 +73,15 @@ public class HomeActivity extends Activity {
     @Override
     protected void onStop() {
         super.onStop();
+        stopSpeaking();
+        try {
+            if (tts != null) {
+                tts.shutdown();
+                tts = null;
+            }
+        } catch (Exception e) {
+            // shutting down anyway
+        }
         AppLock.onBackgrounded();
     }
 
@@ -175,9 +186,22 @@ public class HomeActivity extends Activity {
         v.addView(cmdInput);
 
         Button mic = new Button(this);
-        mic.setText("🎤 Voice (fills command — you tap Send)");
+        mic.setText("🎤 Voice (auto-sends)");
         mic.setOnClickListener(unused -> startVoiceInput());
         v.addView(mic);
+
+        speakBtn = new Button(this);
+        paintSpeak();
+        speakBtn.setOnClickListener(unused -> {
+            boolean on = !speakOn();
+            getSharedPreferences(SetupActivity.PREFS, MODE_PRIVATE).edit()
+                    .putString(SetupActivity.KEY_SPKR, on ? "1" : "").apply();
+            paintSpeak();
+            if (!on) {
+                stopSpeaking();
+            }
+        });
+        v.addView(speakBtn);
 
         Button send = new Button(this);
         send.setText("Send");
@@ -371,9 +395,88 @@ public class HomeActivity extends Activity {
         }
         cmdInput.setText("voice-cmd " + text);
         toast("Heard: " + text);
+        sendCommand(); // operator-ordered auto-send (P3b)
     }
 
-    private void sendCommand() {        final String cmd = cmdInput.getText().toString().trim();
+    private boolean speakOn() {
+        return SetupActivity.pref(this, SetupActivity.KEY_SPKR, "1").equals("1");
+    }
+
+    private void paintSpeak() {
+        if (speakBtn == null) {
+            return;
+        }
+        speakBtn.setText(speakOn() ? "🔊 Speak replies: ON" : "🔇 Speak replies: OFF");
+    }
+
+    private void stopSpeaking() {
+        try {
+            if (tts != null) {
+                tts.stop();
+            }
+        } catch (Exception e) {
+            // shutting down anyway
+        }
+    }
+
+    private void speakReply(String text) {
+        final String clean = text.replace("🎙", "").trim();
+        if (clean.isEmpty()) {
+            return;
+        }
+        runOnUiThread(() -> {
+            try {
+                if (tts == null) {
+                    tts = new android.speech.tts.TextToSpeech(HomeActivity.this, status -> {
+                        if (status == android.speech.tts.TextToSpeech.SUCCESS) {
+                            tts.setLanguage(java.util.Locale.US);
+                            tts.speak(clean, android.speech.tts.TextToSpeech.QUEUE_FLUSH, null, "jarvis");
+                        }
+                    });
+                } else {
+                    tts.speak(clean, android.speech.tts.TextToSpeech.QUEUE_FLUSH, null, "jarvis");
+                }
+            } catch (Exception e) {
+                // TTS missing on this device; replies stay readable
+            }
+        });
+    }
+
+    /** After a voice send, poll the controller for the spoken reply (~12s)
+     * and read it aloud. Plain commands never poll. */
+    private void listenForReply(String cmd) {
+        if (!speakOn() || cmd == null) {
+            return;
+        }
+        String lc = cmd.trim().toLowerCase();
+        if (!lc.startsWith("voice-cmd") && !lc.startsWith("memory")) {
+            return;
+        }
+        final long since = System.currentTimeMillis();
+        final String pw = password();
+        new Thread(() -> {
+            for (int i = 0; i < 12; i++) {
+                try {
+                    Thread.sleep(1000);
+                } catch (InterruptedException e) {
+                    return;
+                }
+                try {
+                    String body = ApiClient.get("/api/voice-reply?since=" + since, pw);
+                    org.json.JSONObject j = new org.json.JSONObject(body);
+                    String text = j.optString("text", "");
+                    if (!text.isEmpty()) {
+                        speakReply(text);
+                        return;
+                    }
+                } catch (Exception e) {
+                    return; // core down or gone; stay silent
+                }
+            }
+        }, "rmm-listen-reply").start();
+    }
+    private void sendCommand() {
+        final String cmd = cmdInput.getText().toString().trim();
         if (cmd.isEmpty()) {
             return;
         }
@@ -386,6 +489,7 @@ public class HomeActivity extends Activity {
                     toast("Sent — replies in console");
                     cmdInput.setText("");
                 });
+                listenForReply(cmd);
                 flushQueue(false);
             } catch (Exception e) {
                 Set<String> q = queue();

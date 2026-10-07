@@ -59,6 +59,38 @@ final class ApiClient {
         throw new Exception("send failed (login expired)");
     }
 
+    /** Authenticated GET (voice-reply poll). 204 → empty string (nothing
+     * new); anything else non-200 throws like send. */
+    static synchronized String get(String path, String password) throws Exception {
+        for (int attempt = 0; attempt < 2; attempt++) {
+            if (cookie == null) {
+                login(password);
+            }
+            HttpURLConnection c = (HttpURLConnection) new URL(BASE + path).openConnection();
+            c.setRequestMethod("GET");
+            c.setConnectTimeout(15000);
+            c.setReadTimeout(30000);
+            if (cookie != null) {
+                c.setRequestProperty("Cookie", cookie);
+            }
+            int code = c.getResponseCode();
+            String resp = readAll(c);
+            c.disconnect();
+            if (code == 401) {
+                cookie = null; // session died; one re-login, then give up
+                continue;
+            }
+            if (code == 204) {
+                return "";
+            }
+            if (code != 200) {
+                throw new Exception("get failed (code " + code + ")");
+            }
+            return resp;
+        }
+        throw new Exception("get failed (login expired)");
+    }
+
     private static HttpURLConnection post(String path, String body, String ck) throws Exception {
         HttpURLConnection c = (HttpURLConnection) new URL(BASE + path).openConnection();
         c.setRequestMethod("POST");

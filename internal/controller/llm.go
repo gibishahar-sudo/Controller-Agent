@@ -41,18 +41,18 @@ const (
 )
 
 type llmState struct {
-	mu       sync.Mutex
-	cmd      *exec.Cmd
-	verified bool // shas checked this boot
-	ready    bool // files present + verified
-	pulling  bool
-	pullPct  int
-	pullWhat string
-	lastUse  time.Time
-	lastErr  string
-	idleT    *time.Timer
-	stopPull bool
-	starting bool
+	mu        sync.Mutex
+	cmd       *exec.Cmd
+	verified  bool // shas checked this boot
+	ready     bool // files present + verified
+	pulling   bool
+	pullPct   int
+	pullWhat  string
+	lastUse   time.Time
+	lastErr   string
+	idleT     *time.Timer
+	stopPull  bool
+	starting  bool
 	startDone chan struct{}
 }
 
@@ -76,9 +76,9 @@ func llmHome() string {
 	return dir
 }
 
-func llmBinDir() string  { return filepath.Join(llmHome(), "bin") }
-func llmExe() string     { return filepath.Join(llmBinDir(), "llama-server.exe") }
-func llmModel() string   { return filepath.Join(llmHome(), "model.gguf") }
+func llmBinDir() string { return filepath.Join(llmHome(), "bin") }
+func llmExe() string    { return filepath.Join(llmBinDir(), "llama-server.exe") }
+func llmModel() string  { return filepath.Join(llmHome(), "model.gguf") }
 
 func shaFileHex(path string) (string, error) {
 	f, err := os.Open(path)
@@ -535,6 +535,27 @@ func (s *Server) tryLLMCmd(cmd string) (bool, string) {
 		}
 	}
 	return false, ""
+}
+
+// llmPhraseIfReady phrases text through the model ONLY when the sidecar
+// is already warm (running + healthy). Never starts a pull, never blocks
+// hunting one: cold return ("", false) keeps the raw text on its way.
+func (s *Server) llmPhraseIfReady(text string) (string, bool) {
+	if s.llm == nil {
+		return "", false
+	}
+	st := s.llm
+	st.mu.Lock()
+	running := st.cmd != nil && st.cmd.Process != nil
+	st.mu.Unlock()
+	if !running || !llmHealthy() {
+		return "", false
+	}
+	line, err := s.llmSay(text)
+	if err != nil || line == "" || len(line) > 200 {
+		return "", false
+	}
+	return line, true
 }
 
 // llmSay phrases operator-result text into one short Jarvis line (proven

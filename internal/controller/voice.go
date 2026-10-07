@@ -162,6 +162,30 @@ func ensureScheme(s string) string {
 	return "https://" + s
 }
 
+// pickVoiceReply returns the newest voice answer (direct reply or completed
+// run result) newer than sinceMillis, for the tablet TTS poll. 204-style
+// miss is reported as ok=false.
+func (s *Server) pickVoiceReply(sinceMillis int64) (text string, ts int64, ok bool) {
+	s.voiceMu.Lock()
+	defer s.voiceMu.Unlock()
+	var best string
+	var bestTs int64
+	if sp := s.voice.spoken; sp != nil {
+		if t := sp.at.UnixMilli(); t > sinceMillis && t > bestTs {
+			best, bestTs = sp.text, t
+		}
+	}
+	if last := s.voice.last; last != nil && len(last.lines) > 0 {
+		if t := last.at.UnixMilli(); t > sinceMillis && t > bestTs {
+			best, bestTs = strings.Join(last.lines, " · "), t
+		}
+	}
+	if bestTs == 0 {
+		return "", 0, false
+	}
+	return best, bestTs, true
+}
+
 // parseMemoryCmd handles the memory grammar (shared by voice-cmd memory
 // phrases and the memory pseudo-command). host = selected hostname ("" if
 // none). Returns matched, and optionally tac to retarget execution.
@@ -296,7 +320,18 @@ func (s *Server) finishVoice(ac, tac *AgentConn, run, rep, rest, cmdID string) (
 		host = tac.hostname
 	}
 	if rep != "" {
+		// Phrasing wire (P0r-proven job): long replies get one llmSay
+		// pass, but ONLY when the sidecar is already warm — never a pull,
+		// never added latency hunting one. Failures keep the raw text.
+		if len(rep) > 80 {
+			if line, ok := s.llmPhraseIfReady(rep); ok {
+				rep = line
+			}
+		}
 		s.broadcastWS(map[string]interface{}{"type": "output", "id": host, "data": rep, "success": true})
+		s.voiceMu.Lock()
+		s.voice.spoken = &voiceSpoken{text: rep, at: time.Now()}
+		s.voiceMu.Unlock()
 	}
 	if run != "" {
 		if tac == nil {

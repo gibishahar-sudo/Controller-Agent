@@ -36,6 +36,7 @@ public class SetupActivity extends Activity {
     public static final String KEY_MONBTN = "monbtn";
     public static final String KEY_HOTWORD = "hotword";
     public static final String KEY_PORCUPINE = "porcupine_key";
+    public static final String KEY_SPKR = "speak_replies";
     private static final int REQ_MIC = 7101;
     private TextView hwStatusView;
 

@@ -398,6 +398,7 @@ html{touch-action:manipulation}
         <span class="gt">❯</span><input id="cmdInput" placeholder="Enter command… (help, list-directory, get-system-info)" autocomplete="off"/>
         <button class="btn btn-primary btn-small" id="cmdSend">Send</button>
         <button class="btn btn-small" id="micBtn" title="Dictate a command (Chrome desktop only)">🎤</button>
+        <button class="btn btn-small" id="speakBtn" title="Spoken Jarvis replies on/off">🔊</button>
         <button class="btn btn-small" id="sendAllBtn" title="Send commands to ALL connected agents">All: OFF</button>
         <button class="btn btn-small" id="exportLog" title="Download terminal log">⤓</button>
         <button class="btn btn-small" id="clearTerm" title="Clear terminal">Clear</button>
@@ -695,6 +696,7 @@ function connectWS(){
           let line=`[${m.id||selected?.id||"agent"}] ${m.data||m.error||""}`;
           if(lastCmdAt && Date.now()-lastCmdAt<30000) line+=` • ${Date.now()-lastCmdAt}ms`;
           addTerm(line, t); addScreenLog(line);
+          speakJarvis(m.data||"");
           }
         }
       }
@@ -1106,6 +1108,7 @@ $("micBtn")?.addEventListener("click", ()=>{
     if(!heard) return;
     const box=$("cmdInput"); if(box){ box.value="voice-cmd "+heard; box.focus(); }
     addTerm("🎙 heard: "+heard, "out");
+    sendCmd(); // operator-ordered auto-send: heard text goes immediately
   };
   rec.onerror=e=>{
     if(my!==micAttempt) return;
@@ -1128,6 +1131,29 @@ $("micBtn")?.addEventListener("click", ()=>{
   rec.onend=done;
   try{ rec.start(); }catch{ done(); }
 });
+// Spoken Jarvis replies (desktop): speechSynthesis over 🎙 outputs, never
+// the heard-echoes. Toggle persists (default ON — operator-ordered voice).
+function speakOn(){
+  try{ return (localStorage.getItem("rmm_speak")||"1")==="1"; }catch{ return true; }
+}
+function paintSpeakBtn(){ const b=$("speakBtn"); if(b) b.textContent=speakOn()?"🔊":"🔇"; }
+$("speakBtn")?.addEventListener("click", ()=>{
+  try{ localStorage.setItem("rmm_speak", speakOn()?"0":"1"); }catch{}
+  if(!speakOn()&&window.speechSynthesis){ try{window.speechSynthesis.cancel();}catch{} }
+  paintSpeakBtn();
+});
+paintSpeakBtn();
+function speakJarvis(text){
+  if(!speakOn()) return;
+  let t=String(text||"").replace(/^🎙\s*/,"").trim();
+  if(!t||/^heard /.test(t)) return; // confirmations stay silent
+  if(t.length>400) t=t.slice(0,400);
+  try{
+    if(!window.speechSynthesis) return;
+    window.speechSynthesis.cancel();
+    window.speechSynthesis.speak(new SpeechSynthesisUtterance(t));
+  }catch{}
+}
 function sendAllCount(){ return agents.filter(a=>!a.id.startsWith("manual-")&&!a.id.startsWith("conn-")&&a.connected).length; }
 function refreshSendAllBtn(){ const b=$("sendAllBtn"); if(b&&sendAllOn) b.textContent=`All: ON (${sendAllCount()})`; }
 $("sendAllBtn").onclick=e=>{

@@ -173,14 +173,22 @@ type voicePending struct {
 }
 
 // voiceCtx holds Layer-1 follow-up state: last completed run (repeat +
-// recall-cache), one pending wipe gate, and in-flight voice commands
-// awaiting their outputs (completed by CmdID sniffing in ackCmd's path).
+// recall-cache), one pending wipe gate, in-flight voice commands awaiting
+// their outputs (completed by CmdID sniffing), and the last SPOKEN reply
+// (TTS poll endpoint serves it to tablets that can't hear the WebView).
 type voiceCtx struct {
 	last      *voiceResult
-	recall    *voiceResult // last facts-listing (ordinal forget targets it)
+	recall    *voiceResult
+	spoken    *voiceSpoken
 	pendingWipe string
 	pendingAt time.Time
 	awaiting  map[string]*voicePending
+}
+
+// voiceSpoken is one direct reply, for the TTS poll endpoint.
+type voiceSpoken struct {
+	text string
+	at   time.Time
 }
 
 func newVoiceCtx() *voiceCtx {

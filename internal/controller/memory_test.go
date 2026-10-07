@@ -203,8 +203,7 @@ func TestMemoryGrammar(t *testing.T) {	if _, ok := cutPrefixWord("forget", "forg
 	}
 }
 
-func TestParseOrdinalRef(t *testing.T) {
-	cases := map[string]int{
+func TestParseOrdinalRef(t *testing.T) {	cases := map[string]int{
 		"open #2": 2, "open the second one": 2, "#3": 3, "7": 7,
 		"number 2": 2, "2nd": 2, "open 1": 1, "the third one": 3,
 		"second": 2, "third": 3,
@@ -294,5 +293,36 @@ func TestOrdinalOfflineBox(t *testing.T) {
 	h, _, run, rep, _ := s.tryVoiceCmd(nil, "voice-cmd open 1", "c1")
 	if !h || run != "" || !strings.Contains(rep, "offline") {
 		t.Fatalf("offline: handled=%v run=%q rep=%q", h, run, rep)
+	}
+}
+
+func TestPickVoiceReply(t *testing.T) {
+	s := memTestServer()
+	if _, _, ok := s.pickVoiceReply(0); ok {
+		t.Fatal("empty must miss")
+	}
+	now := time.Now()
+	s.voice.spoken = &voiceSpoken{text: "hello there", at: now.Add(-time.Minute)}
+	if text, _, ok := s.pickVoiceReply(0); !ok || text != "hello there" {
+		t.Fatalf("spoken: %q %v", text, ok)
+	}
+	if _, _, ok := s.pickVoiceReply(now.Add(time.Minute).UnixMilli()); ok {
+		t.Fatal("future since must miss")
+	}
+	// Newer run result wins over older direct reply.
+	s.voice.last = &voiceResult{run: "get-chrome-tabs", lines: []string{"1. Foo", "2. Bar"}, host: "H", at: now}
+	if text, _, ok := s.pickVoiceReply(0); !ok || text != "1. Foo · 2. Bar" {
+		t.Fatalf("run lines: %q %v", text, ok)
+	}
+}
+
+func TestFinishVoiceStashesSpoken(t *testing.T) {
+	s := memTestServer()
+	h, _, run, rep, _ := s.tryVoiceCmd(nil, "voice-cmd help", "c1")
+	if !h || run != "" || rep == "" {
+		t.Fatalf("help: handled=%v run=%q rep=%q", h, run, rep)
+	}
+	if text, _, ok := s.pickVoiceReply(0); !ok || text != rep {
+		t.Fatalf("stash: %q %v want %q", text, ok, rep)
 	}
 }
