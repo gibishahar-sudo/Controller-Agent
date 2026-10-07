@@ -34,6 +34,7 @@ public class HomeActivity extends Activity {
     public static final String EXTRA_AUTOLISTEN = "rmm_autolisten";
 
     private TextView statusText;
+    private TextView hotwordText;
     private ListView agentList;
     private ArrayAdapter<String> agentAdapter;
     private final List<String> agentIds = new ArrayList<>();
@@ -109,6 +110,15 @@ public class HomeActivity extends Activity {
         statusText.setTypeface(android.graphics.Typeface.MONOSPACE);
         statusText.setText("…");
         v.addView(statusText);
+
+        hotwordText = new TextView(this);
+        hotwordText.setTypeface(android.graphics.Typeface.MONOSPACE);
+        hotwordText.setTextSize(13);
+        hotwordText.setText("🎤 …");
+        hotwordText.setTextColor(0xFF8B949E);
+        hotwordText.setOnClickListener(unused ->
+                startActivity(new Intent(this, SetupActivity.class)));
+        v.addView(hotwordText);
 
         LinearLayout btns = row();
         Button open = new Button(this);
@@ -232,6 +242,28 @@ public class HomeActivity extends Activity {
         Toast.makeText(this, msg, Toast.LENGTH_SHORT).show();
     }
 
+    /** Hotword indicator: green while the tablet is listening for Jarvis,
+     * amber while working (pull/model), gray when off. Tapping opens Setup
+     * (bound in initHome). Refreshed with every status cycle + on resume. */
+    private void paintHotword() {
+        if (hotwordText == null) {
+            return;
+        }
+        String st = HotwordService.status(this);
+        if (st == null || st.equals("off") || st.isEmpty()) {
+            hotwordText.setText("🎤 Jarvis: off — tap for Setup");
+            hotwordText.setTextColor(0xFF8B949E);
+            return;
+        }
+        String low = st.toLowerCase();
+        if (low.startsWith("listening")) {
+            hotwordText.setTextColor(0xFF7EE787);
+        } else {
+            hotwordText.setTextColor(0xFFE3B341);
+        }
+        hotwordText.setText("🎤 Jarvis: " + st + " — tap for Setup");
+    }
+
     private String password() {
         return SetupActivity.pref(this, SetupActivity.KEY_PASSWORD, "");
     }
@@ -270,6 +302,7 @@ public class HomeActivity extends Activity {
             final List<String> fIds = ids;
             runOnUiThread(() -> {
                 statusText.setText("core: " + fRunning + "   •   " + fNames.size() + " agents");
+                paintHotword();
                 agentAdapter.clear();
                 agentAdapter.addAll(fNames);
                 agentIds.clear();

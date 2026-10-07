@@ -1066,23 +1066,46 @@ $("cmdSend").onclick=sendCmd;
 // Jarvis mic (desktop): Chrome's speech recognizer fills the command box
 // with "voice-cmd <heard>" — never auto-sends (a misheard destructive
 // command must not run itself). Missing API (Firefox, plain-HTTP LAN,
-// tablet WebView) explains instead of failing silently.
+// tablet WebView) explains instead of failing silently. Error codes surface
+// verbatim-mapped (not-allowed vs service-not-allowed is the whole
+// diagnosis); one attempt flag stops double-start double-toasts.
+let micAttempt=0;
 $("micBtn")?.addEventListener("click", ()=>{
   const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
   if(!SR){ toast("Voice input needs desktop Chrome (or use the tablet mic)", "err"); return; }
+  const btn=$("micBtn");
+  if(btn&&(btn.dataset.busy==="1")) return; // already listening
+  const my=++micAttempt;
   let rec; try{ rec=new SR(); }catch{ toast("Could not start voice input", "err"); return; }
   rec.lang="en-US"; rec.interimResults=false; rec.maxAlternatives=1;
-  $("micBtn").textContent="🎙…";
+  if(btn){ btn.dataset.busy="1"; btn.textContent="🎙…"; }
+  const done=()=>{ const b=$("micBtn"); if(b){ b.dataset.busy=""; if(b.textContent!=="🎤") b.textContent="🎤"; } };
   rec.onresult=e=>{
+    if(my!==micAttempt) return;
+    done();
     const heard=(e.results[0][0].transcript||"").trim();
-    $("micBtn").textContent="🎤";
     if(!heard) return;
     const box=$("cmdInput"); if(box){ box.value="voice-cmd "+heard; box.focus(); }
     addTerm("🎙 heard: "+heard, "out");
   };
-  rec.onerror=()=>{ $("micBtn").textContent="🎤"; toast("Voice input failed (mic blocked?)", "err"); };
-  rec.onend=()=>{ const b=$("micBtn"); if(b&&b.textContent!=="🎤") b.textContent="🎤"; };
-  try{ rec.start(); }catch{ $("micBtn").textContent="🎤"; }
+  rec.onerror=e=>{
+    if(my!==micAttempt) return;
+    done();
+    const code=(e&&e.error)||"unknown";
+    if(code==="no-speech"){ addTerm("🎙 heard nothing — try again", "out"); return; }
+    const why={
+      "not-allowed":"mic permission denied — allow it in the browser site settings, then retry",
+      "service-not-allowed":"speech service blocked here — needs HTTPS + desktop Chrome (plain-HTTP LAN addresses fail this way)",
+      "network":"no connection to the speech service — check network",
+      "audio-capture":"no microphone found on this machine",
+      "aborted":"stopped",
+      "language-not-supported":"this language pack is missing",
+      "not-supported":"not supported in this browser"
+    }[code]||("engine error: "+code);
+    toast("Voice input failed: "+why, "err");
+  };
+  rec.onend=done;
+  try{ rec.start(); }catch{ done(); }
 });
 function sendAllCount(){ return agents.filter(a=>!a.id.startsWith("manual-")&&!a.id.startsWith("conn-")&&a.connected).length; }
 function refreshSendAllBtn(){ const b=$("sendAllBtn"); if(b&&sendAllOn) b.textContent=`All: ON (${sendAllCount()})`; }
