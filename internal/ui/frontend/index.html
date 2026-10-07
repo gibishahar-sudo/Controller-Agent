@@ -1075,6 +1075,13 @@ $("micBtn")?.addEventListener("click", ()=>{
   if(!SR){ toast("Voice input needs desktop Chrome (or use the tablet mic)", "err"); return; }
   const btn=$("micBtn");
   if(btn&&(btn.dataset.busy==="1")) return; // already listening
+  // Insecure origins fail at the service with a bare "network" error AFTER
+  // the mic opens fine — say so up front instead of after the confusion.
+  // localhost/loopback stay secure by definition; only LAN names suffer.
+  const host=(location.hostname||"").toLowerCase();
+  if(location.protocol==="http:"&&host!=="localhost"&&host!=="127.0.0.1"&&host!=="[::1]"&&host!==""){
+    toast("This address is plain HTTP — speech may fail: retry via https:// or http://localhost", "err");
+  }
   const my=++micAttempt;
   let rec; try{ rec=new SR(); }catch{ toast("Could not start voice input", "err"); return; }
   rec.lang="en-US"; rec.interimResults=false; rec.maxAlternatives=1;

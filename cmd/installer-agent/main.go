@@ -60,6 +60,22 @@ func relaunchAsAdmin() {
 	os.Exit(0)
 }
 
+// setupInstallLog tees every log line (including log.Fatalf aborts) into
+// %TEMP%\rmm-install.log alongside stderr. Best effort and silent about it:
+// logging must never break an install. The handle stays open for the
+// process lifetime (writes are unbuffered, nothing to flush).
+func setupInstallLog() {
+	tmp := os.Getenv("TEMP")
+	if tmp == "" {
+		return
+	}
+	f, err := os.OpenFile(filepath.Join(tmp, "rmm-install.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	log.SetOutput(io.MultiWriter(os.Stderr, f))
+}
+
 func copyFile(src, dst string) error {
 	in, err := os.Open(src)
 	if err != nil {
@@ -270,7 +286,14 @@ func install() {
 			silent = true
 		}
 	}
+	// Run log (v1.46.80 post-mortem): silent installs show nothing, so a
+	// failed run was indistinguishable from a stale box. Every log line now
+	// also appends to %TEMP%\rmm-install.log (SYSTEM context: the Windows
+	// temp dir) — "still old after the CMD" starts with that file's tail.
+	setupInstallLog()
+	log.Printf("install start args=%q", os.Args)
 	if !isAdmin() {
+		log.Printf("not admin - relaunching elevated")
 		relaunchAsAdmin()
 		return
 	}
