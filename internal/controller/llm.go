@@ -540,8 +540,14 @@ func (s *Server) tryLLMCmd(cmd string) (bool, string) {
 // llmPhraseIfReady phrases text through the model ONLY when the sidecar
 // is already warm (running + healthy). Never starts a pull, never blocks
 // hunting one: cold return ("", false) keeps the raw text on its way.
+// Also returns false for very short text (< 40 chars) — phrasing a
+// 5-word reply adds latency for no benefit.
 func (s *Server) llmPhraseIfReady(text string) (string, bool) {
 	if s.llm == nil {
+		return "", false
+	}
+	text = strings.TrimSpace(text)
+	if len(text) < 40 {
 		return "", false
 	}
 	st := s.llm

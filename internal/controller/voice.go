@@ -320,10 +320,11 @@ func (s *Server) finishVoice(ac, tac *AgentConn, run, rep, rest, cmdID string) (
 		host = tac.hostname
 	}
 	if rep != "" {
-		// Phrasing wire (P0r-proven job): long replies get one llmSay
-		// pass, but ONLY when the sidecar is already warm — never a pull,
+		// Phrasing wire (P0r-proven job): replies get one llmSay pass,
+		// but ONLY when the sidecar is already warm — never a pull,
 		// never added latency hunting one. Failures keep the raw text.
-		if len(rep) > 80 {
+		// Threshold lowered from 80 to 40: most useful replies are short.
+		if len(rep) > 40 {
 			if line, ok := s.llmPhraseIfReady(rep); ok {
 				rep = line
 			}

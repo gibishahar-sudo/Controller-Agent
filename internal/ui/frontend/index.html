@@ -397,7 +397,7 @@ html{touch-action:manipulation}
       <div class="inputbar">
         <span class="gt">❯</span><input id="cmdInput" placeholder="Enter command… (help, list-directory, get-system-info)" autocomplete="off"/>
         <button class="btn btn-primary btn-small" id="cmdSend">Send</button>
-        <button class="btn btn-small" id="micBtn" title="Dictate a command (Chrome desktop only)">🎤</button>
+        <button class="btn btn-small" id="micBtn" title="Dictate a command (native app or Chrome desktop)">🎤</button>
         <button class="btn btn-small" id="speakBtn" title="Spoken Jarvis replies on/off">🔊</button>
         <button class="btn btn-small" id="sendAllBtn" title="Send commands to ALL connected agents">All: OFF</button>
         <button class="btn btn-small" id="exportLog" title="Download terminal log">⤓</button>
@@ -1073,9 +1073,19 @@ $("cmdSend").onclick=sendCmd;
 // diagnosis); one attempt flag stops double-start double-toasts.
 let micAttempt=0;
 $("micBtn")?.addEventListener("click", ()=>{
+  const btn=$("micBtn");
+  if(btn&&(btn.dataset.busy==="1")) return; // already listening
+  // Native frame first: the PC app binds window.nativeMicListen (Windows
+  // Speech Recognition, in-box) because its embedded frame has no web
+  // speech service. Browsers skip straight to webkitSpeechRecognition.
+  if(typeof window.nativeMicListen==="function"){
+    if(btn){ btn.dataset.busy="1"; btn.textContent="🎙…"; }
+    addTerm("🎙 listening (Windows) — speak now", "out");
+    try{ window.nativeMicListen(); }catch{ if(btn){btn.dataset.busy="";btn.textContent="🎤";} }
+    return;
+  }
   const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
   if(!SR){ toast("Voice input needs desktop Chrome (or use the tablet mic)", "err"); return; }
-  const btn=$("micBtn");
   if(btn&&(btn.dataset.busy==="1")) return; // already listening
   // Origin gate: the recognition backend only serves secure web origins.
   // App frames (file:, custom schemes) have no speech service at all: mic
@@ -1147,6 +1157,8 @@ function speakJarvis(text){
   if(!speakOn()) return;
   let t=String(text||"").replace(/^🎙\s*/,"").trim();
   if(!t||/^heard /.test(t)) return; // confirmations stay silent
+  // Only speak Jarvis replies (🎙 prefix), never system/connection messages
+  if(!String(text||"").startsWith("🎙")) return;
   if(t.length>400) t=t.slice(0,400);
   try{
     if(!window.speechSynthesis) return;
