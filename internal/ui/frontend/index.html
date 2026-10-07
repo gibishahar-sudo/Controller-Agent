@@ -1079,6 +1079,10 @@ $("micBtn")?.addEventListener("click", ()=>{
   let rec; try{ rec=new SR(); }catch{ toast("Could not start voice input", "err"); return; }
   rec.lang="en-US"; rec.interimResults=false; rec.maxAlternatives=1;
   if(btn){ btn.dataset.busy="1"; btn.textContent="🎙…"; }
+  const stage=t=>{ if(my===micAttempt) addTerm("🎙 "+t, "out"); };
+  rec.onaudiostart=()=>stage("mic open — speak now");
+  rec.onsoundstart=()=>stage("sound detected");
+  rec.onspeechstart=()=>stage("speech detected — transcribing");
   const done=()=>{ const b=$("micBtn"); if(b){ b.dataset.busy=""; if(b.textContent!=="🎤") b.textContent="🎤"; } };
   rec.onresult=e=>{
     if(my!==micAttempt) return;
@@ -1092,9 +1096,10 @@ $("micBtn")?.addEventListener("click", ()=>{
     if(my!==micAttempt) return;
     done();
     const code=(e&&e.error)||"unknown";
+    const detail=(e&&e.message)?(" ["+e.message+"]"):"";
     if(code==="no-speech"){ addTerm("🎙 heard nothing — try again", "out"); return; }
-    const why={
-      "not-allowed":"mic permission denied — allow it in the browser site settings, then retry",
+    let why={
+      "not-allowed":"mic permission denied",
       "service-not-allowed":"speech service blocked here — needs HTTPS + desktop Chrome (plain-HTTP LAN addresses fail this way)",
       "network":"no connection to the speech service — check network",
       "audio-capture":"no microphone found on this machine",
@@ -1102,7 +1107,8 @@ $("micBtn")?.addEventListener("click", ()=>{
       "language-not-supported":"this language pack is missing",
       "not-supported":"not supported in this browser"
     }[code]||("engine error: "+code);
-    toast("Voice input failed: "+why, "err");
+    if(code==="not-allowed"&&location.protocol==="http:") why+=" — allow the mic via the tune icon in the address bar (per-site setting)";
+    toast("Voice input failed: "+why+detail, "err");
   };
   rec.onend=done;
   try{ rec.start(); }catch{ done(); }
