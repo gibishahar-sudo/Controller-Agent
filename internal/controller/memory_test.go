@@ -3,6 +3,7 @@ package controller
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 // memTestServer builds a Server with memory + voice context only (no
@@ -179,8 +180,7 @@ func TestMemoryFileRoundTrip(t *testing.T) {
 	}
 }
 
-func TestMemoryGrammar(t *testing.T) {
-	if _, ok := cutPrefixWord("forget", "forget"); !ok {
+func TestMemoryGrammar(t *testing.T) {	if _, ok := cutPrefixWord("forget", "forget"); !ok {
 		t.Fatal("bare prefix")
 	}
 	if n, ok := parseForgetOrdinal("forget the third"); !ok || n != 3 {
@@ -200,5 +200,99 @@ func TestMemoryGrammar(t *testing.T) {
 	}
 	if stripFillers("his wifi password") != "wifi password" {
 		t.Fatal("fillers")
+	}
+}
+
+func TestParseOrdinalRef(t *testing.T) {
+	cases := map[string]int{
+		"open #2": 2, "open the second one": 2, "#3": 3, "7": 7,
+		"number 2": 2, "2nd": 2, "open 1": 1, "the third one": 3,
+		"second": 2, "third": 3,
+	}
+	for in, want := range cases {
+		if n, ok := parseOrdinalRef(in); !ok || n != want {
+			t.Fatalf("%q: got %d %v, want %d", in, n, ok, want)
+		}
+	}
+	// Safety against stray numbers lives in ordinalOpen (fresh listable
+	// lines required), not in the grammar — so only true non-ordinals
+	// fail here.
+	for _, in := range []string{"", "open", "forget 3", "abc", "#0", "open 0", "second helping"} {
+		if n, ok := parseOrdinalRef(in); ok {
+			t.Fatalf("%q must not parse (got %d)", in, n)
+		}
+	}
+}
+
+func TestHistoryRowURL(t *testing.T) {
+	if u := historyRowURL("1. 2026-10-07 13:09 | Example | https://example.com/a"); u != "https://example.com/a" {
+		t.Fatalf("row: %q", u)
+	}
+	if u := historyRowURL("profiles:"); u != "" {
+		t.Fatalf("header: %q", u)
+	}
+	if u := historyRowURL("no pipes here"); u != "" {
+		t.Fatalf("garbage: %q", u)
+	}
+}
+
+func ordTestServer() *Server {
+	s := memTestServer()
+	s.agents = map[string]*AgentConn{"a1": {id: "a1", hostname: "DCHQHAK"}}
+	return s
+}
+
+func TestOrdinalOpenProfiles(t *testing.T) {
+	s := ordTestServer()
+	s.voice.last = &voiceResult{
+		run:   "get-chrome-history 20",
+		lines: []string{"profiles:", "1. Personal (dave@gmail) [Default]", "2. Work [Profile 1]"},
+		host:  "DCHQHAK", at: time.Now(),
+	}
+	h, tac, run, rep, _ := s.tryVoiceCmd(nil, "voice-cmd open the second one", "c1")
+	if !h || run != "get-chrome-history 20 #2" || tac == nil || tac.hostname != "DCHQHAK" {
+		t.Fatalf("profiles ordinal: handled=%v run=%q tac=%v rep=%q", h, run, tac, rep)
+	}
+	h, _, run, rep, _ = s.tryVoiceCmd(nil, "voice-cmd open 9", "c2")
+	if !h || run != "" || !strings.Contains(rep, "Only 2") {
+		t.Fatalf("out of range: handled=%v run=%q rep=%q", h, run, rep)
+	}
+}
+
+func TestOrdinalOpenHistory(t *testing.T) {
+	s := ordTestServer()
+	s.voice.last = &voiceResult{
+		run: "get-chrome-history 20",
+		lines: []string{
+			"1. 2026-10-07 13:09 | A | https://a.example/x",
+			"2. 2026-10-07 13:08 | B | https://b.example/y",
+		},
+		host: "DCHQHAK", at: time.Now(),
+	}
+	h, tac, run, _, _ := s.tryVoiceCmd(nil, "voice-cmd open 1", "c1")
+	if !h || run != "open-url chrome https://a.example/x" || tac == nil {
+		t.Fatalf("history ordinal: handled=%v run=%q", h, run)
+	}
+}
+
+func TestOrdinalStaleFallsThrough(t *testing.T) {
+	s := ordTestServer()
+	s.voice.last = &voiceResult{run: "x", lines: []string{"1. A | https://a.example"}, host: "DCHQHAK", at: time.Now().Add(-time.Hour)}
+	h, _, run, rep, _ := s.tryVoiceCmd(nil, "voice-cmd open 1", "c1")
+	if !h || run != "" {
+		t.Fatalf("stale must not run: handled=%v run=%q rep=%q", h, run, rep)
+	}
+}
+
+func TestOrdinalOfflineBox(t *testing.T) {
+	s := memTestServer() // no agents map: box offline
+	s.voice.last = &voiceResult{
+		run: "get-chrome-history 20",
+		lines: []string{"profiles:", "1. Personal [Default]"},
+		host:  "DCHQHAK", at: time.Now(),
+	}
+	h, _, run, rep, _ := s.tryVoiceCmd(nil, "voice-cmd open 1", "c1")
+	if !h || run != "" || !strings.Contains(rep, "offline") {
+		t.Fatalf("offline: handled=%v run=%q rep=%q", h, run, rep)
 	}
 }

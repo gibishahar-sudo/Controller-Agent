@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -41,13 +42,16 @@ var voiceSites = map[string]string{
 }
 
 var jarvisPrefix = regexp.MustCompile(`^(hey[ ,]+)?jarvis([,. ]+|$)`)
+var jarvisSuffix = regexp.MustCompile(`[, ]*\bjarvis[?!.]*$`)
 var voiceSpaces = regexp.MustCompile(`\s+`)
 
-// normVoice lowercases, strips an optional jarvis prefix, and squeezes
-// whitespace. Shared by the P1 intent table and the P2 memory grammar.
+// normVoice lowercases, strips an optional jarvis prefix AND a trailing
+// jarvis ("what can you do Jarvis" must parse — the name comes last in
+// speech), and squeezes whitespace. Shared by intents and memory grammar.
 func normVoice(text string) string {
 	s := strings.ToLower(strings.TrimSpace(text))
 	s = jarvisPrefix.ReplaceAllString(s, "")
+	s = jarvisSuffix.ReplaceAllString(s, "")
 	return strings.TrimSpace(voiceSpaces.ReplaceAllString(s, " "))
 }
 
@@ -64,19 +68,15 @@ func isVoiceCmd(cmd string) bool {
 // caller must pass the text on untouched.
 func parseVoiceCmd(text, hostname string) (handled bool, run, reply string) {
 	s := normVoice(text)
-	who := hostname
-	if who == "" {
-		who = "him"
-	}
+	_ = hostname // selection only matters for memory retargeting (tryVoiceCmd layer)
 	say := func(t string) (bool, string, string) { return true, "", "🎙 "+t }
 
 	if s == "" {
 		return say("Yes? Tell me what to do — try: what tabs does he have.")
 	}
-	if s == "help" || s == "what can you do" || s == "commands" {
-		return say("Try: what tabs does he have · what is he doing · open youtube on his pc · " +
-			"open his history on his pc · voice-cmd anything else runs it raw. " +
-			"History read-back and memory land next.")
+	if s == "help" || s == "what can you do" || s == "commands" || s == "what can i ask" || s == "help me" || s == "what do you do" {
+		return say("Try: what tabs does he have · pull his history · open youtube on his pc · " +
+			"remember his name is Dave · memory status · voice-cmd anything else runs it raw.")
 	}
 	// Memory verbs that didn't parse as memory grammar (too short or
 	// mangled): point at the working forms, never pretend otherwise.
@@ -88,13 +88,14 @@ func parseVoiceCmd(text, hostname string) (handled bool, run, reply string) {
 		!hasAny(s, "open ", "pull", "history", "tabs") {
 		return say("Numbered picks work after a listing — 'what do you remember?', then 'forget 2'.")
 	}
-	// History: remote-open wins on explicit place, else read-back pointer (P3).
+	// History: remote-open wins on explicit place, else read-back from the
+	// agent (his box, his profiles).
 	if strings.Contains(s, "histor") {
 		if hasAny(s, "on his pc", "on his screen", "over there", " on there", " show him", "pull it up there") ||
 			(strings.Contains(s, "there") && !strings.Contains(s, "for me") && !strings.Contains(s, "show me") && !strings.Contains(s, "tell me")) {
 			return true, "open-url chrome chrome://history", ""
 		}
-		return say("History read-back ships next — say 'open his history on his pc' to open it on " + who + "'s screen now.")
+		return true, "get-chrome-history 20", ""
 	}
 	// Tabs / browsing.
 	if hasAny(s, "tab", "brows") {
@@ -256,6 +257,14 @@ func (s *Server) tryVoiceCmd(ac *AgentConn, cmd, cmdID string) (handled bool, ta
 	}
 	if h, tac2, run2, rep := s.parseMemoryCmd(rest, host, isMem); h {
 		return s.finishVoice(ac, tac2, run2, rep, rest, cmdID)
+	}
+	// Ordinal follow-ups against the freshest listable result (profiles →
+	// re-pull with #N; history rows → open the Nth URL). Runs on the box
+	// that produced the listing.
+	if n, ok := parseOrdinalRef(normVoice(rest)); ok {
+		if tac, run, rep, matched := s.ordinalOpen(n); matched {
+			return s.finishVoice(ac, tac, run, rep, rest, cmdID)
+		}
 	}
 	if !isVoice {
 		return false, nil, "", "", ""
@@ -775,11 +784,93 @@ func (s *Server) voiceTarget(ac *AgentConn, cmd string) *AgentConn {
 	return s.resolveDefaultAgent()
 }
 
+// parseOrdinalRef matches "open #2" / "open the second one" / "#2" / "7".
+// Bare digits only resolve when a fresh listing exists (checked by the
+// caller), so stray numbers never fire blindly.
+func parseOrdinalRef(s string) (int, bool) {
+	t := strings.TrimSpace(s)
+	t = strings.TrimSpace(strings.TrimPrefix(t, "open "))
+	t = strings.TrimSpace(strings.TrimPrefix(t, "the "))
+	t = strings.TrimSpace(strings.TrimSuffix(t, " one"))
+	t = strings.TrimSpace(strings.TrimPrefix(t, "number "))
+	t = strings.TrimSpace(strings.TrimPrefix(t, "#"))
+	if t == "" {
+		return 0, false
+	}
+	if n, err := strconv.Atoi(t); err == nil && n > 0 && n < 1000 {
+		return n, true
+	}
+	if len(t) > 2 {
+		if n, err := strconv.Atoi(t[:len(t)-2]); err == nil && n > 0 && n < 1000 {
+			switch t[len(t)-2:] {
+			case "st", "nd", "rd", "th":
+				return n, true
+			}
+		}
+	}
+	if n, ok := forgetOrdinals[t]; ok {
+		return n, true
+	}
+	return 0, false
+}
+
+// historyRowURL extracts the URL tail ("... | https://...") of a history row.
+func historyRowURL(line string) string {
+	i := strings.LastIndex(line, "|")
+	if i < 0 {
+		return ""
+	}
+	u := strings.TrimSpace(line[i+1:])
+	if strings.HasPrefix(u, "http://") || strings.HasPrefix(u, "https://") {
+		return u
+	}
+	return ""
+}
+
+// ordinalOpen resolves an ordinal against the freshest listable voice
+// result. Profile lists re-pull with #N; history rows open the Nth URL —
+// both on the originating box. Anything else (or nothing fresh) declines
+// so P1 intents still get their turn.
+func (s *Server) ordinalOpen(n int) (tac *AgentConn, run, reply string, matched bool) {
+	s.voiceMu.Lock()
+	last := s.voice.last
+	fresh := s.voiceFresh(last)
+	s.voiceMu.Unlock()
+	if !fresh || len(last.lines) == 0 {
+		return nil, "", "", false
+	}
+	tac = s.findAgentByHostname(last.host)
+	if tac == nil {
+		return nil, "", "🎙 " + last.host + " is offline now.", true
+	}
+	lines := last.lines
+	if strings.HasPrefix(lines[0], "profiles:") {
+		if n < 1 || n > len(lines)-1 {
+			return nil, "", fmt.Sprintf("🎙 Only %d profiles listed.", len(lines)-1), true
+		}
+		return tac, fmt.Sprintf("get-chrome-history 20 #%d", n), "", true
+	}
+	var urls []string
+	for _, ln := range lines {
+		if u := historyRowURL(ln); u != "" {
+			urls = append(urls, u)
+		}
+	}
+	if len(urls) == 0 {
+		return nil, "", "", false
+	}
+	if n < 1 || n > len(urls) {
+		return nil, "", fmt.Sprintf("🎙 Only %d rows cached.", len(urls)), true
+	}
+	return tac, "open-url chrome " + urls[n-1], "", true
+}
+
 // retargetByName scans for a registered name token (or possessive) and
 // returns that agent. Unknown/offline names yield a clarify note with nil
 // agent; no match yields nil, "" (caller proceeds unchanged). Pronoun-like
 // names can never register (bind-time stoplist), so plain tokens are safe.
 func (s *Server) retargetByName(snorm string, ac *AgentConn) (*AgentConn, string) {
+	snorm = normVoice(snorm)
 	s.memoryMu.Lock()
 	var names []string
 	hosts := map[string]string{}

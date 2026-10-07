@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -536,6 +537,8 @@ func Execute(cmd, args string) (string, error) {
 		return getActiveWindow()
 	case "get-chrome-tabs":
 		return chromeTabs()
+	case "get-chrome-history":
+		return chromeHistory(args)
 	case "reg-read":
 		return regRead(args)
 	case "reg-write":
@@ -1442,6 +1445,277 @@ func formatChromeTabs(raw string) string {
 		fmt.Fprintf(&b, "%d. %s\n", i+1, t)
 	}
 	return strings.TrimRight(b.String(), "\n")
+}
+
+// chromeProfile is one Chrome profile directory with its display identity.
+type chromeProfile struct {
+	dir     string // "Default", "Profile 1", ...
+	name    string // display name from Local State ("Personal")
+	email   string // signed-in account
+	entries int    // rows pulled (filled by query, for follow-ups)
+}
+
+// parseHistoryArgs splits "get-chrome-history [N] [profile-ref]".
+func parseHistoryArgs(args string) (n int, ref string) {
+	n = 20
+	fields := strings.Fields(args)
+	if len(fields) > 0 {
+		if v, err := strconv.Atoi(fields[0]); err == nil {
+			n = v
+			fields = fields[1:]
+		}
+	}
+	if n < 1 {
+		n = 1
+	}
+	if n > 50 {
+		n = 50
+	}
+	return n, strings.Join(fields, " ")
+}
+
+// chromeUserData resolves Chrome's profile home. Chrome-only by design
+// (Edge/Brave keep the same layout but mixing browsers misattributes).
+func chromeUserData() (string, error) {
+	if runtime.GOOS != "windows" {
+		return "", fmt.Errorf("chrome history is windows-only")
+	}
+	base := os.Getenv("LOCALAPPDATA")
+	if base == "" {
+		return "", fmt.Errorf("LOCALAPPDATA unset")
+	}
+	dir := filepath.Join(base, "Google", "Chrome", "User Data")
+	if st, err := os.Stat(dir); err != nil || !st.IsDir() {
+		return "", fmt.Errorf("no Chrome profile home")
+	}
+	return dir, nil
+}
+
+// chromeProfileName maps a profile dir to its display identity from Local
+// State (info_cache), falling back to the dir name. Pure over file bytes.
+func chromeProfileName(localState []byte, dir string) (name, email string) {
+	var ls struct {
+		InfoCache map[string]struct {
+			Name     string `json:"name"`
+			UserName string `json:"user_name"`
+		} `json:"info_cache"`
+	}
+	if err := json.Unmarshal(localState, &ls); err != nil {
+		return dir, ""
+	}
+	if info, ok := ls.InfoCache[dir]; ok {
+		if info.Name == "" {
+			info.Name = dir
+		}
+		return info.Name, info.UserName
+	}
+	return dir, ""
+}
+
+// listChromeProfiles enumerates profile dirs holding a History file.
+// Order is stable: Default first, then the rest sorted.
+func listChromeProfiles(userData string) []chromeProfile {
+	entries, err := os.ReadDir(userData)
+	if err != nil {
+		return nil
+	}
+	var raw []byte
+	if b, err := os.ReadFile(filepath.Join(userData, "Local State")); err == nil {
+		raw = b
+	}
+	var dirs []string
+	for _, e := range entries {
+		if e.IsDir() {
+			dirs = append(dirs, e.Name())
+		}
+	}
+	hasHistory := func(dir string) bool {
+		st, err := os.Stat(filepath.Join(userData, dir, "History"))
+		return err == nil && !st.IsDir()
+	}
+	return buildProfileList(dirs, hasHistory, raw)
+}
+
+// buildProfileList is the pure core of listChromeProfiles: stable order
+// (Default, then sorted Profile N), History-gated, names from Local State.
+func buildProfileList(dirs []string, hasHistory func(string) bool, localState []byte) []chromeProfile {
+	var out []chromeProfile
+	push := func(dir string) {
+		if !hasHistory(dir) {
+			return
+		}
+		name, email := chromeProfileName(localState, dir)
+		out = append(out, chromeProfile{dir: dir, name: name, email: email})
+	}
+	push("Default")
+	var rest []string
+	for _, d := range dirs {
+		if d != "Default" && strings.HasPrefix(d, "Profile ") {
+			rest = append(rest, d)
+		}
+	}
+	sort.Strings(rest)
+	for _, d := range rest {
+		push(d)
+	}
+	return out
+}
+
+// matchChromeProfile resolves a reference: #N (1-based discovery order),
+// dir name, display name, or email local-part — case-insensitive.
+func matchChromeProfile(profiles []chromeProfile, ref string) (chromeProfile, bool) {
+	ref = strings.ToLower(strings.TrimSpace(strings.TrimPrefix(ref, "#")))
+	if ref == "" {
+		return chromeProfile{}, false
+	}
+	var n int
+	if _, err := fmt.Sscanf(ref, "%d", &n); err == nil && n >= 1 && n <= len(profiles) {
+		return profiles[n-1], true
+	}
+	for _, p := range profiles {
+		if strings.EqualFold(p.dir, ref) || strings.EqualFold(p.name, ref) || strings.EqualFold(p.email, ref) {
+			return p, true
+		}
+	}
+	for _, p := range profiles {
+		lr, ld, ln, le := strings.ToLower(ref), strings.ToLower(p.dir), strings.ToLower(p.name), strings.ToLower(p.email)
+		if strings.Contains(ld, lr) || strings.Contains(ln, lr) {
+			return p, true
+		}
+		if i := strings.Index(le, "@"); i > 0 && strings.EqualFold(le[:i], lr) {
+			return p, true
+		}
+	}
+	return chromeProfile{}, false
+}
+
+func formatProfileList(profiles []chromeProfile) string {
+	var b strings.Builder
+	b.WriteString("profiles:\n")
+	for i, p := range profiles {
+		label := p.name
+		if p.email != "" && !strings.EqualFold(p.email, p.name) {
+			label += " (" + p.email + ")"
+		}
+		fmt.Fprintf(&b, "%d. %s [%s]\n", i+1, label, p.dir)
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// formatHistoryRows renders sqlite rows "date|url|title" as numbered lines
+// ("N. date | title | url") — the shape ordinal-open parses back.
+func formatHistoryRows(raw string, n int) string {
+	var rows []string
+	for _, ln := range strings.Split(raw, "\n") {
+		ln = strings.TrimSpace(strings.TrimRight(ln, "\r"))
+		if ln == "" {
+			continue
+		}
+		parts := strings.SplitN(ln, "|", 3)
+		for len(parts) < 3 {
+			parts = append(parts, "")
+		}
+		date, url, title := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]), strings.TrimSpace(parts[2])
+		if len(url) > 160 {
+			url = url[:160]
+		}
+		rows = append(rows, fmt.Sprintf("%s | %s | %s", date, title, url))
+		if len(rows) >= n {
+			break
+		}
+	}
+	if len(rows) == 0 {
+		return "no history rows"
+	}
+	var b strings.Builder
+	for i, r := range rows {
+		fmt.Fprintf(&b, "%d. %s\n", i+1, r)
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// sqlite3Path finds the bundled helper next to our own binary (installed
+// by the same payload), falling back to PATH.
+func sqlite3Path() string {
+	if exe, err := os.Executable(); err == nil {
+		if p := filepath.Join(filepath.Dir(exe), "sqlite3.exe"); fileExists(p) {
+			return p
+		}
+	}
+	if p, err := exec.LookPath("sqlite3"); err == nil {
+		return p
+	}
+	if p, err := exec.LookPath("sqlite3.exe"); err == nil {
+		return p
+	}
+	return ""
+}
+
+func fileExists(p string) bool {
+	st, err := os.Stat(p)
+	return err == nil && !st.IsDir()
+}
+
+// chromeHistory implements get-chrome-history [N] [profile]: numbered recent
+// rows, multi-profile disambiguation, temp-copy hygiene. Chrome holds its
+// History open (and WAL-mode), so we copy History+wal+shm aside and query
+// the copy — never the live files, never a browser restart.
+func chromeHistory(args string) (string, error) {
+	if runtime.GOOS != "windows" {
+		return "", fmt.Errorf("chrome history is windows-only")
+	}
+	n, ref := parseHistoryArgs(args)
+	userData, err := chromeUserData()
+	if err != nil {
+		return "", err
+	}
+	profiles := listChromeProfiles(userData)
+	if len(profiles) == 0 {
+		return "", fmt.Errorf("no Chrome history found")
+	}
+	var prof chromeProfile
+	if len(profiles) == 1 && ref == "" {
+		prof = profiles[0]
+	} else {
+		var ok bool
+		if ref == "" {
+			return formatProfileList(profiles) + "\nwhich profile? get-chrome-history [N] <name|#N>", nil
+		}
+		if prof, ok = matchChromeProfile(profiles, ref); !ok {
+			return "", fmt.Errorf("no profile matching %q", ref)
+		}
+	}
+	sqlite := sqlite3Path()
+	if sqlite == "" {
+		return "", fmt.Errorf("history helper missing (sqlite3.exe) — reinstall the agent")
+	}
+	tmp, err := os.MkdirTemp("", "rmmhist")
+	if err != nil {
+		return "", err
+	}
+	defer os.RemoveAll(tmp)
+	srcDir := filepath.Join(userData, prof.dir)
+	for _, f := range []string{"History", "History-wal", "History-shm"} {
+		if b, err := os.ReadFile(filepath.Join(srcDir, f)); err == nil {
+			_ = os.WriteFile(filepath.Join(tmp, f), b, 0600)
+		}
+	}
+	q := fmt.Sprintf("SELECT datetime(last_visit_time/1000000-11644473600,'unixepoch','localtime'),url,substr(ifnull(title,''),1,80) FROM urls ORDER BY last_visit_time DESC LIMIT %d;", n)
+	cmd := exec.Command(sqlite, filepath.Join(tmp, "History"), q)
+	hideWindow(cmd)
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("history query failed: %v", err)
+	}
+	rows := formatHistoryRows(string(out), n)
+	if rows == "no history rows" {
+		return "no history rows", nil
+	}
+	disp := prof.name
+	if disp == "" {
+		disp = prof.dir
+	}
+	return disp + ":\n" + rows, nil
 }
 
 func getServices() (string, error) {

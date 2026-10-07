@@ -100,6 +100,7 @@ var Known = map[string]string{
 	"clipboard-set":           "Set clipboard - clipboard-set <text>",
 	"get-active-window":       "Get active window",
 	"get-chrome-tabs":         "List Chrome windows (active tab each) - Jarvis: what tabs does he have",
+	"get-chrome-history":      "Recent Chrome history - get-chrome-history [N] [profile]",
 	"voice-cmd":               "Jarvis voice/text command - voice-cmd <what you said>",
 	"memory":                  "Jarvis memory - memory remember|recall|forget|status",
 	"llm-say":                 "Phrase text Jarvis-style (local model) - llm-say <text>",
