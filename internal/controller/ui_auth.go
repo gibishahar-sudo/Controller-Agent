@@ -27,6 +27,11 @@ import (
 // Password source (first hit wins, no new CLI flags by design):
 // RMM_UI_PASSWORD env → ui_password.txt beside the exe (or CWD, 0600)
 // → generated once, persisted, logged (never the secret itself).
+// The env password is read LIVE on every attempt (not from the boot hash),
+// so setting it takes effect without a controller restart; file/generated
+// passwords use the cached hash.
+// Sessions: 32-byte random tokens, 12h fixed TTL, server-side store.
+// Brute force: 5 bad passwords per source IP → 5-minute block (429).
 // Sessions: 32-byte random tokens, 12h fixed TTL, server-side store.
 // Brute force: 5 bad passwords per source IP → 5-minute block (429).
 
@@ -110,8 +115,15 @@ func uiResolvePassword() (string, string) {
 	return pw, "generated " + save
 }
 
-// uiVerifyPassword constant-time compares the candidate.
+// uiVerifyPassword constant-time compares the candidate. The env password
+// is read live (see header): a freshly set RMM_UI_PASSWORD works without
+// a restart. File/generated passwords use the boot-cached hash.
 func (s *Server) uiVerifyPassword(candidate string) bool {
+	if pw := os.Getenv("RMM_UI_PASSWORD"); pw != "" {
+		a := sha256.Sum256([]byte(candidate))
+		b := sha256.Sum256([]byte(pw))
+		return subtle.ConstantTimeCompare(a[:], b[:]) == 1
+	}
 	sum := sha256.Sum256([]byte(candidate))
 	s.uiPassMu.Lock()
 	defer s.uiPassMu.Unlock()
@@ -192,6 +204,7 @@ func (s *Server) uiBlocked(ip string) bool {
 }
 
 // uiFail records one bad password; resets on success via uiFailReset.
+// The block start is logged (one line per block, not per attempt).
 func (s *Server) uiFail(ip string) {
 	s.uiFailMu.Lock()
 	defer s.uiFailMu.Unlock()
@@ -200,10 +213,17 @@ func (s *Server) uiFail(ip string) {
 	}
 	rec := s.uiFails[ip]
 	rec.n++
+	blocked := false
+	if rec.n >= uiFailLimit && time.Now().After(rec.until) {
+		blocked = true
+	}
 	if rec.n >= uiFailLimit {
 		rec.until = time.Now().Add(uiFailBlock)
 	}
 	s.uiFails[ip] = rec
+	if blocked {
+		log.Printf("[http] login blocked for %s (%d bad passwords, %s)", ip, rec.n, uiFailBlock)
+	}
 }
 
 func (s *Server) uiFailReset(ip string) {
@@ -230,12 +250,26 @@ func (s *Server) handleUILogin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad json: need {\"password\":\"...\"}", http.StatusBadRequest)
 		return
 	}
+	// Paste artifacts (stray spaces from password managers) fail an
+	// otherwise-correct password; retry trimmed before counting a strike.
+	// Intentional space-padded passwords still match on the first try.
 	if !s.uiVerifyPassword(req.Password) {
+		if trimmed := strings.TrimSpace(req.Password); trimmed != req.Password && s.uiVerifyPassword(trimmed) {
+			s.uiFailReset(ip)
+			s.uiIssueSessionCookie(w, r)
+			return
+		}
 		s.uiFail(ip)
 		http.Error(w, "bad password", http.StatusUnauthorized)
 		return
 	}
 	s.uiFailReset(ip)
+	s.uiIssueSessionCookie(w, r)
+}
+
+// uiIssueSessionCookie mints a session and sets the cookie (shared by the
+// exact and trimmed-space login paths).
+func (s *Server) uiIssueSessionCookie(w http.ResponseWriter, r *http.Request) {
 	tok := s.uiIssueSession()
 	http.SetCookie(w, &http.Cookie{
 		Name:     uiSessionCookie,

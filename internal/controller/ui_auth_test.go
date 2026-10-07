@@ -13,7 +13,8 @@ import (
 
 // testAuthServer builds a Server with a known UI password ("s3cret")
 // without touching disk or env.
-func testAuthServer() *Server {
+func testAuthServer(t *testing.T) *Server {
+	t.Setenv("RMM_UI_PASSWORD", "") // hermetic: live-env branch must not fire
 	s := &Server{}
 	sum := sha256.Sum256([]byte("s3cret"))
 	s.uiPassHash = sum[:]
@@ -24,7 +25,7 @@ func testAuthServer() *Server {
 }
 
 func TestUIVerifyPassword(t *testing.T) {
-	s := testAuthServer()
+	s := testAuthServer(t)
 	if !s.uiVerifyPassword("s3cret") {
 		t.Fatal("correct password rejected")
 	}
@@ -41,7 +42,7 @@ func TestUIVerifyPassword(t *testing.T) {
 }
 
 func TestUISessionLifecycle(t *testing.T) {
-	s := testAuthServer()
+	s := testAuthServer(t)
 	tok := s.uiIssueSession()
 	r := httptest.NewRequest("GET", "/", nil)
 	if s.uiAuthed(r) {
@@ -68,7 +69,7 @@ func TestUISessionLifecycle(t *testing.T) {
 }
 
 func TestUILoginBackoff(t *testing.T) {
-	s := testAuthServer()
+	s := testAuthServer(t)
 	ip := "10.9.9.9"
 	login := func(pw string) int {
 		body := strings.NewReader(`{"password":"` + pw + `"}`)
@@ -91,7 +92,7 @@ func TestUILoginBackoff(t *testing.T) {
 		t.Fatalf("good password during block: code %d want 429", code)
 	}
 	// Success path (fresh server): sets an HttpOnly cookie.
-	s2 := testAuthServer()
+	s2 := testAuthServer(t)
 	body := strings.NewReader(`{"password":"s3cret"}`)
 	r := httptest.NewRequest("POST", "/api/login", body)
 	r.RemoteAddr = ip + ":1234"
@@ -112,7 +113,7 @@ func TestUILoginBackoff(t *testing.T) {
 }
 
 func TestUIGuardMatrix(t *testing.T) {
-	s := testAuthServer()
+	s := testAuthServer(t)
 	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("INNER"))
 	})
@@ -180,8 +181,7 @@ func TestUIGuardMatrix(t *testing.T) {
 	}
 }
 
-func TestUIOriginOK(t *testing.T) {
-	r := httptest.NewRequest("GET", "/ws", nil)
+func TestUIOriginOK(t *testing.T) {	r := httptest.NewRequest("GET", "/ws", nil)
 	r.Host = "ctrl:8080"
 	if !uiOriginOK(r) {
 		t.Fatal("empty origin rejected")
@@ -197,5 +197,71 @@ func TestUIOriginOK(t *testing.T) {
 	r.Header.Set("Origin", "http://[::1")
 	if uiOriginOK(r) {
 		t.Fatal("malformed origin accepted")
+	}
+}
+
+func TestUILiveEnvPassword(t *testing.T) {
+	s := &Server{}
+	t.Setenv("RMM_UI_PASSWORD", "live-one")
+	if !s.uiVerifyPassword("live-one") {
+		t.Fatal("live env password rejected")
+	}
+	// Rotating the env takes effect with no restart and no cache use.
+	t.Setenv("RMM_UI_PASSWORD", "live-two")
+	if s.uiVerifyPassword("live-one") {
+		t.Fatal("stale env password still accepted")
+	}
+	if !s.uiVerifyPassword("live-two") {
+		t.Fatal("rotated env password rejected")
+	}
+	// End to end over the login handler (cookie set).
+	body := strings.NewReader(`{"password":"live-two"}`)
+	r := httptest.NewRequest("POST", "/api/login", body)
+	r.RemoteAddr = "10.9.9.10:1234"
+	w := httptest.NewRecorder()
+	s.handleUILogin(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("live env login: code %d want 200", w.Code)
+	}
+}
+
+func TestUITrimmedLogin(t *testing.T) {
+	s := &Server{}
+	t.Setenv("RMM_UI_PASSWORD", "s3cret leven")
+	login := func(pw string) int {
+		body := strings.NewReader(`{"password":"` + pw + `"}`)
+		r := httptest.NewRequest("POST", "/api/login", body)
+		r.RemoteAddr = "10.9.9.11:1234"
+		w := httptest.NewRecorder()
+		s.handleUILogin(w, r)
+		return w.Code
+	}
+	// Exact first (intentional space-passwords keep working).
+	if code := login("s3cret leven"); code != http.StatusOK {
+		t.Fatalf("exact spaced password: code %d want 200", code)
+	}
+	// Paste artifacts (surrounding spaces) succeed without a strike.
+	s2 := &Server{}
+	t.Setenv("RMM_UI_PASSWORD", "s3cret")
+	body := strings.NewReader(`{"password":"  s3cret  "}`)
+	r := httptest.NewRequest("POST", "/api/login", body)
+	r.RemoteAddr = "10.9.9.12:1234"
+	w := httptest.NewRecorder()
+	s2.handleUILogin(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("padded password: code %d want 200", w.Code)
+	}
+	found := false
+	for _, c := range w.Result().Cookies() {
+		if c.Name == uiSessionCookie && c.Value != "" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("padded login set no session cookie")
+	}
+	// Genuinely wrong stays wrong.
+	if code := login("nope"); code != http.StatusUnauthorized {
+		t.Fatalf("wrong password: code %d want 401", code)
 	}
 }
