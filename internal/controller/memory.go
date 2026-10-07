@@ -204,14 +204,19 @@ func (s *Server) voiceFresh(v *voiceResult) bool {
 // noteVoiceResult completes a tracked voice command when its agent output
 // lands (called beside ackCmd on BOTH transports). Unknown CmdIDs are a
 // no-op. Lines capped at 20; errors still record (as failures to report).
+// When the box visibly failed the run (unknown verb, transport error),
+// Jarvis says so with a next step instead of letting the raw error sit
+// unexplained — the notice is a direct reply, never a new run, so it
+// cannot recurse.
 func (s *Server) noteVoiceResult(cmdID, result, errStr string) {
 	if cmdID == "" {
 		return
 	}
+	op := s.opName() // before voiceMu: opName locks memoryMu (no reentry)
 	s.voiceMu.Lock()
-	defer s.voiceMu.Unlock()
 	p, ok := s.voice.awaiting[cmdID]
 	if !ok {
+		s.voiceMu.Unlock()
 		return
 	}
 	delete(s.voice.awaiting, cmdID)
@@ -237,4 +242,26 @@ func (s *Server) noteVoiceResult(cmdID, result, errStr string) {
 		}
 	}
 	s.voice.last = &voiceResult{text: p.text, run: p.run, lines: lines, host: p.host, at: time.Now()}
+	failed := errStr != "" || voiceRunFailed(text)
+	run, host := p.run, p.host
+	s.voiceMu.Unlock()
+	if !failed {
+		return
+	}
+	hint := "try 'voice-cmd help'"
+	if min, ok := cmdMinVersion[cmdVerb(run)]; ok {
+		hint = "update the box past " + min
+	} else if strings.HasPrefix(run, "run-powershell ") {
+		hint = "even the fallback didn't land — that box may block PowerShell, update it"
+	}
+	s.broadcastWS(map[string]interface{}{"type": "output", "id": host,
+		"data": fmt.Sprintf("🎙 That didn't land on %s (%s), %s — %s.", host, cmdVerb(run), op, hint), "success": true})
+}
+
+// voiceRunFailed spots agent-side rejection in result text (cmd.exe and
+// PowerShell both phrase it as not-recognized; the dispatcher says
+// unknown command). Pure for tests.
+func voiceRunFailed(text string) bool {
+	l := strings.ToLower(text)
+	return strings.Contains(l, "not recognized") || strings.Contains(l, "unknown command")
 }

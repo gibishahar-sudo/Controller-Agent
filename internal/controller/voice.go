@@ -75,9 +75,8 @@ func parseVoiceCmd(text, hostname string) (handled bool, run, reply string) {
 	if s == "" {
 		return say("Yes? Tell me what to do — try: what tabs does he have.")
 	}
-	if s == "help" || s == "what can you do" || s == "commands" || s == "what can i ask" || s == "help me" || s == "what do you do" {
-		return say("Try: what tabs does he have · pull his history · open youtube on his pc · " +
-			"remember his name is Dave · memory status · voice-cmd anything else runs it raw.")
+	if isHelpRequest(s) {
+		return say(voiceHelpText())
 	}
 	// Memory verbs that didn't parse as memory grammar (too short or
 	// mangled): point at the working forms, never pretend otherwise.
@@ -258,6 +257,39 @@ func (s *Server) parseMemoryCmd(text, host string, viaMemory bool) (bool, *Agent
 	}
 	return false, nil, "", ""
 }
+
+// isHelpRequest matches the help phrases in one place (parser and the
+// name-aware tryVoiceCmd path share it).
+func isHelpRequest(s string) bool {
+	switch s {
+	case "help", "what can you do", "commands", "what can i ask", "help me", "what do you do":
+		return true
+	}
+	return false
+}
+
+// voiceHelpText is the capability list (names get appended by the caller
+// that knows the store).
+func voiceHelpText() string {
+	return "Try: what tabs does he have · pull his history · open youtube on his pc · " +
+		"remember his name is Dave · memory status · voice-cmd anything else runs it raw."
+}
+
+// dayGreeting is time-aware and pure (hour in 24h).
+func dayGreeting(h int) string {
+	switch {
+	case h >= 5 && h < 12:
+		return "Good morning"
+	case h >= 12 && h < 18:
+		return "Good afternoon"
+	case h >= 18 && h < 23:
+		return "Good evening"
+	default:
+		return "Burning the midnight oil"
+	}
+}
+
+// tryVoiceCmd routes "voice-cmd <text>" and "memory <subcommand>"
 // pseudo-commands from any ingress. Memory grammar runs first (names,
 // facts, prefs, recall, wipe gate, repeats); P1 intents after. Direct
 // replies broadcast to all consoles; run rewrites the agent command on
@@ -279,6 +311,17 @@ func (s *Server) tryVoiceCmd(ac *AgentConn, cmd, cmdID string) (handled bool, ta
 	host := ""
 	if ac != nil {
 		host = ac.hostname
+	}
+	snorm := normVoice(rest)
+	if snorm == "" {
+		return s.finishVoice(ac, ac, "", "🎙 "+dayGreeting(time.Now().Hour())+", "+s.opName()+" — tell me what to do.", rest, cmdID)
+	}
+	if isHelpRequest(snorm) {
+		rep := "🎙 " + voiceHelpText()
+		if names := s.knownNames(); len(names) > 0 {
+			rep += "\n🎙 I know " + strings.Join(names, ", ") + " by name."
+		}
+		return s.finishVoice(ac, ac, "", rep, rest, cmdID)
 	}
 	if h, tac2, run2, rep := s.parseMemoryCmd(rest, host, isMem); h {
 		return s.finishVoice(ac, tac2, run2, rep, rest, cmdID)
@@ -1056,6 +1099,19 @@ func (s *Server) ordinalOpen(n int) (tac *AgentConn, run, reply string, matched 
 		return nil, "", fmt.Sprintf("🎙 Only %d rows cached.", len(urls)), true
 	}
 	return tac, "open-url chrome " + urls[n-1], "", true
+}
+
+// knownNames lists registered "name (host)" pairs, sorted, for the help
+// reply. Pure snapshot under one lock.
+func (s *Server) knownNames() []string {
+	s.memoryMu.Lock()
+	defer s.memoryMu.Unlock()
+	var out []string
+	for n, h := range s.memory.Names {
+		out = append(out, n+" ("+h+")")
+	}
+	sort.Strings(out)
+	return out
 }
 
 // retargetByName scans for a registered name token (or possessive) and

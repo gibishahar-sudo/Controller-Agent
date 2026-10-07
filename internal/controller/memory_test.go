@@ -326,3 +326,75 @@ func TestFinishVoiceStashesSpoken(t *testing.T) {
 		t.Fatalf("stash: %q %v want %q", text, ok, rep)
 	}
 }
+
+func TestVoiceRunFailed(t *testing.T) {
+	for _, s := range []string{
+		"'get-chrome-history' is not recognized as an internal or external command,",
+		"The term 'foo' is not recognized as the name of a cmdlet,",
+		"unknown command: frobnicate",
+	} {
+		if !voiceRunFailed(s) {
+			t.Fatalf("should flag failure: %q", s)
+		}
+	}
+	// Transport errors ride the errStr branch of noteVoiceResult, not text.
+	for _, s := range []string{"3 Chrome window(s):\n1. Foo", "ok", ""} {
+		if voiceRunFailed(s) {
+			t.Fatalf("false positive: %q", s)
+		}
+	}
+}
+
+func TestDayGreeting(t *testing.T) {
+	cases := map[int]string{
+		0: "Burning the midnight oil", 4: "Burning the midnight oil",
+		5: "Good morning", 11: "Good morning",
+		12: "Good afternoon", 17: "Good afternoon",
+		18: "Good evening", 22: "Good evening", 23: "Burning the midnight oil",
+	}
+	for h, want := range cases {
+		if got := dayGreeting(h); got != want {
+			t.Fatalf("hour %d: got %q want %q", h, got, want)
+		}
+	}
+}
+
+func TestIsHelpRequest(t *testing.T) {
+	for _, s := range []string{"help", "what can you do", "commands", "what can i ask", "help me", "what do you do"} {
+		if !isHelpRequest(s) {
+			t.Fatalf("%q must be help", s)
+		}
+	}
+	if isHelpRequest("help yourself") || isHelpRequest("helper") {
+		t.Fatal("prefix bleed")
+	}
+}
+
+func TestHelpNamesKnown(t *testing.T) {
+	s := memTestServer()
+	s.memoryMu.Lock()
+	s.memory.Names["dave"] = "DCHQHAK"
+	s.memoryMu.Unlock()
+	_, _, _, rep, _ := s.tryVoiceCmd(nil, "voice-cmd help", "c1")
+	if !strings.Contains(rep, "I know dave (DCHQHAK)") {
+		t.Fatalf("help must name names: %q", rep)
+	}
+	if !strings.Contains(rep, "what tabs") {
+		t.Fatalf("help must keep the list: %q", rep)
+	}
+}
+
+func TestKnownNames(t *testing.T) {
+	s := memTestServer()
+	if got := s.knownNames(); len(got) != 0 {
+		t.Fatalf("empty: %v", got)
+	}
+	s.memoryMu.Lock()
+	s.memory.Names["zed"] = "H2"
+	s.memory.Names["amy"] = "H1"
+	s.memoryMu.Unlock()
+	got := s.knownNames()
+	if len(got) != 2 || got[0] != "amy (H1)" || got[1] != "zed (H2)" {
+		t.Fatalf("sorted pairs: %v", got)
+	}
+}
