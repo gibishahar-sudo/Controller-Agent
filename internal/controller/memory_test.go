@@ -237,7 +237,7 @@ func TestHistoryRowURL(t *testing.T) {
 
 func ordTestServer() *Server {
 	s := memTestServer()
-	s.agents = map[string]*AgentConn{"a1": {id: "a1", hostname: "DCHQHAK"}}
+	s.agents = map[string]*AgentConn{"a1": {id: "a1", hostname: "DCHQHAK", version: "1.46.82"}}
 	return s
 }
 

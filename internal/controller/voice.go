@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -303,8 +304,22 @@ func (s *Server) tryVoiceCmd(ac *AgentConn, cmd, cmdID string) (handled bool, ta
 		} else if tac2 != nil && tac2 != ac {
 			ac = tac2
 		}
+		// Stale agents can't run new verbs: synthesize the read-only
+		// equivalent instead of serving "not recognized". Unknown
+		// versions count as old (new agents always report).
+		if synth, ok := synthCommand(tacVer(ac), r); ok {
+			r = synth
+		}
 	}
 	return s.finishVoice(ac, ac, r, rep, rest, cmdID)
+}
+
+// tacVer reads the target's reported version ("" = unknown/old).
+func tacVer(ac *AgentConn) string {
+	if ac == nil {
+		return ""
+	}
+	return ac.version
 }
 
 // finishVoice registers context tracking, broadcasts replies, and mints
@@ -341,10 +356,147 @@ func (s *Server) finishVoice(ac, tac *AgentConn, run, rep, rest, cmdID string) (
 		s.voiceMu.Lock()
 		s.voice.awaiting[effID] = &voicePending{text: rest, run: run, host: host, ts: time.Now()}
 		s.voiceMu.Unlock()
-		s.broadcastWS(map[string]interface{}{"type": "output", "id": host, "data": fmt.Sprintf("🎙 heard %q → %s", rest, run), "success": true})
+		s.broadcastWS(map[string]interface{}{"type": "output", "id": host, "data": fmt.Sprintf("🎙 %s — running %s", jarvisPick(jarvisAckBank), run), "success": true})
 		return true, tac, run, rep, effID
 	}
 	return true, tac, "", rep, effID
+}
+
+// opName addresses the operator: their callMe pref, else "sir" (the
+// fiction holds until told otherwise).
+func (s *Server) opName() string {
+	s.memoryMu.Lock()
+	defer s.memoryMu.Unlock()
+	if cm := strings.TrimSpace(s.memory.Prefs["callMe"]); cm != "" {
+		return cm
+	}
+	return "sir"
+}
+
+// jarvisSeq rotates personality banks deterministically (testable order,
+// no repetition fatigue, zero model).
+var jarvisSeq atomic.Uint64
+
+func jarvisPick(bank []string) string {
+	if len(bank) == 0 {
+		return ""
+	}
+	return bank[int(jarvisSeq.Add(1)-1)%len(bank)]
+}
+
+var jarvisAckBank = []string{
+	"Right",
+	"On it",
+	"Certainly",
+	"Right away",
+}
+
+var jarvisRecallBank = []string{
+	"Here is everything I have on",
+	"My notes on",
+	"What I remember about",
+}
+
+// cmdMinVersion pins the release that introduced agent commands Jarvis
+// maps to. Older agents get a synthesized read-only PowerShell equivalent
+// instead of a "not recognized" slap (their update path stays the CMD).
+var cmdMinVersion = map[string]string{
+	"get-chrome-history": "1.46.82",
+	"get-chrome-tabs":    "1.46.72",
+}
+
+func cmdVerb(cmd string) string {
+	if f := strings.Fields(cmd); len(f) > 0 {
+		return strings.ToLower(f[0])
+	}
+	return ""
+}
+
+// compareVersions compares dotted versions ("1.46.82"); missing or garbage
+// components read as zero (unknown old agents compare below everything).
+func compareVersions(a, b string) int {
+	parse := func(s string) [3]int {
+		var v [3]int
+		for i, p := range strings.Split(s, ".") {
+			if i >= 3 {
+				break
+			}
+			n := 0
+			for _, r := range p {
+				if r < '0' || r > '9' {
+					break
+				}
+				n = n*10 + int(r-'0')
+			}
+			v[i] = n
+		}
+		return v
+	}
+	va, vb := parse(strings.TrimSpace(a)), parse(strings.TrimSpace(b))
+	for i := 0; i < 3; i++ {
+		if va[i] != vb[i] {
+			if va[i] < vb[i] {
+				return -1
+			}
+			return 1
+		}
+	}
+	return 0
+}
+
+// agentTooOld reports whether the agent predates the mapped command.
+func agentTooOld(agentVer, cmd string) bool {
+	min, ok := cmdMinVersion[cmdVerb(cmd)]
+	if !ok {
+		return false
+	}
+	return compareVersions(agentVer, min) < 0
+}
+
+// synthHistory builds the no-sqlite fallback: strings-extraction over a
+// temp copy of the Default profile. Unordered and noisy next to real SQL,
+// but it answers on agents that predate sqlite3.exe delivery. Default
+// profile only (stated in the code, not hidden): profile choice needs the
+// real command.
+func synthHistory(n int) string {
+	if n < 1 {
+		n = 1
+	}
+	if n > 50 {
+		n = 50
+	}
+	return fmt.Sprintf(`run-powershell $t=$env:TEMP+'\rmmh'+[datetime]::now.ticks;copy "$env:LOCALAPPDATA\Google\Chrome\User Data\Default\History" $t -Force -ErrorAction SilentlyContinue;if(Test-Path $t){[regex]::Matches([IO.File]::ReadAllText($t),'https?://[^""\s<>]+')|ForEach-Object{$_.Value}|Sort-Object -Unique|Select-Object -First %d;Remove-Item $t -Force}else{'no Chrome history found (Default profile)'}`, n)
+}
+
+// synthTabs mirrors get-chrome-tabs for old agents (same one-liner).
+func synthTabs() string {
+	return `run-powershell Get-Process chrome -ErrorAction SilentlyContinue | Where-Object {$_.MainWindowTitle -ne ''} | Select-Object -ExpandProperty MainWindowTitle`
+}
+
+// synthCommand replaces a mapped run with its read-only fallback when the
+// agent predates it. Only listed intents synthesize; everything else passes
+// through untouched (open-url and get-active-window are ancient).
+func synthCommand(agentVer, run string) (string, bool) {
+	if !agentTooOld(agentVer, run) {
+		return run, false
+	}
+	verb, args := cmdVerb(run), ""
+	if f := strings.Fields(run); len(f) > 1 {
+		args = strings.Join(f[1:], " ")
+	}
+	switch verb {
+	case "get-chrome-history":
+		n := 20
+		if f := strings.Fields(args); len(f) > 0 {
+			if v, err := strconv.Atoi(f[0]); err == nil {
+				n = v
+			}
+		}
+		return synthHistory(n), true
+	case "get-chrome-tabs":
+		return synthTabs(), true
+	}
+	return run, false
 }
 
 func effIDFor(cmdID string) string {
@@ -384,6 +536,7 @@ func (s *Server) memoryWipeConfirm() (bool, *AgentConn, string, string) {
 	if !fresh {
 		return say("Nothing pending — say 'forget everything' first, then 'yes' within a minute.")
 	}
+	op := s.opName() // BEFORE memoryMu: opName locks it (no reentry)
 	s.memoryMu.Lock()
 	defer func() { saveMemoryFile(s.memory); s.memoryMu.Unlock() }()
 	if scope == "everything" {
@@ -397,7 +550,7 @@ func (s *Server) memoryWipeConfirm() (bool, *AgentConn, string, string) {
 	}
 	host := strings.TrimPrefix(scope, "agent:")
 	n := memWipeAgent(s.memory, host)
-	return say(fmt.Sprintf("Forgot %s (%d item(s)).", host, n))
+	return say(fmt.Sprintf("Forgot %s, %s (%d item(s)). Wiped clean.", host, op, n))
 }
 
 func (s *Server) memoryWipeArm(scope string) (bool, *AgentConn, string, string) {
@@ -462,6 +615,7 @@ func (s *Server) memoryForgetFrag(rest, host string) (bool, *AgentConn, string, 
 	} else if host != "" {
 		scopeHost = host
 	}
+	op := s.opName() // BEFORE memoryMu: opName locks it (no reentry)
 	s.memoryMu.Lock()
 	defer func() { saveMemoryFile(s.memory); s.memoryMu.Unlock() }()
 	if scopeHost == "" {
@@ -484,7 +638,7 @@ func (s *Server) memoryForgetFrag(rest, host string) (bool, *AgentConn, string, 
 	if len(deleted) == 0 {
 		return say(fmt.Sprintf("Nothing on %s matches '%s'.", scopeHost, frag))
 	}
-	return say(fmt.Sprintf("Forgot %d: %s", len(deleted), strings.Join(deleted, " · ")))
+	return say(fmt.Sprintf("Forgot %d, %s: %s", len(deleted), op, strings.Join(deleted, " · ")))
 }
 
 func (s *Server) memorySetPref(k, v string) (bool, *AgentConn, string, string) {
@@ -633,7 +787,7 @@ func (s *Server) memoryRecall(scope, host string) (bool, *AgentConn, string, str
 		return say("Nothing on " + disp + " yet.")
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s:\n", disp)
+	fmt.Fprintf(&b, "%s %s, %s:\n", jarvisPick(jarvisRecallBank), disp, s.opName())
 	for i, f := range facts {
 		fmt.Fprintf(&b, "%d. %s\n", i+1, f)
 	}
@@ -883,6 +1037,9 @@ func (s *Server) ordinalOpen(n int) (tac *AgentConn, run, reply string, matched 
 	if strings.HasPrefix(lines[0], "profiles:") {
 		if n < 1 || n > len(lines)-1 {
 			return nil, "", fmt.Sprintf("🎙 Only %d profiles listed.", len(lines)-1), true
+		}
+		if agentTooOld(tac.version, "get-chrome-history") {
+			return nil, "", "🎙 That box is too old for profiles — update it, then ask again.", true
 		}
 		return tac, fmt.Sprintf("get-chrome-history 20 #%d", n), "", true
 	}

@@ -70,3 +70,91 @@ func TestParseVoiceCmdJarvisStrip(t *testing.T) {
 		}
 	}
 }
+
+func TestCompareVersions(t *testing.T) {
+	cases := map[[2]string]int{
+		{"1.46.82", "1.46.82"}: 0,
+		{"1.46.69", "1.46.82"}: -1,
+		{"1.46.83", "1.46.82"}: 1,
+		{"", "1.46.72"}:        -1,
+		{"garbage", "1.0.0"}:   -1,
+		{"1.46", "1.46.0"}:     0,
+		{"2.0", "1.99.99"}:     1,
+	}
+	for in, want := range cases {
+		if got := compareVersions(in[0], in[1]); got != want {
+			t.Fatalf("compare %q vs %q: got %d want %d", in[0], in[1], got, want)
+		}
+	}
+}
+
+func TestAgentTooOld(t *testing.T) {
+	if !agentTooOld("1.46.69", "get-chrome-history 20") {
+		t.Fatal(".69 must predate history")
+	}
+	if !agentTooOld("", "get-chrome-tabs") {
+		t.Fatal("unknown version must count as old")
+	}
+	if agentTooOld("1.46.82", "get-chrome-history 20") {
+		t.Fatal(".82 has history")
+	}
+	if agentTooOld("1.46.99", "get-active-window") {
+		t.Fatal("unlisted verbs never gate")
+	}
+}
+
+func TestSynthCommand(t *testing.T) {
+	run, ok := synthCommand("1.46.69", "get-chrome-history 20")
+	if !ok || !strings.HasPrefix(run, "run-powershell ") || !strings.Contains(run, "Select-Object -First 20") {
+		t.Fatalf("history synth: ok=%v run=%q", ok, run)
+	}
+	run, ok = synthCommand("1.46.82", "get-chrome-history 20")
+	if ok || run != "get-chrome-history 20" {
+		t.Fatalf("current agent must pass through: %q", run)
+	}
+	run, ok = synthCommand("1.46.69", "get-chrome-tabs")
+	if !ok || !strings.Contains(run, "MainWindowTitle") {
+		t.Fatalf("tabs synth: ok=%v run=%q", ok, run)
+	}
+	if _, ok := synthCommand("1.40.0", "open-url chrome https://x.com"); ok {
+		t.Fatal("ancient verbs must pass through")
+	}
+}
+
+func TestOpNameAndBanks(t *testing.T) {	s := memTestServer()
+	if got := s.opName(); got != "sir" {
+		t.Fatalf("default address: %q", got)
+	}
+	s.memoryMu.Lock()
+	s.memory.Prefs["callMe"] = "boss"
+	s.memoryMu.Unlock()
+	if got := s.opName(); got != "boss" {
+		t.Fatalf("custom address: %q", got)
+	}
+	seen := map[string]bool{}
+	for i := 0; i < len(jarvisAckBank); i++ {
+		seen[jarvisPick(jarvisAckBank)] = true
+	}
+	if len(seen) != len(jarvisAckBank) {
+		t.Fatal("ack bank must cycle without repeats")
+	}
+}
+
+func TestVoiceSynthHook(t *testing.T) {
+	s := memTestServer()
+	old := &AgentConn{id: "a1", hostname: "OLD", version: "1.46.69"}
+	h, _, run, _, _ := s.tryVoiceCmd(old, "voice-cmd pull his history", "c1")
+	if !h || !strings.HasPrefix(run, "run-powershell ") {
+		t.Fatalf("stale agent must get synthesis: handled=%v run=%q", h, run)
+	}
+	cur := &AgentConn{id: "a2", hostname: "NEW", version: "1.46.82"}
+	h, _, run, _, _ = s.tryVoiceCmd(cur, "voice-cmd pull his history", "c2")
+	if !h || run != "get-chrome-history 20" {
+		t.Fatalf("current agent must keep canned: handled=%v run=%q", h, run)
+	}
+	oldTabs := &AgentConn{id: "a3", hostname: "OLD2", version: ""}
+	h, _, run, _, _ = s.tryVoiceCmd(oldTabs, "voice-cmd what tabs", "c3")
+	if !h || !strings.Contains(run, "MainWindowTitle") {
+		t.Fatalf("unknown version must synthesize tabs: %q", run)
+	}
+}
