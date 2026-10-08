@@ -193,6 +193,42 @@ html{touch-action:manipulation}
 .toast.ok{border-color:var(--success);background:rgba(139,195,74,.12)}
 .search-cur{background:rgba(255,213,79,.28)!important;outline:1px solid #FFD54F}
 @keyframes toastIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+
+/* Jarvis tab (arc-reactor theme, scoped: nothing outside #tab-jarvis changes) */
+.tab[data-tab="jarvis"]{color:#C9A7EB}
+.tab[data-tab="jarvis"].active{background:linear-gradient(180deg,rgba(88,28,135,.45),var(--bg-medium));border-color:#7C3AED;color:#fff;box-shadow:0 0 12px rgba(124,58,237,.45)}
+#tab-jarvis{overflow-y:auto}
+.j-hero{display:flex;gap:14px;align-items:center;padding:14px;background:linear-gradient(135deg,rgba(88,28,135,.35),rgba(8,145,178,.18));border:1px solid #7C3AED;border-radius:12px;box-shadow:0 0 18px rgba(124,58,237,.25)}
+.j-orb{width:76px;height:76px;border-radius:50%;flex-shrink:0;background:radial-gradient(circle at 35% 35%,#A5F3FC,#22D3EE 35%,#7C3AED 70%,#1E1B4B);box-shadow:0 0 22px rgba(34,211,238,.7),0 0 46px rgba(124,58,237,.5),inset 0 0 18px rgba(255,255,255,.25);animation:jBreathe 3.2s ease-in-out infinite}
+.j-orb.listening{animation:jListen .9s ease-in-out infinite;box-shadow:0 0 30px rgba(34,211,238,.95),0 0 70px rgba(124,58,237,.7),inset 0 0 22px rgba(255,255,255,.4)}
+@keyframes jBreathe{0%,100%{transform:scale(1);filter:brightness(1)}50%{transform:scale(1.05);filter:brightness(1.2)}}
+@keyframes jListen{0%,100%{transform:scale(1.08);filter:brightness(1.25)}50%{transform:scale(1.16);filter:brightness(1.5)}}
+.j-greet{font-size:15px;font-weight:700;color:#F5F3FF}
+.j-sub{font-size:11px;color:#C4B5FD;margin-top:2px}
+.j-pills{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+.j-pill{font-size:10px;padding:3px 10px;border-radius:20px;border:1px solid #7C3AED;background:rgba(124,58,237,.15);color:#DDD6FE}
+.j-pill.dim{border-color:var(--border);background:rgba(255,255,255,.04);color:var(--fg-dim)}
+.j-hero-btns{margin-left:auto;display:flex;gap:8px;align-items:center}
+.j-mic{width:64px;height:64px;border-radius:50%;font-size:26px;border:2px solid #22D3EE;background:rgba(34,211,238,.12);color:#fff;cursor:pointer;box-shadow:0 0 14px rgba(34,211,238,.5);transition:all .15s;font-family:inherit}
+.j-mic:hover{background:rgba(34,211,238,.25);transform:scale(1.06)}
+.j-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.j-card{padding:14px;background:rgba(30,27,75,.35);border:1px solid rgba(124,58,237,.5);border-radius:12px}
+.j-card h4{margin:0 0 10px 0;font-size:12px;color:#DDD6FE}
+.j-card.wide{grid-column:1/-1}
+.j-feed{max-height:220px;overflow-y:auto;display:flex;flex-direction:column;gap:6px;margin-top:10px;padding:4px}
+.j-bub{max-width:88%;padding:7px 11px;border-radius:12px;font-size:12px;line-height:1.5;word-break:break-word}
+.j-rep{align-self:flex-start;background:rgba(124,58,237,.22);border:1px solid rgba(124,58,237,.55);color:#EDE9FE;border-bottom-left-radius:4px}
+.j-heard{align-self:flex-end;background:rgba(34,211,238,.12);border:1px solid rgba(34,211,238,.4);color:#A5F3FC;border-bottom-right-radius:4px;font-size:11px}
+.j-chips{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+.j-chip{padding:5px 10px;background:rgba(124,58,237,.15);border:1px solid rgba(124,58,237,.5);border-radius:20px;font-size:11px;cursor:pointer;color:#DDD6FE;transition:all .15s}
+.j-chip:hover{background:#7C3AED;color:#fff;box-shadow:0 0 10px rgba(124,58,237,.6)}
+.j-row{display:flex;gap:6px;margin-top:8px}
+.j-row input{flex:1;background:var(--bg-input);border:1px solid rgba(124,58,237,.5);color:var(--fg);padding:7px 10px;border-radius:8px;outline:none;font-family:inherit;font-size:12px}
+.j-row input:focus{border-color:#22D3EE;box-shadow:0 0 8px rgba(34,211,238,.35)}
+.j-mem{font-size:11px;color:var(--fg);margin-top:8px;max-height:150px;overflow-y:auto}
+.j-mem .nm{color:#22D3EE;font-weight:700}
+.j-mem .fc{color:var(--fg-dim)}
+@media(max-width:900px){.j-grid{grid-template-columns:1fr}.j-hero{flex-wrap:wrap}.j-hero-btns{margin-left:0}}
 </style>
 </head>
 <body>
@@ -245,6 +281,7 @@ html{touch-action:manipulation}
 
     <div class="tabs">
       <button class="tab active" data-tab="screen">🖥 Screen</button>
+      <button class="tab" data-tab="jarvis">🎙 Jarvis</button>
       <button class="tab" data-tab="dashboard">📊 Dashboard</button>
       <button class="tab" data-tab="files">📁 Files</button>
       <button class="tab" data-tab="commands">⌨ Commands</button>
@@ -299,14 +336,64 @@ html{touch-action:manipulation}
         </div>
         <div style="display:flex;gap:6px;align-items:center"><label style="font-size:11px;color:#888">Vol</label><input id="volSlider" type="range" min="0" max="100" value="80" style="width:100px"/><span id="volLabel" style="font-size:11px">80%</span></div>
       </div>
-      <div class="toolbar" style="justify-content:space-between">
-        <div style="display:flex;gap:6px;align-items:center"><span style="font-size:11px;color:#888">Pranks:</span>
-          <button class="btn btn-small" id="sbToggle" title="Show/hide the prank soundboard">🔊 Board</button>
-          <span id="sbStatus" style="font-size:11px;color:#888">Board hidden</span>
+    </section>
+
+    <!-- Jarvis — her tab: voice console, memory, sidecar, mischief kit -->
+    <section id="tab-jarvis" class="tab-content">
+      <div class="j-hero">
+        <div class="j-orb" id="jOrb" title="Jarvis listening state"></div>
+        <div style="min-width:0">
+          <div class="j-greet" id="jGreet">Good evening, sir.</div>
+          <div class="j-sub">All her things live here now — talk, remember, phrase, prank.</div>
+          <div class="j-pills">
+            <span class="j-pill dim" id="jAgentPill" title="Selected agent">no agent</span>
+            <span class="j-pill dim" id="jModelPill" title="Local model sidecar">model ?</span>
+            <span class="j-pill dim" id="jTtsPill" title="Spoken replies">voice ?</span>
+          </div>
         </div>
-        <button class="btn btn-small" id="sbStopAll" title="Stop every prank sound">⏹ Stop all</button>
+        <div class="j-hero-btns">
+          <button class="j-mic" id="jMicBtn" title="Dictate (same engine as ⌨ mic)">🎤</button>
+          <button class="btn btn-small" id="jSpeakBtn" title="Spoken Jarvis replies on/off">🔊</button>
+        </div>
       </div>
-      <div id="sbPanel" style="display:none;grid-template-columns:1fr 1fr;gap:6px;padding:6px;background:var(--bg-input);border:1px solid var(--border);border-radius:8px"></div>
+      <div class="j-grid">
+        <div class="j-card">
+          <h4>🎙 Talk to her</h4>
+          <div class="j-row" style="margin-top:0"><input id="jVoiceInput" placeholder='Try: what tabs does he have · remember his name is Dave' autocomplete="off"/><button class="btn btn-primary btn-small" id="jVoiceSend">Ask</button></div>
+          <div class="j-chips">
+            <span class="j-chip" data-jcmd="voice-cmd help">help</span>
+            <span class="j-chip" data-jcmd="voice-cmd what tabs does he have">his tabs</span>
+            <span class="j-chip" data-jcmd="voice-cmd pull his history">his history</span>
+            <span class="j-chip" data-jcmd="voice-cmd what did I run">my runs</span>
+            <span class="j-chip" data-jcmd="memory status">memory</span>
+            <span class="j-chip" data-jcmd="llm-status">model</span>
+          </div>
+          <div class="j-feed" id="jFeed"><div class="j-bub j-rep">Ask me anything — replies land here and out loud.</div></div>
+        </div>
+        <div class="j-card">
+          <h4>🧠 Memory</h4>
+          <div class="j-row" style="margin-top:0"><input id="jMemInput" placeholder="remember his name is Dave · call me boss" autocomplete="off"/><button class="btn btn-small" id="jMemSave">Remember</button></div>
+          <div class="j-row"><input id="jForgetInput" placeholder="forget fragment…" autocomplete="off"/><button class="btn btn-small" id="jMemForget">Forget</button><button class="btn btn-small" id="jMemRefresh" title="Reload from controller">⟳</button></div>
+          <div class="j-mem" id="jMemView">Not loaded — ⟳ to pull her memory.</div>
+        </div>
+        <div class="j-card">
+          <h4>🗣 Phrasing model <span style="font-size:10px;color:#888">(local sidecar)</span></h4>
+          <div class="j-sub" id="jLlmStatus">model ? — press ⟳</div>
+          <div class="j-row"><button class="btn btn-small" id="jLlmRefresh" title="llm-status">⟳</button><button class="btn btn-small" id="jLlmWarmOn" title="Keep the model warm (30-min idle)">Warm on</button><button class="btn btn-small" id="jLlmWarmOff" title="Back to 5-min idle killer">Warm off</button><button class="btn btn-small" id="jLlmPull" title="Fetch model (~800MB once)">Pull</button></div>
+          <div class="j-row"><input id="jLlmSay" placeholder="llm-say test line…" autocomplete="off"/><button class="btn btn-small" id="jLlmSayBtn">Say</button></div>
+        </div>
+        <div class="j-card">
+          <h4>😈 Mischief kit <span style="font-size:10px;color:#888">(moved home from Screen)</span></h4>
+          <div class="j-row" style="margin-top:0;justify-content:space-between">
+            <div style="display:flex;gap:6px;align-items:center">
+              <button class="btn btn-small" id="sbToggle" title="Show/hide the prank soundboard">🔊 Board</button>
+              <span id="sbStatus" style="font-size:11px;color:#888">Board hidden</span>
+            </div>
+            <button class="btn btn-small" id="sbStopAll" title="Stop every prank sound">⏹ Stop all</button>
+          </div>
+          <div id="sbPanel" style="display:none;grid-template-columns:1fr 1fr;gap:6px;padding:6px;margin-top:8px;background:rgba(0,0,0,.25);border:1px solid rgba(124,58,237,.4);border-radius:8px"></div>
+        </div>
+      </div>
     </section>
 
     <!-- Files -->
@@ -402,7 +489,7 @@ html{touch-action:manipulation}
         <button class="btn btn-small" id="sendAllBtn" title="Send commands to ALL connected agents">All: OFF</button>
         <button class="btn btn-small" id="exportLog" title="Download terminal log">⤓</button>
         <button class="btn btn-small" id="clearTerm" title="Clear terminal">Clear</button>
-        <span id="historyHint" class="history-hint">↑↓ history • Tab complete • Ctrl+K focus • Ctrl+1-5 tabs</span>
+        <span id="historyHint" class="history-hint">↑↓ history • Tab complete • Ctrl+K focus • Ctrl+1-8 tabs</span>
       </div>
     </section>
 
@@ -565,6 +652,7 @@ document.querySelectorAll(".tab").forEach(t=>t.onclick=()=>{
   document.querySelectorAll(".tab").forEach(x=>x.classList.remove("active"));
   document.querySelectorAll(".tab-content").forEach(x=>x.classList.remove("active"));
   t.classList.add("active"); document.getElementById("tab-"+t.dataset.tab).classList.add("active");
+  if(t.dataset.tab==="jarvis"&&typeof updateJHero==="function"){ try{ updateJHero(); }catch{} }
   // Suspend the screen off-tab (bandwidth back to files), resume on return.
   if(t.dataset.tab!=="screen"&&streaming&&!streamSuspended){
     streamSuspended=true;
@@ -979,6 +1067,7 @@ function addTerm(text, cls="out"){
   const time=new Date().toLocaleTimeString();
   div.innerHTML=`<span style="opacity:.5">[${time}]</span> ${escapeHtml(text)}`;
   term.appendChild(div); term.scrollTop=term.scrollHeight;
+  if(typeof jMirror==="function"){ try{ jMirror(text); }catch{} }
 }
 function escapeHtml(s){return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");}
 function updateSuggest(){
@@ -1072,14 +1161,17 @@ $("cmdSend").onclick=sendCmd;
 // verbatim-mapped (not-allowed vs service-not-allowed is the whole
 // diagnosis); one attempt flag stops double-start double-toasts.
 let micAttempt=0;
-$("micBtn")?.addEventListener("click", ()=>{
-  const btn=$("micBtn");
+// micReset clears every mic button (both tabs) — the native PC-app Eval
+// calls this instead of touching micBtn alone.
+function micReset(){ ["micBtn","jMicBtn"].forEach(id=>{ const b=$(id); if(!b) return; b.dataset.busy=""; if(id==="micBtn"){ if(b.textContent!=="🎤") b.textContent="🎤"; } else { if(b.textContent!=="🎤") b.textContent="🎤"; } }); const o=$("jOrb"); if(o) o.classList.remove("listening"); }
+function orbListen(on){ const b=$("jMicBtn"); if(b){ b.dataset.busy=on?"1":""; b.textContent=on?"🎙…":"🎤"; } const o=$("jOrb"); if(o) o.classList.toggle("listening", !!on); }
+function startMic(btn){
   if(btn&&(btn.dataset.busy==="1")) return; // already listening
   // Native frame first: the PC app binds window.nativeMicListen (Windows
   // Speech Recognition, in-box) because its embedded frame has no web
   // speech service. Browsers skip straight to webkitSpeechRecognition.
   if(typeof window.nativeMicListen==="function"){
-    if(btn){ btn.dataset.busy="1"; btn.textContent="🎙…"; }
+    if(btn){ btn.dataset.busy="1"; btn.textContent="🎙…"; } orbListen(true);
     addTerm("🎙 listening (Windows) — speak now", "out");
     try{ window.nativeMicListen(); }catch{ if(btn){btn.dataset.busy="";btn.textContent="🎤";} }
     return;
@@ -1105,20 +1197,23 @@ $("micBtn")?.addEventListener("click", ()=>{
   const my=++micAttempt;
   let rec; try{ rec=new SR(); }catch{ toast("Could not start voice input", "err"); return; }
   rec.lang="en-US"; rec.interimResults=false; rec.maxAlternatives=1;
-  if(btn){ btn.dataset.busy="1"; btn.textContent="🎙…"; }
+  if(btn){ btn.dataset.busy="1"; btn.textContent="🎙…"; } orbListen(true);
   const stage=t=>{ if(my===micAttempt) addTerm("🎙 "+t, "out"); };
   rec.onaudiostart=()=>stage("mic open — speak now");
   rec.onsoundstart=()=>stage("sound detected");
   rec.onspeechstart=()=>stage("speech detected — transcribing");
-  const done=()=>{ const b=$("micBtn"); if(b){ b.dataset.busy=""; if(b.textContent!=="🎤") b.textContent="🎤"; } };
+  const done=()=>{ micReset(); };
   rec.onresult=e=>{
     if(my!==micAttempt) return;
     done();
     const heard=(e.results[0][0].transcript||"").trim();
     if(!heard) return;
-    const box=$("cmdInput"); if(box){ box.value="voice-cmd "+heard; box.focus(); }
     addTerm("🎙 heard: "+heard, "out");
-    sendCmd(); // operator-ordered auto-send: heard text goes immediately
+    // Heard text lands on the active tab's box and auto-sends
+    // (operator-ordered: heard text goes immediately).
+    if(document.getElementById("tab-jarvis")?.classList.contains("active") && $("jVoiceInput")){ $("jVoiceInput").value=heard; sendJarvis(); return; }
+    const box=$("cmdInput"); if(box){ box.value="voice-cmd "+heard; box.focus(); }
+    sendCmd();
   };
   rec.onerror=e=>{
     if(my!==micAttempt) return;
@@ -1140,14 +1235,21 @@ $("micBtn")?.addEventListener("click", ()=>{
   };
   rec.onend=done;
   try{ rec.start(); }catch{ done(); }
-});
+}
+$("micBtn")?.addEventListener("click", ()=>startMic($("micBtn")));
+$("jMicBtn")?.addEventListener("click", ()=>startMic($("jMicBtn")));
 // Spoken Jarvis replies (desktop): speechSynthesis over 🎙 outputs, never
 // the heard-echoes. Toggle persists (default ON — operator-ordered voice).
 function speakOn(){
   try{ return (localStorage.getItem("rmm_speak")||"1")==="1"; }catch{ return true; }
 }
-function paintSpeakBtn(){ const b=$("speakBtn"); if(b) b.textContent=speakOn()?"🔊":"🔇"; }
+function paintSpeakBtn(){ const on=speakOn(); const b=$("speakBtn"); if(b) b.textContent=on?"🔊":"🔇"; const j=$("jSpeakBtn"); if(j) j.textContent=on?"🔊":"🔇"; const p=$("jTtsPill"); if(p){ p.textContent=on?"voice on":"voice off"; p.classList.toggle("dim", !on); } }
 $("speakBtn")?.addEventListener("click", ()=>{
+  try{ localStorage.setItem("rmm_speak", speakOn()?"0":"1"); }catch{}
+  if(!speakOn()&&window.speechSynthesis){ try{window.speechSynthesis.cancel();}catch{} }
+  paintSpeakBtn();
+});
+$("jSpeakBtn")?.addEventListener("click", ()=>{
   try{ localStorage.setItem("rmm_speak", speakOn()?"0":"1"); }catch{}
   if(!speakOn()&&window.speechSynthesis){ try{window.speechSynthesis.cancel();}catch{} }
   paintSpeakBtn();
@@ -1721,6 +1823,74 @@ $("sbPanel")?.addEventListener("click", e=>{
   else if(act==="stop"){ if(!sbSend("stop-prank "+id)) return; st.playing=false; sbSay("■ "+id+" stopped"); }
   sbRender();
 });
+// Jarvis tab: reply feed mirror (🎙 terminal lines become chat bubbles;
+// 🗣 sidecar lines update her model card + pill), selection-free sender
+// (memory/llm commands work with no agent picked), memory viewer, hero.
+function jMirror(text){
+  const t=String(text||"");
+  if(t.startsWith("🗣 ")){
+    const short=t.slice(2).trim().slice(0,160);
+    const el=$("jLlmStatus"); if(el) el.textContent=short;
+    const mp=$("jModelPill"); if(mp){ const warm=/ready/i.test(t); mp.textContent=warm?"model warm":"model "+short.split(" ")[0]; mp.classList.toggle("dim", !warm); }
+    return;
+  }
+  if(!t.startsWith("🎙")) return;
+  const f=$("jFeed"); if(!f) return;
+  const d=document.createElement("div");
+  d.className="j-bub "+(/^🎙 heard: /.test(t)?"j-heard":"j-rep");
+  d.textContent=t.replace(/^🎙\s*/,"");
+  f.appendChild(d);
+  while(f.children.length>100) f.firstChild.remove();
+  f.scrollTop=f.scrollHeight;
+}
+function jSendRaw(v){
+  if(!v) return;
+  addTerm("❯ "+v, "prompt");
+  if(ws && ws.readyState===1) ws.send(JSON.stringify({type:"command", cmd:v, target:selected?.id, cmdId:mkCmdId()}));
+  else fetch("/api/cmd",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({cmd:v, cmdId:mkCmdId()})});
+}
+function sendJarvis(){
+  const box=$("jVoiceInput"); let v=(box.value||"").trim(); if(!v) return; box.value="";
+  const l=v.toLowerCase();
+  if(!(l==="memory"||l.startsWith("memory ")||l.startsWith("voice-cmd")||l.startsWith("llm-"))) v="voice-cmd "+v;
+  jSendRaw(v);
+}
+$("jVoiceSend")?.addEventListener("click", sendJarvis);
+$("jVoiceInput")?.addEventListener("keydown", e=>{ if(e.key==="Enter"){ e.preventDefault(); sendJarvis(); } e.stopPropagation(); });
+document.querySelectorAll(".j-chip[data-jcmd]").forEach(c=>c.onclick=()=>jSendRaw(c.dataset.jcmd));
+function jMemRefresh(){
+  const v=$("jMemView"); if(v) v.textContent="Loading…";
+  fetch("/api/memory").then(r=>r.json()).then(m=>{
+    const el=$("jMemView"); if(!el) return;
+    const names=Object.keys(m.names||{}).sort();
+    const prefs=m.prefs||{};
+    let h="";
+    h+=names.length?names.map(n=>`<div><span class="nm">${escapeHtml(n)}</span> → ${escapeHtml(m.names[n])}</div>`).join(""):`<div class="fc">No names yet — try "remember his name is Dave".</div>`;
+    Object.keys(prefs).sort().forEach(k=>{ h+=`<div><span class="nm">${escapeHtml(k)}</span> = ${escapeHtml(prefs[k])}</div>`; });
+    Object.keys(m.agents||{}).sort().forEach(host=>{ ((m.agents[host]||{}).facts||[]).slice(0,20).forEach(f=>{ h+=`<div class="fc">• ${escapeHtml(f)} <span style="opacity:.6">(${escapeHtml(host)})</span></div>`; }); });
+    el.innerHTML=h||`<div class="fc">Empty.</div>`;
+  }).catch(()=>{ const el=$("jMemView"); if(el) el.textContent="Memory unreachable."; });
+}
+$("jMemRefresh")?.addEventListener("click", jMemRefresh);
+$("jMemSave")?.addEventListener("click", ()=>{ const b=$("jMemInput"); let v=(b.value||"").trim(); if(!v) return; b.value=""; if(!/^memory(\s|$)/i.test(v)) v="memory "+v; jSendRaw(v); setTimeout(jMemRefresh, 1500); });
+$("jMemForget")?.addEventListener("click", ()=>{ const b=$("jForgetInput"); let v=(b.value||"").trim(); if(!v) return; b.value=""; jSendRaw("memory forget "+v.replace(/^forget\s+/i,"")); setTimeout(jMemRefresh, 1500); });
+$("jMemInput")?.addEventListener("keydown", e=>{ if(e.key==="Enter"){ e.preventDefault(); $("jMemSave").click(); } e.stopPropagation(); });
+$("jForgetInput")?.addEventListener("keydown", e=>{ if(e.key==="Enter"){ e.preventDefault(); $("jMemForget").click(); } e.stopPropagation(); });
+$("jLlmRefresh")?.addEventListener("click", ()=>jSendRaw("llm-status"));
+$("jLlmWarmOn")?.addEventListener("click", ()=>jSendRaw("llm-warm on"));
+$("jLlmWarmOff")?.addEventListener("click", ()=>jSendRaw("llm-warm off"));
+$("jLlmPull")?.addEventListener("click", ()=>jSendRaw("llm-pull"));
+$("jLlmSayBtn")?.addEventListener("click", ()=>{ const b=$("jLlmSay"); const v=(b.value||"").trim(); if(!v) return; b.value=""; jSendRaw("llm-say "+v); });
+$("jLlmSay")?.addEventListener("keydown", e=>{ if(e.key==="Enter"){ e.preventDefault(); $("jLlmSayBtn").click(); } e.stopPropagation(); });
+let jModelAt=0;
+function updateJHero(){
+  const h=new Date().getHours();
+  const g=h>=5&&h<12?"Good morning":h>=12&&h<18?"Good afternoon":h>=18&&h<23?"Good evening":"Burning the midnight oil";
+  const gr=$("jGreet"); if(gr) gr.textContent=g+", sir — tell me what to do.";
+  const a=$("jAgentPill"); if(a){ if(selected){ a.textContent="● "+(selected.hostname||selected.id); a.classList.remove("dim"); } else { a.textContent="no agent"; a.classList.add("dim"); } }
+  paintSpeakBtn();
+  if(Date.now()-jModelAt>60000){ jModelAt=Date.now(); jSendRaw("llm-status"); }
+}
 $("muteBtn").onclick=()=>{ if(!selected) return; sendCmdVal("set-mic-mute on"); addConsole("Mute toggled"); };
 $("volSlider").oninput=e=>{ $("volLabel").textContent=e.target.value+"%"; };
 $("volSlider").onchange=e=>{ if(selected) sendCmdVal("set-volume "+e.target.value); };
@@ -2911,14 +3081,15 @@ try{
     $("cmdFavs").insertBefore(s,$("addCmdFav"));
   });
 }catch{}
-// Keyboard shortcuts: Ctrl+K focuses command input, Ctrl+1..5 switch tabs
+// Keyboard shortcuts: Ctrl+K focuses command input, Ctrl+1..8 switch tabs, Ctrl+J jumps to Jarvis
 document.addEventListener("keydown", e=>{
   if(e.ctrlKey && (e.key==="k"||e.key==="K")){ e.preventDefault(); document.querySelector('.tab[data-tab="commands"]')?.click(); input.focus(); }
-  if(e.ctrlKey && ["1","2","3","4","5","6","7"].includes(e.key)){
+  if(e.ctrlKey && ["1","2","3","4","5","6","7","8"].includes(e.key)){
     e.preventDefault();
-    const tabs=["screen","dashboard","files","commands","audio","camera","settings"];
+    const tabs=["screen","jarvis","dashboard","files","commands","audio","camera","settings"];
     document.querySelector(`.tab[data-tab="${tabs[+e.key-1]}"]`)?.click();
   }
+  if(e.ctrlKey && (e.key==="j"||e.key==="J")){ e.preventDefault(); document.querySelector('.tab[data-tab="jarvis"]')?.click(); }
 });
 
 // Compact declutter mode (persisted): secondary buttons hide behind ⋯.
@@ -3086,15 +3257,7 @@ document.querySelectorAll(".file-pane, #screenWrap").forEach(el=>{
   });
 });
 
-// Voice talk-back gated OFF (toggle in Settings)
-const voiceCard=document.createElement("div"); voiceCard.className="audio-card"; voiceCard.innerHTML=`<h4>🎙 Voice <span style="font-size:10px;color:#666">(gated OFF)</span></h4><label class="toggle" id="voiceToggle"><input type="checkbox"/> Enable talk-back</label><div style="font-size:11px;color:#888">Hold to talk is coming — gated for now. Enable to test local mic loopback.</div><button class="btn btn-small" id="voiceTest">Test mic</button><span id="voiceStatus" style="font-size:11px;color:#888"></span>`;
-document.querySelector("#tab-audio .audio-grid")?.appendChild(voiceCard);
-let voiceOn=false; try{ voiceOn=localStorage.getItem("rmm_voice")==="1"; }catch{} const vt=document.getElementById("voiceToggle")?.querySelector("input"); if(vt) vt.checked=voiceOn;
-document.getElementById("voiceToggle")?.addEventListener("change", e=>{ voiceOn=e.currentTarget.querySelector("input").checked; try{ localStorage.setItem("rmm_voice", voiceOn?"1":""); }catch{} toast(voiceOn?"Voice enabled (skeleton)":"Voice disabled"); });
-document.getElementById("voiceTest")?.addEventListener("click", async()=>{
-  if(!voiceOn) return toast("Enable voice first","err");
-  try{ const s=await navigator.mediaDevices.getUserMedia({audio:true}); s.getTracks().forEach(t=>t.stop()); $("voiceStatus").textContent="Mic OK — skeleton only (no agent stream yet)."; }catch(err){ $("voiceStatus").textContent="Mic blocked: "+err; }
-});
+// (Voice skeleton removed in 1.46.87 — her tab owns talk-back now.)
 
 setWsState("WS connecting…");
 connectWS();

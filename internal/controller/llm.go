@@ -37,7 +37,9 @@ const (
 	llmModelSize = 807694464
 	llmPort      = "17877"
 	llmIdleKill  = 5 * time.Minute
-	llmTimeout   = 10 * time.Second
+	llmWarmIdle  = 30 * time.Minute
+	llmTimeout   = 6 * time.Second
+	llmCacheCap  = 200
 )
 
 type llmState struct {
@@ -54,9 +56,53 @@ type llmState struct {
 	stopPull  bool
 	starting  bool
 	startDone chan struct{}
+	// Phrase cache: (text + callMe) -> phrased line. Repeat replies
+	// (help, greetings, recall openers) skip the model entirely.
+	phraseCache map[string]string
+	phraseOrder []string // FIFO eviction order, capped at llmCacheCap
+	lastOK      time.Time // last successful completion: skips the /health probe while fresh
+	warm        bool      // warm standby: prewarmed at boot, long idle window
 }
 
-func newLLMState() *llmState { return &llmState{} }
+func newLLMState() *llmState { return &llmState{phraseCache: map[string]string{}} }
+
+// phraseKey scopes cache entries by addressee (callMe changes the line).
+func phraseKey(text, callMe string) string { return text + "\x00" + callMe }
+
+// phraseGet/phrasePut are the bounded FIFO cache (caller need not hold mu).
+func (st *llmState) phraseGet(key string) (string, bool) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	line, ok := st.phraseCache[key]
+	return line, ok
+}
+
+func (st *llmState) phrasePut(key, line string) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.phraseCache == nil {
+		st.phraseCache = map[string]string{}
+	}
+	if _, dup := st.phraseCache[key]; !dup {
+		st.phraseOrder = append(st.phraseOrder, key)
+	}
+	st.phraseCache[key] = line
+	for len(st.phraseOrder) > llmCacheCap {
+		old := st.phraseOrder[0]
+		st.phraseOrder = st.phraseOrder[1:]
+		delete(st.phraseCache, old)
+	}
+}
+
+// idleKillDur is short by default (RAM back fast), long on warm standby.
+func (st *llmState) idleKillDur() time.Duration {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.warm {
+		return llmWarmIdle
+	}
+	return llmIdleKill
+}
 
 // llmHome mirrors memoryFile: beside the exe (installed) or CWD (dev).
 func llmHome() string {
@@ -103,15 +149,23 @@ func (s *Server) llmStatus() string {
 	}
 	if st.cmd != nil && st.cmd.Process != nil {
 		idle := time.Since(st.lastUse).Round(time.Second)
-		return fmt.Sprintf("ready (pid %d, idle %s)", st.cmd.Process.Pid, idle)
+		return fmt.Sprintf("ready (pid %d, idle %s)%s, cache %d", st.cmd.Process.Pid, idle, warmTag(st), len(st.phraseCache))
 	}
 	if st.ready {
-		return "ready (server down, starts on demand)"
+		return fmt.Sprintf("ready (server down, starts on demand)%s, cache %d", warmTag(st), len(st.phraseCache))
 	}
 	if st.lastErr != "" {
 		return "down: " + st.lastErr
 	}
 	return "down (no model — first llm-say pulls ~800MB in background)"
+}
+
+// warmTag reports the standby flag for the status line (caller holds mu).
+func warmTag(st *llmState) string {
+	if st.warm {
+		return " warm-standby"
+	}
+	return ""
 }
 
 // llmEnsure verifies files (once per boot) and starts the server.
@@ -263,19 +317,28 @@ func llmThreads() string {
 	return fmt.Sprintf("%d", n)
 }
 
-// armIdleLocked (re)arms the idle killer (caller holds st.mu).
+// armIdleLocked (re)arms the idle killer (caller holds st.mu). Warm
+// standby keeps the server half an hour; default gives RAM back in five.
 func (st *llmState) armIdleLocked() {
 	if st.idleT != nil {
 		st.idleT.Stop()
 	}
-	st.idleT = time.AfterFunc(llmIdleKill, func() {
+	dur := llmIdleKill
+	if st.warm {
+		dur = llmWarmIdle
+	}
+	st.idleT = time.AfterFunc(dur, func() {
 		// Kill only if still idle (a fresh use re-arms).
 		st.mu.Lock()
 		defer st.mu.Unlock()
 		if st.cmd == nil || st.cmd.Process == nil {
 			return
 		}
-		if time.Since(st.lastUse) < llmIdleKill {
+		idle := llmIdleKill
+		if st.warm {
+			idle = llmWarmIdle
+		}
+		if time.Since(st.lastUse) < idle {
 			return
 		}
 		_ = st.cmd.Process.Kill()
@@ -505,9 +568,9 @@ func (s *Server) llmStop() string {
 }
 
 // tryLLMCmd routes controller-side llm pseudo-commands (llm-say, llm-pull,
-// llm-stop, llm-status). Everything answers directly via broadcast; nothing
-// reaches agents. Returns handled + reply (reply is for callers with a local
-// screen; WS/HTTP already got the broadcast).
+// llm-stop, llm-status, llm-warm). Everything answers directly via
+// broadcast; nothing reaches agents. Returns handled + reply (reply is for
+// callers with a local screen; WS/HTTP already got the broadcast).
 func (s *Server) tryLLMCmd(cmd string) (bool, string) {
 	t := strings.TrimSpace(cmd)
 	lt := strings.ToLower(t)
@@ -523,6 +586,8 @@ func (s *Server) tryLLMCmd(cmd string) (bool, string) {
 		return answer(s.llmStop())
 	case lt == "llm-pull":
 		return answer(s.llmPull())
+	case lt == "llm-warm" || lt == "llm-warm on" || lt == "llm-warm off":
+		return answer(s.llmWarm(lt))
 	case lt == "llm-say" || strings.HasPrefix(lt, "llm-say "):
 		text := strings.TrimSpace(t[len("llm-say"):])
 		if text == "" {
@@ -537,11 +602,53 @@ func (s *Server) tryLLMCmd(cmd string) (bool, string) {
 	return false, ""
 }
 
+// llmWarm toggles warm standby (pref persisted in memory.json): on keeps
+// the sidecar up for 30 idle minutes and prewarms it now; off returns to
+// the 5-minute idle killer. "llm-warm" alone reports the flag. Prewarm
+// starts only when files verify — never a surprise 800MB pull.
+func (s *Server) llmWarm(lt string) string {
+	on := strings.HasSuffix(lt, " on")
+	off := strings.HasSuffix(lt, " off")
+	s.memoryMu.Lock()
+	if on {
+		s.memory.Prefs["llmWarm"] = "1"
+	} else if off {
+		delete(s.memory.Prefs, "llmWarm")
+	}
+	warmed := s.memory.Prefs["llmWarm"] == "1"
+	saveMemoryFile(s.memory)
+	s.memoryMu.Unlock()
+	st := s.llm
+	st.mu.Lock()
+	st.warm = warmed
+	st.mu.Unlock()
+	if off {
+		s.llmStop()
+		return "standby off (5-minute idle killer)"
+	}
+	if on {
+		if err := llmVerifyFiles(); err != nil {
+			return "standby on — files not present, llm-pull first"
+		}
+		go func() {
+			if err := s.llmEnsure(); err != nil {
+				log.Printf("[llm] prewarm: %v", err)
+			}
+		}()
+		return "standby on (30-minute idle window, prewarming now)"
+	}
+	if warmed {
+		return "standby on (30-minute idle window)"
+	}
+	return "standby off (5-minute idle killer)"
+}
+
 // llmPhraseIfReady phrases text through the model ONLY when the sidecar
 // is already warm (running + healthy). Never starts a pull, never blocks
 // hunting one: cold return ("", false) keeps the raw text on its way.
 // Also returns false for very short text (< 40 chars) — phrasing a
-// 5-word reply adds latency for no benefit.
+// 5-word reply adds latency for no benefit. Repeat texts hit the phrase
+// cache (no model call at all); a recent success skips the /health probe.
 func (s *Server) llmPhraseIfReady(text string) (string, bool) {
 	if s.llm == nil {
 		return "", false
@@ -550,11 +657,21 @@ func (s *Server) llmPhraseIfReady(text string) (string, bool) {
 	if len(text) < 40 {
 		return "", false
 	}
+	callMe := ""
+	s.memoryMu.Lock()
+	if cm, ok := s.memory.Prefs["callMe"]; ok {
+		callMe = strings.TrimSpace(cm)
+	}
+	s.memoryMu.Unlock()
 	st := s.llm
+	if line, ok := st.phraseGet(phraseKey(text, callMe)); ok {
+		return line, true
+	}
 	st.mu.Lock()
 	running := st.cmd != nil && st.cmd.Process != nil
+	fresh := time.Since(st.lastOK) < time.Minute
 	st.mu.Unlock()
-	if !running || !llmHealthy() {
+	if !running || (!fresh && !llmHealthy()) {
 		return "", false
 	}
 	line, err := s.llmSay(text)
@@ -566,11 +683,25 @@ func (s *Server) llmPhraseIfReady(text string) (string, bool) {
 
 // llmSay phrases operator-result text into one short Jarvis line (proven
 // P0r job: grounded, no invention). Auto-pulls on first need (voted);
-// while pulling, answers with the unphrased text once.
+// while pulling, answers with the unphrased text once. Repeat texts hit
+// the cache; 32 output tokens + 6s timeout keep slow boxes from stalling
+// the voice path (failures keep the raw text).
 func (s *Server) llmSay(ctxText string) (string, error) {
 	ctxText = strings.TrimSpace(ctxText)
 	if ctxText == "" {
 		return "", fmt.Errorf("nothing to phrase")
+	}
+	if s.llm == nil {
+		return ctxText, fmt.Errorf("sidecar unavailable")
+	}
+	callMe := ""
+	s.memoryMu.Lock()
+	if cm, ok := s.memory.Prefs["callMe"]; ok {
+		callMe = strings.TrimSpace(cm)
+	}
+	s.memoryMu.Unlock()
+	if line, ok := s.llm.phraseGet(phraseKey(ctxText, callMe)); ok {
+		return line, nil
 	}
 	if err := s.llmEnsure(); err != nil {
 		if err == errLLMNeedPull {
@@ -579,26 +710,22 @@ func (s *Server) llmSay(ctxText string) (string, error) {
 		}
 		return ctxText, err
 	}
-	callMe := ""
-	s.memoryMu.Lock()
-	if cm, ok := s.memory.Prefs["callMe"]; ok {
-		callMe = strings.TrimSpace(cm)
-	}
-	s.memoryMu.Unlock()
 	sys, user := llmPrompt(ctxText, callMe)
-	line, err := s.llmComplete(sys, user, 0.2, 40, llmTimeout)
+	line, err := s.llmComplete(sys, user, 0.2, 32, llmTimeout)
 	if err != nil {
 		return ctxText, err
 	}
 	if line = llmCleanLine(line); line == "" || len(line) > 200 {
 		return ctxText, fmt.Errorf("bad model reply")
 	}
+	s.llm.phrasePut(phraseKey(ctxText, callMe), line)
 	return line, nil
 }
 
 // llmPrompt builds the proven P0r phrasing prompt (short, grounded).
+// The word cap keeps generations short: faster replies, shorter TTS.
 func llmPrompt(ctxText, callMe string) (sys, user string) {
-	sys = "Reply with ONE short line only, no quotes, no JSON."
+	sys = "Reply with ONE short line only, no quotes, no JSON. Keep it under 20 words."
 	user = ctxText + ". Say it in one short Jarvis-style line."
 	if callMe != "" {
 		user += " Address the operator as " + callMe + "."
@@ -612,14 +739,21 @@ func llmCleanLine(s string) string {
 }
 
 // llmComplete posts one chat completion (temp/maxTokens bounded) and
-// returns the raw content. Serialized: one in-flight model call.
+// returns the raw content. Serialized: one in-flight model call. Success
+// stamps lastOK so the next phrasing skips the /health probe.
 func (s *Server) llmComplete(sys, user string, temp float64, maxTokens int, timeout time.Duration) (string, error) {
 	st := s.llm
 	st.mu.Lock()
 	st.lastUse = time.Now()
 	st.armIdleLocked()
 	st.mu.Unlock()
-	return llmPost("http://127.0.0.1:"+llmPort+"/v1/chat/completions", sys, user, temp, maxTokens, timeout)
+	line, err := llmPost("http://127.0.0.1:"+llmPort+"/v1/chat/completions", sys, user, temp, maxTokens, timeout)
+	if err == nil {
+		st.mu.Lock()
+		st.lastOK = time.Now()
+		st.mu.Unlock()
+	}
+	return line, err
 }
 
 // llmPost is the transport half of llmComplete (hermetic under tests).

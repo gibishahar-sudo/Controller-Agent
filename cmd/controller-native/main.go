@@ -90,23 +90,25 @@ func main() {
 	w.SetSize(1000, 700, webview2.HintNone)
 	w.Navigate(url)
 	// Native mic bridge: this embedded frame has no web speech service, so
-	// the page's mic button calls window.nativeMicListen() (bound below)
+	// the page's mic buttons call window.nativeMicListen() (bound below)
 	// instead of webkitSpeechRecognition. Recognition runs here via in-box
 	// Windows Speech Recognition; the transcript returns through Eval,
 	// filling the command box and auto-sending exactly like the web path.
 	// A busy flag in the page stops double-taps; results are JSON-encoded
-	// so quotes in speech can't break the snippet.
+	// so quotes in speech can't break the snippet. micReset() clears both
+	// tab buttons (Commands + Jarvis); the transcript still lands in the
+	// shared command box either way.
 	if err := w.Bind("nativeMicListen", func() string {
 		go func() {
 			text := windowsSpeechOnce(45 * time.Second)
 			w.Dispatch(func() {
 				if strings.TrimSpace(text) == "" {
-					w.Eval(`(function(){var b=document.getElementById("micBtn");if(b){b.dataset.busy="";b.textContent="🎤";}addTerm("🎙 heard nothing — try again","out");})()`)
+					w.Eval(`(function(){micReset();addTerm("🎙 heard nothing — try again","out");})()`)
 					return
 				}
 				full, _ := json.Marshal("voice-cmd " + text)
 				bare, _ := json.Marshal(text)
-				w.Eval(`(function(){var box=document.getElementById("cmdInput");var b=document.getElementById("micBtn");if(b){b.dataset.busy="";b.textContent="🎤";}if(!box){toast("No command box","err");return;}box.value=` + string(full) + `;box.focus();addTerm("🎙 heard: "+` + string(bare) + `,"out");sendCmd();})()`)
+				w.Eval(`(function(){var box=document.getElementById("cmdInput");micReset();if(!box){toast("No command box","err");return;}box.value=` + string(full) + `;box.focus();addTerm("🎙 heard: "+` + string(bare) + `,"out");sendCmd();})()`)
 			})
 		}()
 		return ""

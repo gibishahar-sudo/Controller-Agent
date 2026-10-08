@@ -383,6 +383,16 @@ func StartBackground(opts Options) (*Server, error) {
 	s.memory = loadMemoryFile()
 	s.voice = newVoiceCtx()
 	s.llm = newLLMState()
+	if s.memory.Prefs["llmWarm"] == "1" {
+		s.llm.warm = true
+		// Prewarm in background: no pull, no block — if files are
+		// missing the sidecar simply stays down until llm-pull.
+		go func() {
+			if err := s.llmEnsure(); err != nil {
+				log.Printf("[llm] prewarm: %v", err)
+			}
+		}()
+	}
 	s.authLog = make(map[string]time.Time)
 	s.loadAgentToken()
 	s.loadHeldRollbacks()

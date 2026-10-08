@@ -73,7 +73,7 @@ func TestLLMCleanLine(t *testing.T) {
 func TestTryLLMCmdShapes(t *testing.T) {
 	s := memTestServer()
 	s.llm = newLLMState()
-	for _, cmd := range []string{"llm-status", "llm-stop", "llm-pull", "llm-say hi", "LLM-STATUS", "  llm-status  "} {
+	for _, cmd := range []string{"llm-status", "llm-stop", "llm-pull", "llm-say hi", "llm-warm", "LLM-STATUS", "  llm-status  "} {
 		h, rep := s.tryLLMCmd(cmd)
 		if !h || rep == "" {
 			t.Fatalf("%q: handled=%v rep=%q", cmd, h, rep)
@@ -86,5 +86,75 @@ func TestTryLLMCmdShapes(t *testing.T) {
 		if h, _ := s.tryLLMCmd(cmd); h {
 			t.Fatalf("%q must not route to llm", cmd)
 		}
+	}
+}
+
+func TestPhraseCache(t *testing.T) {
+	st := newLLMState()
+	if _, ok := st.phraseGet("k"); ok {
+		t.Fatal("empty cache must miss")
+	}
+	st.phrasePut("a", "Aye.")
+	st.phrasePut("b", "Aye2.")
+	if got, ok := st.phraseGet("a"); !ok || got != "Aye." {
+		t.Fatalf("get a: %q %v", got, ok)
+	}
+	for i := 0; i < llmCacheCap+10; i++ {
+		st.phrasePut(strings.Repeat("x", i+3), "v")
+	}
+	if len(st.phraseCache) > llmCacheCap {
+		t.Fatalf("cache uncapped: %d", len(st.phraseCache))
+	}
+	if _, ok := st.phraseGet("a"); ok {
+		t.Fatal("FIFO must evict the oldest first")
+	}
+	if k1, k2 := phraseKey("t", "boss"), phraseKey("t", "sir"); k1 == k2 {
+		t.Fatal("callMe must scope the key")
+	}
+}
+
+func TestIdleKillDur(t *testing.T) {
+	st := newLLMState()
+	if got := st.idleKillDur(); got != llmIdleKill {
+		t.Fatalf("default: %v", got)
+	}
+	st.mu.Lock()
+	st.warm = true
+	st.mu.Unlock()
+	if got := st.idleKillDur(); got != llmWarmIdle {
+		t.Fatalf("warm: %v", got)
+	}
+}
+
+func TestLLMWarmPref(t *testing.T) {
+	s := memTestServer()
+	s.llm = newLLMState()
+	h, rep := s.tryLLMCmd("llm-warm")
+	if !h || !strings.Contains(rep, "standby off") {
+		t.Fatalf("bare warm reports: %v %q", h, rep)
+	}
+	h, rep = s.tryLLMCmd("llm-warm on")
+	if !h || !strings.Contains(rep, "llm-pull first") {
+		t.Fatalf("warm on without files: %v %q", h, rep)
+	}
+	if s.memory.Prefs["llmWarm"] != "1" {
+		t.Fatal("warm pref must persist")
+	}
+	if !s.llm.warm {
+		t.Fatal("runtime flag must follow the pref")
+	}
+	h, rep = s.tryLLMCmd("llm-warm off")
+	if !h || !strings.Contains(rep, "standby off") {
+		t.Fatalf("warm off: %v %q", h, rep)
+	}
+	if _, ok := s.memory.Prefs["llmWarm"]; ok {
+		t.Fatal("warm off must clear the pref")
+	}
+}
+
+func TestLLMPromptWordCap(t *testing.T) {
+	sys, _ := llmPrompt("ctx", "")
+	if !strings.Contains(sys, "20 words") {
+		t.Fatalf("prompt must cap length: %q", sys)
 	}
 }
