@@ -398,3 +398,50 @@ func TestKnownNames(t *testing.T) {
 		t.Fatalf("sorted pairs: %v", got)
 	}
 }
+
+// dupAlarmText names the host, the count, and caps the id list.
+func TestDupAlarmText(t *testing.T) {
+	got := dupAlarmText("H", []string{"b", "a"})
+	if !strings.Contains(got, "2 agents on H") || !strings.Contains(got, "a, b") {
+		t.Fatalf("shape: %q", got)
+	}
+	many := []string{"1", "2", "3", "4", "5", "6", "7"}
+	got = dupAlarmText("H", many)
+	if !strings.Contains(got, "7 agents on H") || !strings.Contains(got, "…") || strings.Contains(got, "7, ") {
+		t.Fatalf("truncate: %q", got)
+	}
+}
+
+// dupCheck alarms once at threshold, re-fires on growth, clears below.
+func TestDupCheck(t *testing.T) {
+	s := memTestServer()
+	s.agents = map[string]*AgentConn{}
+	add := func(id string) {
+		s.agentsMu.Lock()
+		s.agents[id] = &AgentConn{hostname: "H", id: id}
+		s.agentsMu.Unlock()
+		s.dupCheck("H")
+	}
+	add("a1")
+	add("a2")
+	if len(s.dupAlarmed) != 0 {
+		t.Fatal("below threshold must stay silent")
+	}
+	add("a3")
+	if s.dupAlarmed["H"] != 3 {
+		t.Fatalf("threshold must alarm: %v", s.dupAlarmed)
+	}
+	add("a4")
+	if s.dupAlarmed["H"] != 4 {
+		t.Fatalf("growth must re-fire: %v", s.dupAlarmed)
+	}
+	s.agentsMu.Lock()
+	delete(s.agents, "a4")
+	delete(s.agents, "a3")
+	s.agentsMu.Unlock()
+	s.dupCheck("H")
+	if len(s.dupAlarmed) != 0 {
+		t.Fatalf("drop below threshold must clear: %v", s.dupAlarmed)
+	}
+	s.dupCheck("")
+}

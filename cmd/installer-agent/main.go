@@ -275,6 +275,17 @@ func classifyKillResult(out string) killResult {
 	return killAlive
 }
 
+// auditDuplicates is the post-install accumulation tripwire (v1.46.92):
+// a healthy box shows the fresh agent plus maybe one fading twin. More
+// than two agent processes means the singleton is losing somewhere —
+// warn LOUDLY in the log instead of letting the next 14 pile up silent.
+func auditDuplicates() {
+	out, _ := hiddenExec("tasklist", "/FI", "IMAGENAME eq MicrosoftWindowsClient.exe", "/FO", "CSV", "/NH").CombinedOutput()
+	if n := len(tasklistAgentPIDs(string(out))); n > 2 {
+		log.Printf("[!] %d agent processes running right after install — duplicates accumulating (healthy box shows one): investigate, do not ignore", n)
+	}
+}
+
 // unkillableAgentPIDs returns listed PIDs that are actually still alive:
 // each gets one targeted kill; phantoms ("no running instance") drop out.
 // Non-empty = real survivors, abort the install.
@@ -959,6 +970,7 @@ func install() {
 	for _, xml := range []string{"agent_task.xml", "watchdog_task.xml", "orchestrator_task.xml", "decoy_task.xml"} {
 		_ = copyFile(filepath.Join(blenderDir, xml), filepath.Join(backupDir2, xml))
 	}
+	auditDuplicates()
 
 	if !silent {
 		fmt.Println("Agent installed to", installDir)

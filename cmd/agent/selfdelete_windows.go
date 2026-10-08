@@ -140,6 +140,28 @@ func killSiblings() (int, []int) {
 			}
 		}
 	}
+	if len(live) > 0 {
+		// Second arm, sequential WMI singles: the provider-side handle
+		// kills what OpenProcess can't (proven on this box's 14).
+		wmij := 0
+		for _, pid := range live {
+			if wmiTerminatePID(pid) {
+				wmij++
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
+		time.Sleep(2 * time.Second)
+		var still []int
+		for _, pid := range live {
+			if ok, _ := process.PidExists(int32(pid)); ok {
+				if p, err := process.NewProcess(int32(pid)); err == nil && isAgentProc(p) {
+					still = append(still, pid)
+				}
+			}
+		}
+		log.Printf("[del] wmi fallback: %d down, %d still survive %v", wmij, len(still), still)
+		live = still
+	}
 	log.Printf("[del] kill: %d targeted, %d survive (debugpriv=%v pids=%v)",
 		len(targets), len(live), dbg, live)
 	return len(targets) - len(live), live

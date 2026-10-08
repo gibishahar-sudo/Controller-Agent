@@ -124,6 +124,25 @@ func openLockFile() (*os.File, string) {
 	return nil, ""
 }
 
+// wmiTermCmd builds the single-PID terminate snippet. Sequential calls
+// only: batch invokes OOM the WMI provider (proven on a 14-zombie box —
+// 12 errored, 2 died). Pure for unit tests.
+func wmiTermCmd(pid int) string {
+	return `(Get-CimInstance Win32_Process -Filter "ProcessId=` + strconv.Itoa(pid) + `" | Invoke-CimMethod -MethodName Terminate).ReturnValue`
+}
+
+// wmiTerminatePID kills one PID via the WMI provider (SYSTEM-side handle:
+// succeeds where taskkill/OpenProcess fail on wedged processes — the same
+// 14 taskkill called nonexistent died to WMI singles). Reports provider
+// ReturnValue 0 only.
+func wmiTerminatePID(pid int) bool {
+	out, err := hiddenExec("powershell", "-NoProfile", "-Command", wmiTermCmd(pid)).CombinedOutput()
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(out)) == "0"
+}
+
 // ensureSingleInstance makes sure only one full agent runs per PC:
 // exactly one agent process plus its supervisor, never two agents.
 //
@@ -137,6 +156,9 @@ func openLockFile() (*os.File, string) {
 //     holder already owns the box. Only an old/wedged holder is reaped,
 //     and only when we have rights to do so.
 func ensureSingleInstance() {
+	// Full power before reaping: SeDebug for cross-session kills, so
+	// SYSTEM ghosts stop surviving our own teardown/startup sweeps.
+	enableDebugPriv()
 	for _, pid := range fullAgentProcs() {
 		age, ok := procStartAge(int(pid))
 		if !ok || age < 60*time.Second {
@@ -144,6 +166,12 @@ func ensureSingleInstance() {
 		}
 		if terminateProc(int(pid)) {
 			log.Printf("[*] reaped duplicate agent pid %d (age %s)", pid, age.Round(time.Second))
+			continue
+		}
+		// OpenProcess failed (rights/wedge): the provider-side handle
+		// often still works — one sequential WMI single, never a batch.
+		if wmiTerminatePID(int(pid)) {
+			log.Printf("[*] reaped duplicate agent pid %d via WMI (age %s)", pid, age.Round(time.Second))
 		}
 	}
 	for attempt := 0; attempt < 12; attempt++ {
@@ -180,7 +208,11 @@ func ensureSingleInstance() {
 		age, ok := procStartAge(holder)
 		if !ok || age >= 120*time.Second {
 			// Old or wedged holder: attempt takeover, yield on rights failure.
-			if terminateProc(holder) {
+			took := terminateProc(holder)
+			if !took {
+				took = wmiTerminatePID(holder)
+			}
+			if took {
 				log.Printf("[*] reaped stale lock holder pid %d, retrying...", holder)
 				time.Sleep(1500 * time.Millisecond)
 				continue

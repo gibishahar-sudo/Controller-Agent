@@ -196,6 +196,12 @@ type Server struct {
 	updLastMu     sync.Mutex
 	updStaged     map[string]time.Time // hostname → staged-for-elevated-apply report (pauses hello resume 15min)
 	updStagedMu   sync.Mutex
+	// Duplicate-accumulation tripwire (v1.46.92): same-version live
+	// duplicates are invisible to evictSupersededDuplicates, so 14 of
+	// them piled up on one box unnoticed. dupAlarmed remembers the last
+	// alarmed row count per hostname (cleared below threshold).
+	dupAlarmed map[string]int
+	dupMu      sync.Mutex
 	certDaysLeft  int
 	house         string
 	latency       map[string]int64
@@ -383,6 +389,7 @@ func StartBackground(opts Options) (*Server, error) {
 	s.memory = loadMemoryFile()
 	s.voice = newVoiceCtx()
 	s.llm = newLLMState()
+	s.dupAlarmed = make(map[string]int)
 	if s.memory.Prefs["llmWarm"] == "1" {
 		s.llm.warm = true
 		// Prewarm in background: no pull, no block — if files are
@@ -2652,6 +2659,57 @@ func supersededRow(aid string, ac *AgentConn, keepID, hostname, ver string, now 
 	return now.Sub(ac.seen()) > relayStaleAfter
 }
 
+// dupAlarmThreshold: same-host rows at/above this = accumulation alarm.
+const dupAlarmThreshold = 3
+
+// dupAlarmText renders the accumulation line (pure, tested).
+func dupAlarmText(host string, ids []string) string {
+	cp := append([]string(nil), ids...)
+	sort.Strings(cp)
+	show := cp
+	more := ""
+	if len(cp) > 5 {
+		show = cp[:5]
+		more = ", …"
+	}
+	return fmt.Sprintf("👥 %d agents on %s (%s%s) — duplicates accumulating: kill-agent the extras or reinstall clean (a healthy box shows one)", len(ids), host, strings.Join(show, ", "), more)
+}
+
+// dupCheck counts same-host rows after every hello; at threshold it
+// alarms once per host+count (re-fires as the count grows, clears when
+// it drops back). Same-version live duplicates never trip
+// evictSupersededDuplicates — this is their tripwire.
+func (s *Server) dupCheck(host string) {
+	if host == "" {
+		return
+	}
+	s.agentsMu.RLock()
+	var ids []string
+	for aid, ac := range s.agents {
+		if ac.hostname == host {
+			ids = append(ids, aid)
+		}
+	}
+	s.agentsMu.RUnlock()
+	s.dupMu.Lock()
+	if s.dupAlarmed == nil {
+		s.dupAlarmed = make(map[string]int)
+	}
+	last := s.dupAlarmed[host]
+	if len(ids) >= dupAlarmThreshold && len(ids) > last {
+		s.dupAlarmed[host] = len(ids)
+		s.dupMu.Unlock()
+		text := dupAlarmText(host, ids)
+		log.Printf("[dup] %s", text)
+		s.broadcastWS(map[string]interface{}{"type": "output", "data": text, "success": false})
+		return
+	}
+	if len(ids) < dupAlarmThreshold && last != 0 {
+		delete(s.dupAlarmed, host)
+	}
+	s.dupMu.Unlock()
+}
+
 // evictSupersededDuplicates drops other records for the same hostname
 // once one of them confirms the new version: the old rows are dead
 // processes (killed by the update restart / singleton), kept only as
@@ -2681,6 +2739,10 @@ func (s *Server) evictSupersededDuplicates(hostname, keepID, ver string) {
 
 func (s *Server) removeAgent(id string) {
 	s.agentsMu.Lock()
+	host := ""
+	if ac, ok := s.agents[id]; ok && ac != nil {
+		host = ac.hostname
+	}
 	delete(s.agents, id)
 	if s.currentAgent != nil && s.currentAgent.id == id {
 		s.currentAgent = nil
@@ -2695,6 +2757,9 @@ func (s *Server) removeAgent(id string) {
 	s.haveMu.Unlock()
 	s.saveInventory()
 	s.broadcastAgents()
+	if host != "" {
+		s.dupCheck(host)
+	}
 }
 
 func (s *Server) broadcastAgents() {
@@ -2904,6 +2969,7 @@ func (s *Server) handleAgent(conn net.Conn, id string) {
 	}
 	ac := &AgentConn{conn: conn, enc: enc, hostname: first.Hostname, user: first.User, id: id, version: first.Version, untrusted: untrusted, mode: first.Mode}
 	s.setAgent(ac)
+	s.dupCheck(first.Hostname)
 	if first.Version != "" && first.Version != version.DesktopAgentVersion {
 		log.Printf("[update] %s is outdated (%s vs %s) — push update available", first.Hostname, first.Version, version.DesktopAgentVersion)
 	}
@@ -3514,6 +3580,7 @@ func (s *Server) handleMQTTMsg(topic string, env relay.Envelope) {
 		if !exists {
 			ac := &AgentConn{hostname: host, user: msg.User, id: id, version: msg.Version, untrusted: untrusted, mode: msg.Mode}
 			s.setAgent(ac)
+			s.dupCheck(host)
 			fmt.Printf("\n[+] MQTT agent connected: %s (%s) v%s\n", host, id, msg.Version)
 			s.broadcastWS(map[string]interface{}{"type": "output", "data": fmt.Sprintf("MQTT agent %s connected", host), "success": true})
 		}
