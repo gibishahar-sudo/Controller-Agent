@@ -30,10 +30,19 @@ func TestSetupInstallLogCaptures(t *testing.T) {
 	}
 }
 
-// Missing TEMP must not break anything (stderr-only fallback).
+// Missing TEMP must not break anything and must not spray real system
+// dirs (v1.46.91: this test wrote the live C:\Windows\Temp log twice).
+// Plain dir like Captures (t.TempDir auto-cleanup chokes on the open
+// handle, which stays open for the process lifetime by design).
 func TestSetupInstallLogNoTemp(t *testing.T) {
+	dir := filepath.Join(os.TempDir(), "rmminstalllognotemp")
+	_ = os.MkdirAll(dir, 0755)
 	t.Setenv("TEMP", "")
+	t.Setenv("RMM_LOG_DIR", dir)
 	defer log.SetOutput(os.Stderr)
 	setupInstallLog()
 	log.Printf("noop")
+	if b, err := os.ReadFile(filepath.Join(dir, "rmm-install.log")); err != nil || !strings.Contains(string(b), "noop") {
+		t.Fatalf("override dir must capture the line: %v %q", err, b)
+	}
 }

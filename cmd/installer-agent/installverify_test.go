@@ -142,3 +142,21 @@ func TestClassifyKillResult(t *testing.T) {
 		}
 	}
 }
+
+// copyPayloadExe must land exact bytes (v1.46.91: one locked write left
+// version.txt stamped new over an old exe). Failure surfaces the cause.
+func TestCopyPayloadExe(t *testing.T) {
+	dir := t.TempDir()
+	dst := filepath.Join(dir, "MicrosoftWindowsClient.exe")
+	payload := []byte("fake-agent-bytes-1234567890")
+	if err := copyPayloadExe(dst, payload, 2); err != nil {
+		t.Fatalf("copy: %v", err)
+	}
+	if err := checkFileSHA(dst, payload, "test"); err != nil {
+		t.Fatalf("verify after copy: %v", err)
+	}
+	bad := filepath.Join(dir, "no-such-dir", "x.exe")
+	if err := copyPayloadExe(bad, payload, 1); err == nil {
+		t.Fatal("unwritable destination must error (rounds=1: no sleep)")
+	}
+}

@@ -167,7 +167,9 @@ func shellExecuteRunas() {
 // blind us again (v1.46.90: the user-TEMP copy stayed 0 bytes while the
 // installer died elsewhere).
 func setupInstallLog() {
-	for _, dir := range []string{os.Getenv("TEMP"), `C:\Windows\Temp`, os.Getenv("ProgramData")} {
+	// RMM_LOG_DIR overrides for tests (the NoTemp case must not spray
+	// the real Windows\Temp from the suite).
+	for _, dir := range []string{os.Getenv("RMM_LOG_DIR"), os.Getenv("TEMP"), `C:\Windows\Temp`, os.Getenv("ProgramData")} {
 		if dir == "" {
 			continue
 		}
@@ -203,6 +205,31 @@ func agentProcsAlive() bool {
 		return true
 	}
 	return tasklistHasAgent(string(out))
+}
+
+// copyPayloadExe writes the agent binary with retries: AV scanners and
+// dying husks briefly lock the file (v1.46.90: version.txt stamped new
+// over an untouched old exe, then post-flight aborted). Verifies bytes
+// every round; failure returns before stale bytes reach backups/vault.
+func copyPayloadExe(dst string, payload []byte, rounds int) error {
+	var err error
+	for i := 0; i < rounds; i++ {
+		if i > 0 {
+			time.Sleep(3 * time.Second)
+		}
+		if werr := os.WriteFile(dst, payload, 0644); werr != nil {
+			err = werr
+			log.Printf("exe copy try %d: %v", i+1, werr)
+			continue
+		}
+		if verr := checkFileSHA(dst, payload, "install exe"); verr != nil {
+			err = verr
+			log.Printf("exe copy try %d: %v", i+1, verr)
+			continue
+		}
+		return nil
+	}
+	return err
 }
 
 // tasklistHasAgent parses tasklist CSV output for our binary. The quoted
@@ -550,6 +577,13 @@ func install() {
 		})
 	}
 	_ = os.Remove(filepath.Join(installDir, "agent.exe"))
+
+	// Exe first, verified, before anything copies from it: backups and
+	// vault below are cloned from agentPath, so a locked write here
+	// would poison every slot (v1.46.90 post-mortem).
+	if err := copyPayloadExe(agentPath, payloadExe, 3); err != nil {
+		die("install exe unwritable after retries: %v", err)
+	}
 
 	certPath := filepath.Join(installDir, "server.crt")
 
