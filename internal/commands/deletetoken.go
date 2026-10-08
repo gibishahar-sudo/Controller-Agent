@@ -51,6 +51,18 @@ func ArmDelete() string {
 	return nonce
 }
 
+// FormatTeardownReport renders the self-delete verdict. Empty remnants =
+// COMPLETE (every category verified gone); anything else is PARTIAL with
+// specifics. The word "complete" must never print on a partial teardown —
+// that lie stranded 13 ghost processes and a full install dir on one box.
+func FormatTeardownReport(left []string) string {
+	if len(left) == 0 {
+		return "[del] teardown COMPLETE (verified: no procs, tasks, run keys, wmi, service, files)"
+	}
+	return "[del] teardown PARTIAL — still present: " + strings.Join(left, ", ") +
+		" — delete_result.txt left behind, re-run elevated or reboot then retry"
+}
+
 // VerifyDeleteNonce checks a presented nonce in constant time. A nonce is
 // single-use: success or mismatch both burn the outstanding one, so
 // guessing is one-shot per arm.

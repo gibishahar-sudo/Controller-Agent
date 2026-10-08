@@ -108,6 +108,12 @@ func tasklistHasAgent(out string) bool {
 	return strings.Contains(strings.ToLower(out), `"microsoftwindowsclient.exe"`)
 }
 
+// staleSweepFiles are install-dir entries that must never survive into a
+// fresh install (see the sweep above). Pure for unit tests.
+func staleSweepFiles() []string {
+	return []string{"agent.lock", "delete_pending.json", "delete_pending.json.active"}
+}
+
 // verifyFileSHA compares a written file against expected bytes. Every
 // installer write below is silent on failure — this is the backstop
 // that turns a no-op install into a loud nonzero exit instead.
@@ -325,6 +331,16 @@ func install() {
 	}
 	if agentProcsAlive() {
 		log.Fatalf("agent processes survive forced kill - aborting install (old version left running intact)")
+	}
+	// Fresh-start sweep (v1.46.88): zero agent processes are alive past
+	// the kill-verify above, so lock + pending flags are definitionally
+	// stale. A leftover delete_pending would teardown this install on its
+	// first elevated run; a stale agent.lock (dead pid or pre-kill remnant)
+	// wedges startup behind the singleton. Sweep them before writing.
+	for _, stale := range staleSweepFiles() {
+		if err := os.Remove(filepath.Join(installDir, stale)); err == nil {
+			log.Printf("swept stale %s", stale)
+		}
 	}
 	// Payload bytes up front (v1.46.51 post-mortem): the walk below
 	// swallows read errors, which would "install" empty files behind an

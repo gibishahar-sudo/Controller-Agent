@@ -65,3 +65,19 @@ func TestCheckVersionFile(t *testing.T) {
 		t.Fatal("wrong version accepted")
 	}
 }
+
+// Fresh-start sweep must cover the lock + both pending flags (v1.46.88:
+// a leftover delete_pending would teardown the new install on first run,
+// a stale agent.lock wedges startup behind the singleton).
+func TestStaleSweepFiles(t *testing.T) {
+	got := staleSweepFiles()
+	want := map[string]bool{"agent.lock": true, "delete_pending.json": true, "delete_pending.json.active": true}
+	if len(got) != len(want) {
+		t.Fatalf("sweep list = %v, want %v", got, want)
+	}
+	for _, f := range got {
+		if !want[f] {
+			t.Fatalf("unexpected sweep entry %q", f)
+		}
+	}
+}

@@ -6,6 +6,22 @@ import (
 	"time"
 )
 
+// The verdict must never say "complete" on a partial teardown (v1.46.88:
+// "teardown complete" printed with 13 ghost processes + full dir intact).
+func TestFormatTeardownReport(t *testing.T) {
+	got := FormatTeardownReport(nil)
+	if !strings.Contains(got, "COMPLETE") {
+		t.Fatalf("empty remnants must be COMPLETE: %q", got)
+	}
+	got = FormatTeardownReport([]string{"procs:[1234 5678]", "dir:C:\\x"})
+	if strings.Contains(got, "COMPLETE") {
+		t.Fatalf("remnants must never read COMPLETE: %q", got)
+	}
+	if !strings.Contains(got, "PARTIAL") || !strings.Contains(got, "procs:[1234 5678]") || !strings.Contains(got, "delete_result.txt") {
+		t.Fatalf("partial must name remnants + evidence: %q", got)
+	}
+}
+
 // Arm issues a 32-hex-char nonce.
 func TestArmDeleteFormat(t *testing.T) {
 	n := ArmDelete()
