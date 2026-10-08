@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // tasklistHasAgent parses tasklist CSV for our binary (v1.46.51: the
@@ -79,5 +80,26 @@ func TestStaleSweepFiles(t *testing.T) {
 		if !want[f] {
 			t.Fatalf("unexpected sweep entry %q", f)
 		}
+	}
+}
+
+// handshakeWait is the verified-elevation seam (v1.46.89): the parent
+// trusts the handoff only when the marker lands in time.
+func TestHandshakeWait(t *testing.T) {
+	dir := t.TempDir()
+	miss := filepath.Join(dir, "nope.ok")
+	if handshakeWait(miss, 120*time.Millisecond) {
+		t.Fatal("absent marker must time out")
+	}
+	hit := filepath.Join(dir, "yes.ok")
+	go func() {
+		time.Sleep(60 * time.Millisecond)
+		_ = os.WriteFile(hit, []byte("elevated"), 0644)
+	}()
+	if !handshakeWait(hit, 5*time.Second) {
+		t.Fatal("late marker must be seen")
+	}
+	if elevatedHandshakePath() == "" && os.Getenv("TEMP") != "" {
+		t.Fatal("handshake path must resolve when TEMP is set")
 	}
 }

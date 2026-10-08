@@ -50,14 +50,93 @@ func isAdmin() bool {
 }
 
 func relaunchAsAdmin() {
+	// Verified handoff (v1.46.89): the old fire-and-forget exited 0 the
+	// instant the UAC prompt APPEARED — approved, denied, or never seen
+	// (secure desktop is invisible over screen streams), the CMD read
+	// success either way. Now the parent waits up to 2min for the
+	// elevated child to prove it runs, and exits NONZERO otherwise, so a
+	// hung prompt reads as failure instead of "nothing happens".
+	hs := elevatedHandshakePath()
+	if hs == "" {
+		shellExecuteRunas()
+		os.Exit(0)
+	}
+	_ = os.Remove(hs)
+	shellExecuteRunas()
+	deadline := time.Now().Add(120 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(hs); err == nil {
+			log.Printf("elevated child confirmed, handing off")
+			os.Exit(0)
+		}
+		time.Sleep(time.Second)
+	}
+	log.Fatalf("elevation unapproved after 120s (UAC prompt unseen on secure desktop?) — approve on the box screen, or run from an elevated prompt; if approved late, the install may still complete, check version.txt")
+}
+
+// elevatedHandshakePath is the proof-of-life file the elevated child
+// drops the moment it passes the admin check ("": no TEMP, unverifiable).
+func elevatedHandshakePath() string {
+	tmp := os.Getenv("TEMP")
+	if tmp == "" {
+		return ""
+	}
+	return filepath.Join(tmp, "rmm-elevated.ok")
+}
+
+// handshakeWait polls dir/marker until present or timeout. Pure seam for
+// unit tests (the installer wires it to TEMP + 120s).
+func handshakeWait(path string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return true
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return false
+}
+
+// shellExecuteInfo mirrors SHELLEXECUTEINFOW for the runas call below.
+type shellExecuteInfo struct {
+	cbSize         uint32
+	fMask          uint32
+	hwnd           syscall.Handle
+	lpVerb         *uint16
+	lpFile         *uint16
+	lpParameters   *uint16
+	lpDirectory    *uint16
+	nShow          int32
+	hInstApp       syscall.Handle
+	lpIDList       uintptr
+	lpClass        *uint16
+	hkeyClass      uintptr
+	dwHotKey       uint32
+	hIconOrMonitor syscall.Handle
+	hProcess       syscall.Handle
+}
+
+const (
+	seeMaskNoCloseProcess = 0x40
+	seeMaskFlagNoUI       = 0x400
+	swHide                = 0
+)
+
+// shellExecuteRunas re-launches ourselves elevated and FAILS LOUDLY when
+// the request itself is denied (old code ignored the return entirely).
+func shellExecuteRunas() {
 	exe, _ := os.Executable()
 	verb, _ := syscall.UTF16PtrFromString("runas")
 	file, _ := syscall.UTF16PtrFromString(exe)
 	params, _ := syscall.UTF16PtrFromString(strings.Join(os.Args[1:], " "))
+	sei := shellExecuteInfo{fMask: seeMaskNoCloseProcess | seeMaskFlagNoUI, lpVerb: verb, lpFile: file, lpParameters: params, nShow: swHide}
+	// cbSize must be set (forgotten once, ShellExecuteEx silently failed).
+	sei.cbSize = uint32(unsafe.Sizeof(sei))
 	mod := syscall.NewLazyDLL("shell32.dll")
-	mod.NewProc("ShellExecuteW").Call(0, uintptr(unsafe.Pointer(verb)), uintptr(unsafe.Pointer(file)),
-		uintptr(unsafe.Pointer(params)), 0, 0)
-	os.Exit(0)
+	ret, _, _ := mod.NewProc("ShellExecuteExW").Call(uintptr(unsafe.Pointer(&sei)))
+	if ret == 0 {
+		log.Fatalf("elevation request rejected (UAC denied?) — run from an elevated prompt")
+	}
 }
 
 // setupInstallLog tees every log line (including log.Fatalf aborts) into
@@ -302,6 +381,11 @@ func install() {
 		log.Printf("not admin - relaunching elevated")
 		relaunchAsAdmin()
 		return
+	}
+	// Proof-of-life for the unelevated parent waiting on the handshake
+	// (every entry point passes here: install + uninstall).
+	if hs := elevatedHandshakePath(); hs != "" {
+		_ = os.WriteFile(hs, []byte("elevated"), 0644)
 	}
 
 	// Bland machine-wide home (hidden system dir) instead of a branded
