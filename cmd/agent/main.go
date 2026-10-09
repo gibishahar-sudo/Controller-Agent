@@ -1222,17 +1222,11 @@ func (a *agent) startPushStream(send func(protocol.Message) error, quality, moni
 				} else {
 					emaMs = 0.2*float64(ms) + 0.8*emaMs
 				}
-				// Adaptive quality: slow box -> cheaper frames, fast box -> recover.
-				if emaMs > 100 && q > 40 {
-					q -= 10
-					dlog.Printf("[push] slow cycle ema=%.0fms, quality %d->%d", emaMs, q+10, q)
-				} else if emaMs < 40 && q < qHi {
-					q += 5
-					if q > qHi {
-						q = qHi
-					}
-					dlog.Printf("[push] fast cycle ema=%.0fms, quality recovered to %d", emaMs, q)
-				}
+			// Adaptive quality: slow box -> cheaper frames, fast box -> recover.
+			if nq, stepped := adaptPushQuality(q, qHi, emaMs); stepped {
+				dlog.Printf("[push] quality %d->%d (cycle ema=%.0fms)", q, nq, emaMs)
+				q = nq
+			}
 				if len(msgs) == 0 {
 					maybeSendPace()
 					continue
@@ -1266,7 +1260,7 @@ func (a *agent) startPushStream(send func(protocol.Message) error, quality, moni
 						break
 					}
 				}
-				if realFrame && emaMs > 100 && q <= 40 && scCur > 0.25 {
+				if realFrame && emaMs > 100 && q <= pushMinQuality && scCur > 0.25 {
 					prevSc := scCur
 					if scCur > 0.5 {
 						scCur = 0.5
@@ -1323,6 +1317,32 @@ func (a *agent) send(msg protocol.Message) error {
 		return fmt.Errorf("no connection")
 	}
 	return a.enc.Encode(msg)
+}
+
+// pushMinQuality floors adaptive push quality (v1.46.94: the old 40
+// floor left 150KB frames on thin relay links — 10s+ per frame, so the
+// UI's 3s watchdog false-fired forever. 25 keeps motion visible where
+// 40 stalls entirely; text stays readable, artifacts stay mild).
+const pushMinQuality = 25
+
+// adaptPushQuality steps q toward link reality (pure, tested): slow
+// cycles shed quality to the floor, fast cycles recover to qHi.
+func adaptPushQuality(q, qHi int, emaMs float64) (int, bool) {
+	if emaMs > 100 && q > pushMinQuality {
+		nq := q - 10
+		if nq < pushMinQuality {
+			nq = pushMinQuality
+		}
+		return nq, nq != q
+	}
+	if emaMs < 40 && q < qHi {
+		nq := q + 5
+		if nq > qHi {
+			nq = qHi
+		}
+		return nq, nq != q
+	}
+	return q, false
 }
 
 // defaultHouses preserves the historical HouseA/HouseB behavior when no

@@ -940,6 +940,22 @@ function mergeAgents(incoming){
   agents=Object.values(byId);
   if(selected && !agents.find(a=>a.id===selected.id)) selected=agents[0]||null;
   if(!selected && agents[0]) selected=agents[0];
+  // Same-host follow (v1.46.94): reinstalls/updates mint a new row id
+  // (pid suffix), stranding selection on the stale offline row with a
+  // black screen and starving streams. On nothing (or a dead row) with
+  // exactly one connected same-host sibling, follow it. Ambiguity (0 or
+  // 2+) keeps the current selection — never guess across boxes.
+  (function(){
+    const cur=selected;
+    const dead=!cur||!cur.connected||!agents.find(a=>a.id===cur.id);
+    if(!dead||!cur||!cur.hostname) return;
+    const sibs=agents.filter(a=>a.connected&&a.hostname===cur.hostname&&a.id!==cur.id);
+    if(sibs.length!==1) return;
+    const oldId=cur.id;
+    selected=sibs[0];
+    addTerm(`→ following ${cur.hostname} onto ${selected.id} (reinstall/restart minted a new row)`,"out");
+    if(streaming){ sendPushStop(oldId); pushActive=false; inflight=0; lastFSeq=0; lastFrameAt=Date.now(); frameTimes=[]; topUpShots(); }
+  })();
   renderConns($("connFilter").value); renderDeviceSwitch(); updateActive();
   if(typeof refreshSendAllBtn==="function") refreshSendAllBtn();
   const wsel=$("wsState"); if(wsel) wsel.textContent=`WS live • ${agents.length} agent(s) • ${new Date().toLocaleTimeString()}`;
@@ -1464,13 +1480,19 @@ function scheduleNextShot(){
 $("screenStart").onclick=()=>{
   if(!selected){ toast("No agent selected", "err"); return; }
   if(!selected.connected){ toast("Agent not connected", "err"); return; }
-  streaming=true; lastFrameAt=Date.now(); inflight=0; lastFSeq=0; pushActive=false;
+  streaming=true; lastFrameAt=Date.now(); inflight=0; lastFSeq=0; pushActive=false; frameTimes=[];
   topUpShots();
   if(streamWatch) clearInterval(streamWatch);
-  streamWatch=setInterval(()=>{ if(streaming && !streamSuspended && Date.now()-lastFrameAt>3000){ if(autoFailoverStream()) return; inflight=0; if(pushActive){ pushActive=false; addConsole("Stream starved — re-sending push:start (agent may have restarted)"); } topUpShots(); } },3000);
+  streamWatch=setInterval(()=>{ if(streaming && !streamSuspended && Date.now()-lastFrameAt>stallThreshold()){ if(autoFailoverStream()) return; inflight=0; if(pushActive){ pushActive=false; addConsole("Stream starved — re-sending push:start (agent may have restarted)"); } topUpShots(); } },3000);
   $("screenStart").disabled=true; $("screenStop").disabled=false;
   addConsole("Stream started (monitor "+$("monitorSel").value+(streamAllMonitors()?", all":"")+", q="+$("qualitySel").value+")");
 };
+// stallThreshold scales the starvation trip to the measured cadence
+// (v1.46.94): a fixed 3s on a 10s/frame relay link false-fired forever —
+// every re-push restarts the agent loop (epoch reset + keyframe burst),
+// which is exactly what was starving the stream it meant to save. Slow
+// links get patience (2.5x cadence, 30s cap); fast links keep the 3s.
+function stallThreshold(){ let t=3000; if(frameTimes.length){ const avg=frameTimes.reduce((a,b)=>a+b,0)/frameTimes.length; t=Math.max(t, Math.min(30000, Math.round(avg*2.5))); } return t; }
 // Stream auto-failover: when frames stall, switch viewing to a connected
 // same-host sibling on a different transport (direct<->relay) instead of
 // hammering the dead link. Generation counters are agent-global, so

@@ -39,7 +39,7 @@ func ensureActiveSetupKey(agentPath string) {
 	cur, _, err := k.GetStringValue("StubPath")
 	if err != nil || cur != want {
 		if err := k.SetStringValue("StubPath", want); err == nil {
-			log.Printf("[watch] repaired Active Setup vector")
+			log.Printf("[watch] repaired Active Setup vector (was %q)", cur)
 		}
 	}
 	_ = k.SetStringValue("Version", version.DesktopAgentVersion)
@@ -403,7 +403,7 @@ func runWmiHeal() {
 		cur, _, err := k.GetStringValue(kv[0])
 		if err != nil || cur != kv[1] {
 			if err := k.SetStringValue(kv[0], kv[1]); err == nil {
-				log.Printf("[heal] repaired HKLM Run %s", kv[0])
+				log.Printf("[heal] repaired HKLM Run %s (was %q)", kv[0], cur)
 			}
 		}
 		k.Close()
@@ -596,7 +596,7 @@ func ensureWatchPersistence(w *watchCfg) {
 		cur, _, err := k.GetStringValue(name)
 		if err != nil || cur != val {
 			if err := k.SetStringValue(name, val); err == nil {
-				log.Printf("[watch] repaired HKLM Run %s", name)
+				log.Printf("[watch] repaired HKLM Run %s (was %q)", name, cur)
 			}
 		}
 	}
