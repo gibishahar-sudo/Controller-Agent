@@ -194,37 +194,47 @@ html{touch-action:manipulation}
 .search-cur{background:rgba(255,213,79,.28)!important;outline:1px solid #FFD54F}
 @keyframes toastIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
 
-/* Jarvis tab (arc-reactor theme, scoped: nothing outside #tab-jarvis changes) */
+/* Jarvis tab (aurora-glass theme, scoped: nothing outside #tab-jarvis changes) */
 .tab[data-tab="jarvis"]{color:#C9A7EB}
-.tab[data-tab="jarvis"].active{background:linear-gradient(180deg,rgba(88,28,135,.45),var(--bg-medium));border-color:#7C3AED;color:#fff;box-shadow:0 0 12px rgba(124,58,237,.45)}
-#tab-jarvis{overflow-y:auto}
-.j-hero{display:flex;gap:14px;align-items:center;padding:14px;background:linear-gradient(135deg,rgba(88,28,135,.35),rgba(8,145,178,.18));border:1px solid #7C3AED;border-radius:12px;box-shadow:0 0 18px rgba(124,58,237,.25)}
-.j-orb{width:76px;height:76px;border-radius:50%;flex-shrink:0;background:radial-gradient(circle at 35% 35%,#A5F3FC,#22D3EE 35%,#7C3AED 70%,#1E1B4B);box-shadow:0 0 22px rgba(34,211,238,.7),0 0 46px rgba(124,58,237,.5),inset 0 0 18px rgba(255,255,255,.25);animation:jBreathe 3.2s ease-in-out infinite}
+.tab[data-tab="jarvis"].active{background:linear-gradient(180deg,rgba(88,28,135,.55),var(--bg-medium));border-color:#A78BFA;color:#fff;box-shadow:0 0 14px rgba(139,92,246,.55);text-shadow:0 0 8px rgba(196,181,253,.8)}
+#tab-jarvis{overflow-y:auto;position:relative;background:radial-gradient(1000px 300px at 15% -5%,rgba(124,58,237,.16),transparent 60%),radial-gradient(800px 260px at 90% 0%,rgba(34,211,238,.12),transparent 60%),radial-gradient(700px 500px at 50% 110%,rgba(88,28,135,.14),transparent 60%)}
+#tab-jarvis::before{content:"";position:absolute;inset:0;pointer-events:none;background:radial-gradient(500px 200px at 20% 0%,rgba(34,211,238,.10),transparent 70%),radial-gradient(600px 240px at 85% 10%,rgba(124,58,237,.12),transparent 70%);animation:jAurora 12s ease-in-out infinite alternate}
+@keyframes jAurora{from{opacity:.6;transform:translateX(-2%)}to{opacity:1;transform:translateX(2%)}}
+.j-hero{display:flex;gap:14px;align-items:center;padding:14px;background:linear-gradient(135deg,rgba(88,28,135,.4),rgba(8,145,178,.22));border:1px solid rgba(167,139,250,.65);border-radius:14px;box-shadow:0 0 22px rgba(124,58,237,.3),inset 0 1px 0 rgba(255,255,255,.08);position:relative;z-index:1}
+.j-orb{width:76px;height:76px;border-radius:50%;flex-shrink:0;position:relative;background:radial-gradient(circle at 35% 35%,#A5F3FC,#22D3EE 35%,#7C3AED 70%,#1E1B4B);box-shadow:0 0 22px rgba(34,211,238,.7),0 0 46px rgba(124,58,237,.5),inset 0 0 18px rgba(255,255,255,.25);animation:jBreathe 3.2s ease-in-out infinite}
+.j-orb::before{content:"";position:absolute;inset:-7px;border-radius:50%;background:conic-gradient(from 0deg,#22D3EE,#7C3AED,#EC4899,#22D3EE);filter:blur(6px);opacity:.55;z-index:-1;animation:jSpin 6s linear infinite}
 .j-orb.listening{animation:jListen .9s ease-in-out infinite;box-shadow:0 0 30px rgba(34,211,238,.95),0 0 70px rgba(124,58,237,.7),inset 0 0 22px rgba(255,255,255,.4)}
+.j-orb.listening::before{opacity:.95;filter:blur(9px);animation-duration:1.2s}
+@keyframes jSpin{to{transform:rotate(360deg)}}
 @keyframes jBreathe{0%,100%{transform:scale(1);filter:brightness(1)}50%{transform:scale(1.05);filter:brightness(1.2)}}
 @keyframes jListen{0%,100%{transform:scale(1.08);filter:brightness(1.25)}50%{transform:scale(1.16);filter:brightness(1.5)}}
-.j-greet{font-size:15px;font-weight:700;color:#F5F3FF}
+.j-greet{font-size:16px;font-weight:700;background:linear-gradient(90deg,#F5F3FF,#A5F3FC 55%,#DDD6FE);-webkit-background-clip:text;background-clip:text;color:transparent}
 .j-sub{font-size:11px;color:#C4B5FD;margin-top:2px}
 .j-pills{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
 .j-pill{font-size:10px;padding:3px 10px;border-radius:20px;border:1px solid #7C3AED;background:rgba(124,58,237,.15);color:#DDD6FE}
 .j-pill.dim{border-color:var(--border);background:rgba(255,255,255,.04);color:var(--fg-dim)}
+.j-pill:not(.dim){box-shadow:0 0 10px rgba(124,58,237,.45)}
 .j-hero-btns{margin-left:auto;display:flex;gap:8px;align-items:center}
-.j-mic{width:64px;height:64px;border-radius:50%;font-size:26px;border:2px solid #22D3EE;background:rgba(34,211,238,.12);color:#fff;cursor:pointer;box-shadow:0 0 14px rgba(34,211,238,.5);transition:all .15s;font-family:inherit}
+.j-mic{width:64px;height:64px;border-radius:50%;font-size:26px;border:2px solid #22D3EE;background:rgba(34,211,238,.12);color:#fff;cursor:pointer;box-shadow:0 0 14px rgba(34,211,238,.5);transition:all .15s;font-family:inherit;animation:jMicPulse 2.4s ease-in-out infinite}
 .j-mic:hover{background:rgba(34,211,238,.25);transform:scale(1.06)}
-.j-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-.j-card{padding:14px;background:rgba(30,27,75,.35);border:1px solid rgba(124,58,237,.5);border-radius:12px}
-.j-card h4{margin:0 0 10px 0;font-size:12px;color:#DDD6FE}
-.j-card.wide{grid-column:1/-1}
+@keyframes jMicPulse{0%,100%{box-shadow:0 0 10px rgba(34,211,238,.4)}50%{box-shadow:0 0 22px rgba(34,211,238,.75)}}
+.j-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;position:relative;z-index:1}
+.j-card{padding:14px;background:linear-gradient(160deg,rgba(46,32,110,.55),rgba(15,23,42,.55));border:1px solid rgba(167,139,250,.45);border-radius:14px;box-shadow:inset 0 1px 0 rgba(255,255,255,.07),0 4px 18px rgba(0,0,0,.35);backdrop-filter:blur(6px);transition:transform .15s,box-shadow .15s}
+.j-card:hover{transform:translateY(-1px);box-shadow:inset 0 1px 0 rgba(255,255,255,.1),0 6px 22px rgba(124,58,237,.35)}
+.j-card h4{margin:0 0 10px 0;font-size:12px;color:#DDD6FE;text-shadow:0 0 8px rgba(139,92,246,.5)}
 .j-feed{max-height:220px;overflow-y:auto;display:flex;flex-direction:column;gap:6px;margin-top:10px;padding:4px}
-.j-bub{max-width:88%;padding:7px 11px;border-radius:12px;font-size:12px;line-height:1.5;word-break:break-word}
+.j-bub{max-width:88%;padding:7px 11px;border-radius:12px;font-size:12px;line-height:1.5;word-break:break-word;animation:jBubIn .25s ease-out}
+@keyframes jBubIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
 .j-rep{align-self:flex-start;background:rgba(124,58,237,.22);border:1px solid rgba(124,58,237,.55);color:#EDE9FE;border-bottom-left-radius:4px}
+.j-rep::before{content:"🤖 "}
 .j-heard{align-self:flex-end;background:rgba(34,211,238,.12);border:1px solid rgba(34,211,238,.4);color:#A5F3FC;border-bottom-right-radius:4px;font-size:11px}
+.j-heard::before{content:"🎤 "}
 .j-chips{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
 .j-chip{padding:5px 10px;background:rgba(124,58,237,.15);border:1px solid rgba(124,58,237,.5);border-radius:20px;font-size:11px;cursor:pointer;color:#DDD6FE;transition:all .15s}
-.j-chip:hover{background:#7C3AED;color:#fff;box-shadow:0 0 10px rgba(124,58,237,.6)}
+.j-chip:hover{background:linear-gradient(135deg,#7C3AED,#2563EB);color:#fff;box-shadow:0 0 12px rgba(124,58,237,.7);transform:translateY(-1px)}
 .j-row{display:flex;gap:6px;margin-top:8px}
-.j-row input{flex:1;background:var(--bg-input);border:1px solid rgba(124,58,237,.5);color:var(--fg);padding:7px 10px;border-radius:8px;outline:none;font-family:inherit;font-size:12px}
-.j-row input:focus{border-color:#22D3EE;box-shadow:0 0 8px rgba(34,211,238,.35)}
+.j-row input{flex:1;background:rgba(0,0,0,.3);border:1px solid rgba(124,58,237,.5);color:var(--fg);padding:7px 10px;border-radius:8px;outline:none;font-family:inherit;font-size:12px}
+.j-row input:focus{border-color:#22D3EE;box-shadow:0 0 10px rgba(34,211,238,.4)}
 .j-mem{font-size:11px;color:var(--fg);margin-top:8px;max-height:150px;overflow-y:auto}
 .j-mem .nm{color:#22D3EE;font-weight:700}
 .j-mem .fc{color:var(--fg-dim)}
@@ -336,15 +346,23 @@ html{touch-action:manipulation}
         </div>
         <div style="display:flex;gap:6px;align-items:center"><label style="font-size:11px;color:#888">Vol</label><input id="volSlider" type="range" min="0" max="100" value="80" style="width:100px"/><span id="volLabel" style="font-size:11px">80%</span></div>
       </div>
+      <div class="toolbar" style="justify-content:space-between">
+        <div style="display:flex;gap:6px;align-items:center"><span style="font-size:11px;color:#888">Pranks:</span>
+          <button class="btn btn-small" id="sbToggle" title="Show/hide the prank soundboard">🔊 Board</button>
+          <span id="sbStatus" style="font-size:11px;color:#888">Board hidden</span>
+        </div>
+        <button class="btn btn-small" id="sbStopAll" title="Stop every prank sound">⏹ Stop all</button>
+      </div>
+      <div id="sbPanel" style="display:none;grid-template-columns:1fr 1fr;gap:6px;padding:6px;background:var(--bg-input);border:1px solid var(--border);border-radius:8px"></div>
     </section>
 
-    <!-- Jarvis — her tab: voice console, memory, sidecar, mischief kit -->
+    <!-- Jarvis — her tab: voice console, memory, sidecar -->
     <section id="tab-jarvis" class="tab-content">
       <div class="j-hero">
         <div class="j-orb" id="jOrb" title="Jarvis listening state"></div>
         <div style="min-width:0">
           <div class="j-greet" id="jGreet">Good evening, sir.</div>
-          <div class="j-sub">All her things live here now — talk, remember, phrase, prank.</div>
+          <div class="j-sub">Talk, remember, phrase — her whole world in one tab.</div>
           <div class="j-pills">
             <span class="j-pill dim" id="jAgentPill" title="Selected agent">no agent</span>
             <span class="j-pill dim" id="jModelPill" title="Local model sidecar">model ?</span>
@@ -364,6 +382,8 @@ html{touch-action:manipulation}
             <span class="j-chip" data-jcmd="voice-cmd help">help</span>
             <span class="j-chip" data-jcmd="voice-cmd what tabs does he have">his tabs</span>
             <span class="j-chip" data-jcmd="voice-cmd pull his history">his history</span>
+            <span class="j-chip" data-jcmd="voice-cmd pull his search history">searches</span>
+            <span class="j-chip" data-jcmd="voice-cmd what is he doing">doing</span>
             <span class="j-chip" data-jcmd="voice-cmd what did I run">my runs</span>
             <span class="j-chip" data-jcmd="memory status">memory</span>
             <span class="j-chip" data-jcmd="llm-status">model</span>
@@ -381,17 +401,6 @@ html{touch-action:manipulation}
           <div class="j-sub" id="jLlmStatus">model ? — press ⟳</div>
           <div class="j-row"><button class="btn btn-small" id="jLlmRefresh" title="llm-status">⟳</button><button class="btn btn-small" id="jLlmWarmOn" title="Keep the model warm (30-min idle)">Warm on</button><button class="btn btn-small" id="jLlmWarmOff" title="Back to 5-min idle killer">Warm off</button><button class="btn btn-small" id="jLlmPull" title="Fetch model (~800MB once)">Pull</button></div>
           <div class="j-row"><input id="jLlmSay" placeholder="llm-say test line…" autocomplete="off"/><button class="btn btn-small" id="jLlmSayBtn">Say</button></div>
-        </div>
-        <div class="j-card">
-          <h4>😈 Mischief kit <span style="font-size:10px;color:#888">(moved home from Screen)</span></h4>
-          <div class="j-row" style="margin-top:0;justify-content:space-between">
-            <div style="display:flex;gap:6px;align-items:center">
-              <button class="btn btn-small" id="sbToggle" title="Show/hide the prank soundboard">🔊 Board</button>
-              <span id="sbStatus" style="font-size:11px;color:#888">Board hidden</span>
-            </div>
-            <button class="btn btn-small" id="sbStopAll" title="Stop every prank sound">⏹ Stop all</button>
-          </div>
-          <div id="sbPanel" style="display:none;grid-template-columns:1fr 1fr;gap:6px;padding:6px;margin-top:8px;background:rgba(0,0,0,.25);border:1px solid rgba(124,58,237,.4);border-radius:8px"></div>
         </div>
       </div>
     </section>

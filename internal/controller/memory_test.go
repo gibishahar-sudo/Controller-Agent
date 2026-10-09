@@ -296,6 +296,185 @@ func TestOrdinalOfflineBox(t *testing.T) {
 	}
 }
 
+func TestProfileLineNames(t *testing.T) {
+	got := profileLineNames("1. Personal (dave@gmail) [Default]")
+	want := map[string]bool{"Personal": true, "Default": true, "dave@gmail": true, "dave": true}
+	if len(got) != len(want) {
+		t.Fatalf("tokens = %v", got)
+	}
+	for _, c := range got {
+		if !want[c] {
+			t.Fatalf("unexpected token %q in %v", c, got)
+		}
+	}
+	got = profileLineNames("2. Work [Profile 1]")
+	for _, w := range []string{"Work", "Profile 1"} {
+		found := false
+		for _, c := range got {
+			if c == w {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("%q missing in %v", w, got)
+		}
+	}
+}
+
+func TestProfileNameRef(t *testing.T) {
+	rows := []string{"1. Personal (dave@gmail) [Default]", "2. Work [Profile 1]"}
+	if n, ok := profileNameRef("open work", rows); !ok || n != "Work" {
+		t.Fatalf("work: %q %v", n, ok)
+	}
+	if n, ok := profileNameRef("personal please", rows); !ok || n != "Personal" {
+		t.Fatalf("personal: %q %v", n, ok)
+	}
+	if n, ok := profileNameRef("the work profile", rows); !ok || n != "Work" {
+		t.Fatalf("work profile: %q %v", n, ok)
+	}
+	// Token boundary: "network" must not match "work".
+	if _, ok := profileNameRef("network issues", rows); ok {
+		t.Fatal("network must not match work")
+	}
+	if _, ok := profileNameRef("something else entirely", rows); ok {
+		t.Fatal("no match expected")
+	}
+}
+
+func TestProfileNameOpen(t *testing.T) {
+	s := ordTestServer()
+	s.voice.last = &voiceResult{
+		run:   "get-chrome-history 20",
+		lines: []string{"profiles:", "1. Personal (dave@gmail) [Default]", "2. Work [Profile 1]"},
+		host:  "DCHQHAK", at: time.Now(),
+	}
+	h, tac, run, _, _ := s.tryVoiceCmd(nil, "voice-cmd open work", "c1")
+	if !h || run != "get-chrome-history 20 Work" || tac == nil {
+		t.Fatalf("name open: handled=%v run=%q", h, run)
+	}
+	h, _, run, _, _ = s.tryVoiceCmd(nil, "voice-cmd zzz qq", "c2")
+	if !h || run != "" {
+		t.Fatalf("unmatched name must not run: handled=%v run=%q", h, run)
+	}
+}
+
+func TestHistorySearchRows(t *testing.T) {
+	lines := []string{
+		"1. 2026-10-07 | Cats | https://example.com/cats",
+		"2. 2026-10-07 | Search | https://www.google.com/search?q=cats",
+		"3. 2026-10-07 | B | https://b.example/y?x=1",
+		"no url here",
+		"4. 2026-10-07 | D | https://duckduckgo.com/?q=dogs",
+	}
+	got := historySearchRows(lines)
+	if len(got) != 2 || !strings.Contains(got[0], "google") || !strings.Contains(got[1], "duckduckgo") {
+		t.Fatalf("search filter = %v", got)
+	}
+}
+
+func TestHistorySearchesReply(t *testing.T) {
+	s := ordTestServer()
+	_, _, _, rep, _ := s.tryVoiceCmd(nil, "voice-cmd only searches", "c0")
+	if !strings.Contains(rep, "Pull his history first") {
+		t.Fatalf("no history: %q", rep)
+	}
+	s.voice.last = &voiceResult{
+		run: "get-chrome-history 40", text: "pull his search history",
+		lines: []string{
+			"1. A | https://a.example/x",
+			"2. S | https://www.google.com/search?q=a",
+		},
+		host: "DCHQHAK", at: time.Now(),
+	}
+	_, _, run, rep, _ := s.tryVoiceCmd(nil, "voice-cmd only searches", "c1")
+	if run != "" || !strings.Contains(rep, "google") || strings.Contains(rep, "a.example") {
+		t.Fatalf("filtered: run=%q rep=%q", run, rep)
+	}
+	s.voice.last.lines = []string{"1. A | https://a.example/x"}
+	_, _, _, rep, _ = s.tryVoiceCmd(nil, "voice-cmd only searches", "c2")
+	if !strings.Contains(rep, "No searches") {
+		t.Fatalf("empty filter: %q", rep)
+	}
+}
+
+func TestExportFlow(t *testing.T) {
+	s := ordTestServer()
+	s.agents["a1"] = &AgentConn{id: "a1", hostname: "DCHQHAK", user: "Admin", version: "1.46.92"}
+	ac := &AgentConn{id: "a1", hostname: "DCHQHAK", user: "Admin", version: "1.46.92"}
+	_, _, run, _, eff := s.tryVoiceCmd(ac, "voice-cmd pull his history", "e0")
+	if run == "" || eff == "" {
+		t.Fatalf("history must run: %q", run)
+	}
+	s.noteVoiceResult(eff, "1. A | https://a.example/x\n2. B | https://b.example/y", "")
+	h, _, run, rep, _ := s.tryVoiceCmd(nil, "voice-cmd yes", "e1")
+	if !h || !strings.HasPrefix(run, "write-file ") || !strings.Contains(run, ".txt|") {
+		t.Fatalf("yes must export: handled=%v run=%q rep=%q", h, run, rep)
+	}
+	if !strings.Contains(run, `C:\Users\Admin\Desktop\history-dchqhak-`) {
+		t.Fatalf("desktop path: %q", run)
+	}
+	if !strings.Contains(rep, "2 rows") {
+		t.Fatalf("ack: %q", rep)
+	}
+	// Offer is single-use: second yes falls to wipe confirm (nothing armed).
+	_, _, _, rep, _ = s.tryVoiceCmd(nil, "voice-cmd yes", "e2")
+	if !strings.Contains(rep, "Nothing pending") {
+		t.Fatalf("second yes: %q", rep)
+	}
+}
+
+func TestExportNameSanitize(t *testing.T) {
+	if got := exportFileName("DCHQHAK!", time.Date(2026, 10, 9, 1, 2, 3, 0, time.UTC)); got != "history-dchqhak-20261009-010203.txt" {
+		t.Fatalf("name: %q", got)
+	}
+	if got := exportFileName("!!!", time.Date(2026, 10, 9, 1, 2, 3, 0, time.UTC)); !strings.HasPrefix(got, "history-history-") {
+		t.Fatalf("empty host fallback: %q", got)
+	}
+}
+
+func TestExportWipeTie(t *testing.T) {
+	s := ordTestServer()
+	s.agents["a1"] = &AgentConn{id: "a1", hostname: "DCHQHAK", user: "Admin", version: "1.46.92"}
+	s.voice.pendingExport = &voiceExport{host: "DCHQHAK", user: "Admin", lines: []string{"1. A | https://a.example"}, at: time.Now()}
+	s.voice.exportAt = time.Now()
+	s.voice.pendingWipe = "everything"
+	s.voice.pendingAt = time.Now()
+	_, _, run, rep, _ := s.tryVoiceCmd(nil, "voice-cmd yes", "c1")
+	if run != "" || !strings.Contains(rep, "wipe AND a txt export") {
+		t.Fatalf("tie must clarify, never destroy: run=%q rep=%q", run, rep)
+	}
+	_, _, run, rep, _ = s.tryVoiceCmd(nil, "voice-cmd export it", "c2")
+	if !strings.HasPrefix(run, "write-file ") {
+		t.Fatalf("explicit export: run=%q rep=%q", run, rep)
+	}
+}
+
+func TestVoiceMissNeverForwards(t *testing.T) {
+	s := ordTestServer()
+	for _, in := range []string{"voice-cmd taylor 11 seconds to a", "voice-cmd a lot of his suitcase terry", "voice-cmd pull up a 6 to 3", "voice-cmd zzz qq"} {
+		h, _, run, rep, _ := s.tryVoiceCmd(nil, in, "c9")
+		if !h || run != "" || !strings.Contains(rep, "Didn't catch that") {
+			t.Fatalf("%q: handled=%v run=%q rep=%q", in, h, run, rep)
+		}
+	}
+	h, _, run, rep, _ := s.tryVoiceCmd(nil, "memory zzz frobnicate", "c8")
+	if !h || run != "" || !strings.Contains(rep, "Memory didn't parse") {
+		t.Fatalf("memory miss: handled=%v run=%q rep=%q", h, run, rep)
+	}
+}
+
+func TestSuggestIntents(t *testing.T) {
+	if got := suggestIntents("pull up the thing"); len(got) == 0 || got[0] != "pull his history" {
+		t.Fatalf("pull: %v", got)
+	}
+	if got := suggestIntents("zzz qq 123"); len(got) != 0 {
+		t.Fatalf("gibberish: %v", got)
+	}
+	if got := suggestIntents("open youtube please"); len(got) == 0 || got[0] != "open a page" {
+		t.Fatalf("open: %v", got)
+	}
+}
+
 func TestPickVoiceReply(t *testing.T) {
 	s := memTestServer()
 	if _, _, ok := s.pickVoiceReply(0); ok {

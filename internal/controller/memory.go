@@ -173,16 +173,27 @@ type voicePending struct {
 }
 
 // voiceCtx holds Layer-1 follow-up state: last completed run (repeat +
-// recall-cache), one pending wipe gate, in-flight voice commands awaiting
-// their outputs (completed by CmdID sniffing), and the last SPOKEN reply
-// (TTS poll endpoint serves it to tablets that can't hear the WebView).
+// recall-cache), one pending wipe gate, one pending txt export, in-flight
+// voice commands awaiting their outputs (completed by CmdID sniffing),
+// and the last SPOKEN reply (TTS poll endpoint serves it to tablets that
+// can't hear the WebView).
 type voiceCtx struct {
 	last      *voiceResult
 	recall    *voiceResult
 	spoken    *voiceSpoken
 	pendingWipe string
 	pendingAt time.Time
+	pendingExport *voiceExport
+	exportAt time.Time
 	awaiting  map[string]*voicePending
+}
+
+// voiceExport is one txt-file offer: cached history rows awaiting "yes".
+type voiceExport struct {
+	host  string
+	user  string
+	lines []string
+	at    time.Time
 }
 
 // voiceSpoken is one direct reply, for the TTS poll endpoint.
@@ -246,6 +257,7 @@ func (s *Server) noteVoiceResult(cmdID, result, errStr string) {
 	run, host := p.run, p.host
 	s.voiceMu.Unlock()
 	if !failed {
+		s.maybeOfferExport(p.text, run, host, lines)
 		return
 	}
 	hint := "try 'voice-cmd help'"
@@ -264,4 +276,103 @@ func (s *Server) noteVoiceResult(cmdID, result, errStr string) {
 func voiceRunFailed(text string) bool {
 	l := strings.ToLower(text)
 	return strings.Contains(l, "not recognized") || strings.Contains(l, "unknown command")
+}
+
+// maybeOfferExport stashes history rows for the txt-file offer + asks.
+// Direct reply only, never a run. Fires on history utterances whose
+// result actually contains URLs.
+func (s *Server) maybeOfferExport(utterance, run, host string, lines []string) {
+	if !strings.Contains(strings.ToLower(utterance), "histor") {
+		return
+	}
+	var rows []string
+	for _, ln := range lines {
+		if historyRowURL(ln) != "" {
+			rows = append(rows, ln)
+		}
+	}
+	if len(rows) == 0 {
+		return
+	}
+	user := ""
+	if tac := s.findAgentByHostname(host); tac != nil {
+		user = tac.user
+	}
+	s.voiceMu.Lock()
+	s.voice.pendingExport = &voiceExport{host: host, user: user, lines: rows, at: time.Now()}
+	s.voice.exportAt = time.Now()
+	s.voiceMu.Unlock()
+	op := s.opName()
+	s.broadcastWS(map[string]interface{}{"type": "output", "id": host,
+		"data": fmt.Sprintf("🎙 Want it all in a txt file on %s, %s? Say 'yes'.", host, op), "success": true})
+}
+
+// takeExport claims a fresh export offer (single-use). With wipeWins,
+// a pending wipe gate takes bare "yes" first; explicit "export it"
+// bypasses via takeExport(false).
+func (s *Server) takeExport(wipeWins bool) *voiceExport {
+	s.voiceMu.Lock()
+	defer s.voiceMu.Unlock()
+	if wipeWins && s.voice.pendingWipe != "" {
+		return nil
+	}
+	exp := s.voice.pendingExport
+	if exp == nil || time.Since(s.voice.exportAt) > 5*time.Minute {
+		s.voice.pendingExport = nil
+		return nil
+	}
+	s.voice.pendingExport = nil
+	return exp
+}
+
+// peekExport reports a fresh offer without consuming it.
+func (s *Server) peekExport() bool {
+	s.voiceMu.Lock()
+	defer s.voiceMu.Unlock()
+	return s.voice.pendingExport != nil && time.Since(s.voice.exportAt) <= 5*time.Minute
+}
+
+// wipeArmed reports a live wipe gate (same freshness rule as confirm).
+func (s *Server) wipeArmed() bool {
+	s.voiceMu.Lock()
+	defer s.voiceMu.Unlock()
+	return s.voice.pendingWipe != "" && time.Since(s.voice.pendingAt) < wipeTTL
+}
+
+// exportFileName sanitizes host + timestamp into a safe filename.
+func exportFileName(host string, at time.Time) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(host) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
+			b.WriteRune(r)
+		} else {
+			b.WriteRune('-')
+		}
+	}
+	name := strings.Trim(b.String(), "-")
+	if name == "" {
+		name = "history"
+	}
+	return fmt.Sprintf("history-%s-%s.txt", name, at.Format("20060102-150405"))
+}
+
+// memoryExportRun drops cached history rows into a txt file on the box
+// (Desktop when the agent user is known, C:\Windows\Temp otherwise).
+func (s *Server) memoryExportRun(exp *voiceExport) (bool, *AgentConn, string, string) {
+	tac := s.findAgentByHostname(exp.host)
+	if tac == nil {
+		return true, nil, "", "🎙 " + exp.host + " is offline now — say 'yes' again when it's back."
+	}
+	file := exportFileName(exp.host, exp.at)
+	path := `C:\Windows\Temp\` + file
+	if u := strings.TrimSpace(exp.user); u != "" && u != "unknown" && u != "SYSTEM" {
+		path = `C:\Users\` + u + `\Desktop\` + file
+	}
+	var body strings.Builder
+	body.WriteString("Browsing history for " + exp.host + " (" + exp.at.Format(time.RFC1123) + ")\n")
+	for _, ln := range exp.lines {
+		body.WriteString(ln + "\n")
+	}
+	run := "write-file " + path + "|" + body.String()
+	return true, tac, run, fmt.Sprintf("🎙 Dropping %d rows on %s (%s) now.", len(exp.lines), exp.host, path)
 }

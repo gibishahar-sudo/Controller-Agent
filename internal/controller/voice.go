@@ -102,7 +102,7 @@ func parseVoiceCmd(text, hostname string) (handled bool, run, reply string) {
 		return true, "get-chrome-tabs", ""
 	}
 	// Live activity.
-	if hasAny(s, "doing right now", "doing now", "active window", "foreground", "looking at", "working on") {
+	if hasAny(s, "doing right now", "doing now", " he doing", " you doing", "active window", "foreground", "looking at", "working on") {
 		return true, "get-active-window", ""
 	}
 	// Open a page (always remote — open-url only exists there).
@@ -143,6 +143,134 @@ func hasAny(s string, subs ...string) bool {
 		}
 	}
 	return false
+}
+
+// intentLex maps reply phrasing to the operator's likely intent (pure
+// data for suggestIntents).
+var intentLex = map[string][]string{
+	"what tabs does he have": {"tabs", "tab", "brows", "window"},
+	"pull his history":       {"history", "histor", "pull", "visited", "sites"},
+	"open a page":            {"open", "site", "page", "youtube", "google", "go to", "launch"},
+	"what's he doing":        {"doing", "active", "looking", "working", "foreground"},
+	"memory":                 {"remember", "recall", "forget", "who is", "name", "call me", "status"},
+	"help":                   {"help", "commands", "can you", "what can"},
+}
+
+var missStop = map[string]bool{
+	"the": true, "a": true, "an": true, "to": true, "on": true, "up": true,
+	"it": true, "his": true, "he": true, "does": true, "what": true,
+	"is": true, "me": true, "my": true, "of": true, "for": true,
+	"please": true, "jarvis": true, "hey": true, "and": true, "that": true,
+}
+
+// suggestIntents guesses what misheard speech meant by distinctive-token
+// overlap (pure, tested). Top two scoring intents, empty when nothing
+// overlaps — callers fall back to the help pointer.
+func suggestIntents(snorm string) []string {
+	var toks []string
+	for _, t := range strings.Fields(snorm) {
+		if len(t) > 2 && !missStop[t] {
+			toks = append(toks, t)
+		}
+	}
+	type scored struct {
+		name string
+		n    int
+	}
+	var ss []scored
+	for name, keys := range intentLex {
+		n := 0
+		for _, t := range toks {
+			for _, k := range keys {
+				if strings.Contains(t, k) || strings.Contains(k, t) {
+					n++
+					break
+				}
+			}
+		}
+		if n > 0 {
+			ss = append(ss, scored{name, n})
+		}
+	}
+	sort.Slice(ss, func(i, j int) bool {
+		if ss[i].n != ss[j].n {
+			return ss[i].n > ss[j].n
+		}
+		return ss[i].name < ss[j].name
+	})
+	var out []string
+	for i := 0; i < len(ss) && i < 2; i++ {
+		out = append(out, ss[i].name)
+	}
+	return out
+}
+
+// voiceMissReply answers unparseable speech (pure text, tested): echo
+// what was heard (truncated) plus best guesses. NEVER forwards raw
+// voice-cmd to the agent — every such forward died as 'not recognized'.
+func voiceMissReply(snorm string) string {
+	heard := strings.TrimSpace(snorm)
+	if len(heard) > 60 {
+		heard = heard[:60] + "…"
+	}
+	if sugs := suggestIntents(snorm); len(sugs) > 0 {
+		return "🎙 Didn't catch that (" + heard + ") — did you mean: " + strings.Join(sugs, " / ") + "?"
+	}
+	return "🎙 Didn't catch that (" + heard + ") — say 'help' for what I understand."
+}
+
+// memoryMissReply answers unparseable memory input (the agent has no
+// memory verb, so forwarding always errored — same class as voice).
+func memoryMissReply() string {
+	return "🎙 Memory didn't parse that — try 'memory status', 'remember <fact>', 'who is <name>'."
+}
+
+// historySearchRows keeps cached history rows whose URL looks like a
+// search-engine query (pure, tested).
+func historySearchRows(lines []string) []string {
+	var out []string
+	for _, ln := range lines {
+		u := strings.ToLower(historyRowURL(ln))
+		if u == "" {
+			continue
+		}
+		if strings.Contains(u, "search") || strings.Contains(u, "q=") {
+			out = append(out, ln)
+		}
+	}
+	return out
+}
+
+var searchViewTriggers = map[string]bool{
+	"only searches": true, "just the searches": true, "searches": true,
+	"show searches": true, "filter searches": true, "just searches": true,
+	"search results": true,
+}
+
+// historySearchesReply serves the searches-only view over a fresh
+// history pull (no new run). Matched=true whenever the trigger fires,
+// even to say "pull history first" or "no searches in that pull".
+func (s *Server) historySearchesReply(snorm string) (tac *AgentConn, run, reply string, matched bool) {
+	if !searchViewTriggers[snorm] {
+		return nil, "", "", false
+	}
+	say := func(t string) (*AgentConn, string, string, bool) { return nil, "", t, true }
+	s.voiceMu.Lock()
+	last := s.voice.last
+	fresh := s.voiceFresh(last)
+	s.voiceMu.Unlock()
+	if !fresh || len(last.lines) == 0 ||
+		!(strings.HasPrefix(last.run, "get-chrome-history") || strings.Contains(strings.ToLower(last.text), "histor")) {
+		return say("🎙 Pull his history first — then say 'only searches'.")
+	}
+	found := historySearchRows(last.lines)
+	if len(found) == 0 {
+		return say("🎙 No searches in that pull — it was all direct visits.")
+	}
+	if len(found) > 15 {
+		found = found[:15]
+	}
+	return say("🎙 Searches: " + strings.Join(found, " · "))
 }
 
 var urlLike = regexp.MustCompile(`^([a-z0-9-]+\.)+[a-z]{2,}(/.*)?$|^localhost(:\d+)?(/.*)?$|^\d+\.\d+\.\d+\.\d+(:\d+)?(/.*)?$`)
@@ -204,7 +332,20 @@ func (s *Server) parseMemoryCmd(text, host string, viaMemory bool) (bool, *Agent
 	}
 	// Wipe confirm.
 	if sn == "yes" || sn == "yeah" || sn == "yep" || sn == "do it" || sn == "confirm" || sn == "wipe it" {
+		if s.peekExport() && s.wipeArmed() {
+			return say("You've got a wipe AND a txt export pending — say 'wipe it' for the wipe, 'export it' for the file.")
+		}
+		if exp := s.takeExport(true); exp != nil {
+			return s.memoryExportRun(exp)
+		}
 		return s.memoryWipeConfirm()
+	}
+	// Explicit export confirm (unambiguous even with a wipe armed).
+	if sn == "export it" || sn == "save it" || sn == "do the export" || sn == "txt it" || sn == "save the file" {
+		if exp := s.takeExport(false); exp != nil {
+			return s.memoryExportRun(exp)
+		}
+		return say("Nothing to export — pull his history first, then say 'yes' to the txt offer.")
 	}
 	// Arm wipe.
 	if rest, ok := cutPrefixWord(sn, "forget everything"); ok {
@@ -271,8 +412,9 @@ func isHelpRequest(s string) bool {
 // voiceHelpText is the capability list (names get appended by the caller
 // that knows the store).
 func voiceHelpText() string {
-	return "Try: what tabs does he have · pull his history · open youtube on his pc · " +
-		"remember his name is Dave · memory status · voice-cmd anything else runs it raw."
+	return "Try: what tabs does he have · pull his history (activity) · only searches · " +
+		"open youtube on his pc · remember his name is Dave · memory status · " +
+		"ask for a txt file after history."
 }
 
 // dayGreeting is time-aware and pure (hour in 24h).
@@ -334,12 +476,26 @@ func (s *Server) tryVoiceCmd(ac *AgentConn, cmd, cmdID string) (handled bool, ta
 			return s.finishVoice(ac, tac, run, rep, rest, cmdID)
 		}
 	}
+	// Spoken profile names ("work", "personal") resolve like numbers do.
+	if tac, run, rep, matched := s.profileNameOpen(normVoice(rest)); matched {
+		if tac == nil {
+			tac = ac
+		}
+		return s.finishVoice(ac, tac, run, rep, rest, cmdID)
+	}
+	// Searches-only view over a fresh history pull (no new run).
+	if _, run, rep, matched := s.historySearchesReply(normVoice(rest)); matched {
+		return s.finishVoice(ac, ac, run, rep, rest, cmdID)
+	}
 	if !isVoice {
-		return false, nil, "", "", ""
+		return true, ac, "", "🎙 " + memoryMissReply(), effIDFor(cmdID)
 	}
 	h, r, rep := parseVoiceCmd(rest, host)
 	if !h {
-		return false, nil, "", "", ""
+		// Unparseable speech must NEVER reach the agent's shell (every
+		// such forward died as 'not recognized'). Answer with what was
+		// heard plus best guesses instead.
+		return s.finishVoice(ac, ac, "", voiceMissReply(snorm), rest, cmdID)
 	}
 	if r != "" {
 		if tac2, note := s.retargetByName(rest, ac); note != "" {
@@ -1060,23 +1216,36 @@ func historyRowURL(line string) string {
 	return ""
 }
 
-// ordinalOpen resolves an ordinal against the freshest listable voice
-// result. Profile lists re-pull with #N; history rows open the Nth URL —
-// both on the originating box. Anything else (or nothing fresh) declines
-// so P1 intents still get their turn.
-func (s *Server) ordinalOpen(n int) (tac *AgentConn, run, reply string, matched bool) {
+// cachedListBox returns the originating box + cached listable lines when
+// fresh. Stale/empty declines (caller falls through); offline answers
+// with a note. Shared by ordinal and profile-name follow-ups.
+func (s *Server) cachedListBox() (tac *AgentConn, lines []string, note string, ok bool) {
 	s.voiceMu.Lock()
 	last := s.voice.last
 	fresh := s.voiceFresh(last)
 	s.voiceMu.Unlock()
 	if !fresh || len(last.lines) == 0 {
-		return nil, "", "", false
+		return nil, nil, "", false
 	}
 	tac = s.findAgentByHostname(last.host)
 	if tac == nil {
-		return nil, "", "🎙 " + last.host + " is offline now.", true
+		return nil, nil, "🎙 " + last.host + " is offline now.", false
 	}
-	lines := last.lines
+	return tac, last.lines, "", true
+}
+
+// ordinalOpen resolves an ordinal against the freshest listable voice
+// result. Profile lists re-pull with #N; history rows open the Nth URL —
+// both on the originating box. Anything else (or nothing fresh) declines
+// so P1 intents still get their turn.
+func (s *Server) ordinalOpen(n int) (tac *AgentConn, run, reply string, matched bool) {
+	tac, lines, note, ok := s.cachedListBox()
+	if !ok {
+		if note != "" {
+			return nil, "", note, true
+		}
+		return nil, "", "", false
+	}
 	if strings.HasPrefix(lines[0], "profiles:") {
 		if n < 1 || n > len(lines)-1 {
 			return nil, "", fmt.Sprintf("🎙 Only %d profiles listed.", len(lines)-1), true
@@ -1099,6 +1268,90 @@ func (s *Server) ordinalOpen(n int) (tac *AgentConn, run, reply string, matched 
 		return nil, "", fmt.Sprintf("🎙 Only %d rows cached.", len(urls)), true
 	}
 	return tac, "open-url chrome " + urls[n-1], "", true
+}
+
+// profileLineNames pulls matchable tokens from one cached profile row
+// ("1. Personal (dave@gmail) [Default]"): display name, dir token,
+// email user. Pure, tested.
+func profileLineNames(ln string) []string {
+	s := strings.TrimSpace(ln)
+	if i := strings.Index(s, "."); i > 0 && i < 4 {
+		if _, err := strconv.Atoi(strings.TrimSpace(s[:i])); err == nil {
+			s = strings.TrimSpace(s[i+1:])
+		}
+	}
+	var out []string
+	if i := strings.LastIndex(s, "["); i >= 0 {
+		if j := strings.Index(s[i:], "]"); j > 0 {
+			if d := strings.TrimSpace(s[i+1 : i+j]); d != "" {
+				out = append(out, d)
+			}
+			s = strings.TrimSpace(s[:i])
+		}
+	}
+	if i := strings.Index(s, "("); i >= 0 {
+		if j := strings.Index(s[i:], ")"); j > 0 {
+			if em := strings.TrimSpace(s[i+1 : i+j]); em != "" {
+				out = append(out, em)
+				if k := strings.Index(em, "@"); k > 0 {
+					out = append(out, em[:k])
+				}
+			}
+			s = strings.TrimSpace(s[:i])
+		}
+	}
+	if s = strings.TrimSpace(s); s != "" {
+		out = append(out, s)
+	}
+	return out
+}
+
+// profileNameRef matches a spoken profile name against cached profile
+// rows. Token-boundary match (so "network" never matches "work"),
+// longest wins, minimum two characters. Returns the display token the
+// agent itself accepts. Pure, tested.
+func profileNameRef(snorm string, rows []string) (string, bool) {
+	padded := " " + snorm + " "
+	best, bestLen := "", 0
+	for _, ln := range rows {
+		for _, cand := range profileLineNames(ln) {
+			c := strings.ToLower(strings.TrimSpace(cand))
+			if len(c) < 2 || len(c) <= bestLen {
+				continue
+			}
+			if strings.Contains(padded, " "+c+" ") {
+				best, bestLen = cand, len(c)
+			}
+		}
+	}
+	if best == "" {
+		return "", false
+	}
+	return best, true
+}
+
+// profileNameOpen resolves a SPOKEN profile name ("work", "personal")
+// against the freshest cached profile listing — numbers were the only
+// accepted answer, names now work too.
+func (s *Server) profileNameOpen(snorm string) (tac *AgentConn, run, reply string, matched bool) {
+	tac, lines, note, ok := s.cachedListBox()
+	if !ok {
+		if note != "" {
+			return nil, "", note, true
+		}
+		return nil, "", "", false
+	}
+	if !strings.HasPrefix(lines[0], "profiles:") {
+		return nil, "", "", false
+	}
+	name, found := profileNameRef(snorm, lines[1:])
+	if !found {
+		return nil, "", "", false
+	}
+	if agentTooOld(tac.version, "get-chrome-history") {
+		return nil, "", "🎙 That box is too old for profiles — update it, then ask again.", true
+	}
+	return tac, "get-chrome-history 20 " + name, "", true
 }
 
 // knownNames lists registered "name (host)" pairs, sorted, for the help
