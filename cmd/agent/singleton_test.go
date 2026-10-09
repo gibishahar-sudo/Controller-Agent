@@ -44,6 +44,18 @@ func TestRedundantNoContact(t *testing.T) {
 	}
 }
 
+// watchStubWant must be a wscript one-liner naming the stub beside the exe
+// (v1.46.96: Active Setup via powershell.exe flashes a console per update).
+func TestWatchStubWant(t *testing.T) {
+	got := watchStubWant(`C:\ProgramData\Microsoft\Windows\Update`)
+	if !strings.HasPrefix(got, "wscript.exe //B //Nologo") || !strings.HasSuffix(got, `watch-stub.vbs"`) {
+		t.Fatalf("stub want = %q", got)
+	}
+	if strings.Contains(got, "powershell") {
+		t.Fatalf("stub want must not mention powershell: %q", got)
+	}
+}
+
 // agentRole gates reaping: only bare full agents are ever touched.
 func TestAgentRole(t *testing.T) {
 	for cmd, want := range map[string]string{

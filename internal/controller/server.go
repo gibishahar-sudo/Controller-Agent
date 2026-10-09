@@ -390,6 +390,9 @@ func StartBackground(opts Options) (*Server, error) {
 	s.voice = newVoiceCtx()
 	s.llm = newLLMState()
 	s.dupAlarmed = make(map[string]int)
+	// Flash-free watchdog migration (v1.46.96): best-effort, no-ops
+	// without a controller install or without admin.
+	ensureWatchdogLauncher()
 	if s.memory.Prefs["llmWarm"] == "1" {
 		s.llm.warm = true
 		// Prewarm in background: no pull, no block — if files are

