@@ -1016,12 +1016,18 @@ func (a *agent) stopPushStream() {
 // box stops burning a core on identical captures; any change snaps
 // back to full pace within one beat.
 //
+// send is the OWNING SESSION's transport (direct a.send or the MQTT
+// mout): the push loop must publish back down the same pipe the request
+// came in on. Hardcoding a.send here starved every MQTT-only agent
+// forever (nil direct encoder: "no connection" on every frame, loop
+// exits, UI starves, one on-demand frame paints on stop).
+//
 // Internals: a two-stage pipeline. Stage A captures (GDI-bound, ~90ms
 // on weak boxes) while stage B diffs+encodes+sends the previous frame,
 // so throughput is 1/max(stage) instead of 1/sum. Depth-1 channel with
 // drop (never block): when B lags, A sheds load instead of queueing
 // stale frames. Stage B stays serial so tile generations keep order.
-func (a *agent) startPushStream(quality, monitor int, all bool, scale float64) {
+func (a *agent) startPushStream(send func(protocol.Message) error, quality, monitor int, all bool, scale float64) {
 	a.pushMu.Lock()
 	if a.pushCancel != nil {
 		a.pushCancel()
@@ -1231,12 +1237,12 @@ func (a *agent) startPushStream(quality, monitor int, all bool, scale float64) {
 					maybeSendPace()
 					continue
 				}
-				// Send-failure budget: one failed publish used to kill the
-				// whole loop (a transient blip cost a 3s+ stall until the
-				// UI re-pushed). Now a failing publish drops one frame and
-				// the loop survives; only a persistently dead transport
-				// (10 in a row) exits, and the UI re-push retries.
-				if err := sendShotMsgs(a.send, msgs); err != nil {
+			// Send-failure budget: one failed publish used to kill the
+			// whole loop (a transient blip cost a 3s+ stall until the
+			// UI re-pushed). Now a failing publish drops one frame and
+			// the loop survives; only a persistently dead transport
+			// (10 in a row) exits, and the UI re-push retries.
+			if err := sendShotMsgs(send, msgs); err != nil {
 					sendFails++
 					dlog.Printf("[push] publish failed (%d consecutive): %v", sendFails, err)
 					if sendFails >= 10 {
@@ -1649,11 +1655,11 @@ func (a *agent) connectOnce() error {
 					log.Printf("[*] Sent output (%d bytes)", len(result))
 				}(msg)
 			case protocol.TypeScreenshotRequest:
-				log.Printf("[*] Screenshot requested (quality=%d monitor=%d all=%v scale=%v push=%v)", msg.Quality, msg.Monitor, msg.AllMonitors, msg.Scale, msg.Push)
-				if msg.Push {
-					a.startPushStream(msg.Quality, msg.Monitor, msg.AllMonitors, msg.Scale)
-					continue
-				}
+			log.Printf("[*] Screenshot requested (quality=%d monitor=%d all=%v scale=%v push=%v)", msg.Quality, msg.Monitor, msg.AllMonitors, msg.Scale, msg.Push)
+			if msg.Push {
+				a.startPushStream(a.send, msg.Quality, msg.Monitor, msg.AllMonitors, msg.Scale)
+				continue
+			}
 				a.stopPushStream()
 				go func(quality, monitor int, all bool, scale float64, tiles bool) {
 					if !captureSlot() {
@@ -1924,7 +1930,7 @@ func relayListenOnce(a *agent, hn, user, me, caFile string) error {
 			}(msg)
 		case protocol.TypeScreenshotRequest:
 			if msg.Push {
-				a.startPushStream(msg.Quality, msg.Monitor, msg.AllMonitors, msg.Scale)
+				a.startPushStream(mout, msg.Quality, msg.Monitor, msg.AllMonitors, msg.Scale)
 				return
 			}
 			a.stopPushStream()
@@ -2217,7 +2223,7 @@ func (a *agent) connectViaMQTT() error {
 			}(msg)
 		case protocol.TypeScreenshotRequest:
 			if msg.Push {
-				a.startPushStream(msg.Quality, msg.Monitor, msg.AllMonitors, msg.Scale)
+				a.startPushStream(mout, msg.Quality, msg.Monitor, msg.AllMonitors, msg.Scale)
 				return
 			}
 			a.stopPushStream()
