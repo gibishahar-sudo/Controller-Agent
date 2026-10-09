@@ -517,6 +517,14 @@ func diffEncode(img *image.RGBA, w, h, ox, oy int, s0 uint64, capMs int64, quali
 		kq -= 10
 	}
 	data, format, err := encodeImage(img, kq)
+	if err == nil && format == "jpeg" && kq > 0 {
+		// Bound worst-case bytes for thin links (v1.47.0): a 150KB
+		// keyframe on a ~100kbps relay costs 10s+ and wedges the
+		// stream behind one frame.
+		if bd, _ := encodeBounded(img, kq, 20, keyframeByteCap); bd != nil {
+			data = bd
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -1343,6 +1351,29 @@ func adaptPushQuality(q, qHi int, emaMs float64) (int, bool) {
 		return nq, nq != q
 	}
 	return q, false
+}
+
+// keyframeByteCap bounds worst-case keyframe bytes (v1.47.0): anything
+// bigger stalls thin relay links behind a single frame.
+const keyframeByteCap = 64 * 1024
+
+// encodeBounded JPEGs img starting at q, stepping down until the output
+// fits maxBytes or hits floorQ. Returns data + used quality (nil data on
+// encode error). Pure around encodeImage: unit-tested.
+func encodeBounded(img image.Image, q, floorQ, maxBytes int) ([]byte, int) {
+	for {
+		data, _, err := encodeImage(img, q)
+		if err != nil {
+			return nil, q
+		}
+		if len(data) <= maxBytes || q <= floorQ {
+			return data, q
+		}
+		q -= 15
+		if q < floorQ {
+			q = floorQ
+		}
+	}
 }
 
 // defaultHouses preserves the historical HouseA/HouseB behavior when no
