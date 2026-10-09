@@ -3,6 +3,7 @@ package main
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 // wmiTermCmd must name the exact PID, single-call form (v1.46.92: batch
@@ -14,6 +15,32 @@ func TestWmiTermCmd(t *testing.T) {
 	}
 	if strings.Contains(got, "485840") || strings.Count(got, "48584") != 1 {
 		t.Fatalf("pid must appear exactly once: %q", got)
+	}
+}
+
+// redundantNoContact is the pileup pact (v1.46.95): a session with zero
+// controller contact past grace exits, but ONLY with a live peer. Sole
+// agents (offline laptop, dead network) must retry forever.
+func TestRedundantNoContact(t *testing.T) {
+	now := time.Now()
+	start := now.Add(-11 * time.Minute)
+	if !redundantNoContact(start, now, false, 2) {
+		t.Fatal("old, uncontacted, peers → must fire")
+	}
+	if redundantNoContact(start, now, true, 2) {
+		t.Fatal("contacted → never fire")
+	}
+	if redundantNoContact(start, now, false, 0) {
+		t.Fatal("no peers (sole agent) → never fire")
+	}
+	if redundantNoContact(now.Add(-time.Minute), now, false, 3) {
+		t.Fatal("fresh session → never fire")
+	}
+	if redundantNoContact(now.Add(-10*time.Minute), now, false, 1) {
+		t.Fatal("exactly at grace → never fire (strictly greater)")
+	}
+	if noContactGrace != 10*time.Minute {
+		t.Fatalf("grace drifted: %v", noContactGrace)
 	}
 }
 

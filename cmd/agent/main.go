@@ -2076,6 +2076,24 @@ func relayListenOnce(a *agent, hn, user, me, caFile string) error {
 	}
 }
 
+// noContactGrace is how long a redundant session may go without any
+// controller contact before it must exit (v1.46.95: 14 deaf duplicates
+// piled up for a week — a live holder plus duplicates that never
+// yielded and never connected).
+const noContactGrace = 10 * time.Minute
+
+// redundantNoContact decides the suicide pact (pure, tested): a session
+// with zero controller contact past the grace period exits, but ONLY
+// when a peer full agent exists. Sole agents (offline laptop, dead
+// network) must retry forever and never suicide; ghost mode is gated at
+// the call site (its sleeps are orchestrated, not broken).
+func redundantNoContact(startedAt, now time.Time, contacted bool, peers int) bool {
+	if contacted || peers == 0 {
+		return false
+	}
+	return now.Sub(startedAt) > noContactGrace
+}
+
 // connectViaMQTT joins the MQTT relay (persistent outbound TCP 1883, zero
 // polling). Tried after direct dials fail.
 func (a *agent) connectViaMQTT() error {
@@ -2107,10 +2125,12 @@ func (a *agent) connectViaMQTT() error {
 		return bus.Publish("out/"+hn, env)
 	}
 
-	// inbound watchdog: if no message received for ~10min, force re-dial
+	// inbound watchdog: if no message received for ~4min, force re-dial
 	// to heal silent broker-side subscription drops (broker loses subs without TCP close).
 	var lastInbound atomic.Int64
 	lastInbound.Store(time.Now().UnixNano())
+	sessionStart := time.Now()
+	var contacted atomic.Bool
 	redialCh := make(chan struct{}, 1) // watchdog -> main loop: break out and re-dial
 	go func() {
 		ticker := time.NewTicker(60 * time.Second)
@@ -2120,13 +2140,18 @@ func (a *agent) connectViaMQTT() error {
 			case <-a.closing:
 				return
 			case <-ticker.C:
-				if time.Since(time.Unix(0, lastInbound.Load())) > 10*time.Minute {
-					log.Printf("[!] mqtt: no inbound messages for 10min, forcing re-dial")
+				if time.Since(time.Unix(0, lastInbound.Load())) > 4*time.Minute {
+					log.Printf("[!] mqtt: no inbound messages for 4min, forcing re-dial")
 					select {
 					case redialCh <- struct{}{}:
 					default:
 					}
 					return
+				}
+				// Suicide pact: redundant and never contacted anyone.
+				if agentMode != commands.ModeGhost && redundantNoContact(sessionStart, time.Now(), contacted.Load(), len(fullAgentProcs())) {
+					log.Printf("[!] redundant session, no controller contact for 10min with a live peer on this PC — exiting so duplicates can't pile up (restart takes over if the peer is gone)")
+					os.Exit(1)
 				}
 			}
 		}
@@ -2173,6 +2198,7 @@ func (a *agent) connectViaMQTT() error {
 				commands.E2EEnable(true)
 			}
 			noteAck(msg)
+			contacted.Store(true)
 			log.Printf("[*] MQTT controller ack %s", msg.ID)
 		case protocol.TypeUpdateBegin:
 			log.Printf("[*] MQTT update begin %s", msg.UpdateVer)
@@ -2297,7 +2323,7 @@ func (a *agent) connectViaMQTT() error {
 			dlog.Printf("[listen] announce failed: %v", err)
 			announceFails++
 			// Half-dead TCP (publishes fail, connection looks up): re-dial
-			// instead of sitting mute until the 10min inbound watchdog fires.
+			// instead of sitting mute until the 4min inbound watchdog fires.
 			if announceFails >= 3 {
 				log.Printf("[!] mqtt: 3 consecutive announce failures, forcing re-dial")
 				select {
@@ -2320,7 +2346,7 @@ func (a *agent) connectViaMQTT() error {
 	announce()
 	announceTicker := time.NewTicker(announceEvery(25 * time.Second)) // quiet presence: the sweep still converges quickly on re-hello
 	defer announceTicker.Stop()
-	resubTicker := time.NewTicker(5 * time.Minute) // heal broker-side amnesia without a full re-dial
+	resubTicker := time.NewTicker(2 * time.Minute) // heal broker-side amnesia without a full re-dial
 	defer resubTicker.Stop()
 	mouseTicker := time.NewTicker(150 * time.Millisecond) // MQTT is cheap: near-direct cursor feel
 	defer mouseTicker.Stop()
@@ -2332,7 +2358,7 @@ func (a *agent) connectViaMQTT() error {
 		case <-discCh:
 			return nil
 		case <-redialCh:
-			return fmt.Errorf("mqtt inbound watchdog: 10min without inbound, re-dialing")
+			return fmt.Errorf("mqtt inbound watchdog: 4min without inbound, re-dialing")
 		case <-resubTicker.C:
 			if err := bus.SubscribeCmd(onCmd); err != nil {
 				log.Printf("[!] mqtt: periodic re-subscribe failed (%v), forcing re-dial", err)
