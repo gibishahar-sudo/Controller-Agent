@@ -72,67 +72,129 @@ func installLLMBundle(installDir string) {
 		return
 	}
 	dest := filepath.Join(installDir, "llm")
-	if err := extractLLMBundle(data, dest); err != nil {
+	entries, err := extractLLMBundle(data, dest)
+	if err != nil {
 		msgBox("LLM sidecar", fmt.Sprintf("LLM bundle unpack failed (phrasing will pull on demand):\n%v", err), 0x40)
 		return
 	}
-	st, err := os.Stat(filepath.Join(dest, "model.gguf"))
-	if err != nil || st.Size() != llmModelSizeWant {
-		msgBox("LLM sidecar", "LLM model size mismatch (phrasing will pull on demand).", 0x40)
+	modelPath := filepath.Join(dest, "model.gguf")
+	exePath := filepath.Join(dest, "bin", "llama-server.exe")
+	modelOK, exeOK := false, false
+	if st, serr := os.Stat(modelPath); serr == nil {
+		modelOK = st.Size() == llmModelSizeWant
+	}
+	if _, serr := os.Stat(exePath); serr == nil {
+		exeOK = true
+	}
+	if !modelOK || !exeOK {
+		msgBox("LLM sidecar", llmReport(dest, modelOK, exeOK, entries)+"\n(phrasing will pull on demand).", 0x40)
 		return
 	}
-	if _, err := os.Stat(filepath.Join(dest, "bin", "llama-server.exe")); err != nil {
-		msgBox("LLM sidecar", "LLM server binary missing (phrasing will pull on demand).", 0x40)
-		return
+	if names := bundleEntrySample(data, 5); len(names) > 0 {
+		fmt.Printf("[*] LLM bundle layout: %s\n", strings.Join(names, ", "))
 	}
 	fmt.Println("[*] LLM sidecar installed (no model download needed)")
 }
 
-// validBundleEntry allows only the sidecar layout (bin/*, model.gguf).
+// llmReport renders the actionable sidecar verdict (pure, tested): what
+// is present, what is missing, where, and how much unpacked — never a
+// bare "missing" again.
+func llmReport(dest string, modelOK, exeOK bool, entries int) string {
+	var b strings.Builder
+	b.WriteString("LLM sidecar in " + dest + ":\n")
+	if modelOK {
+		fmt.Fprintf(&b, "model.gguf OK (%d bytes)\n", llmModelSizeWant)
+	} else {
+		b.WriteString("model.gguf MISSING or wrong size\n")
+	}
+	if exeOK {
+		b.WriteString("bin\\llama-server.exe OK\n")
+	} else {
+		b.WriteString("bin\\llama-server.exe MISSING\n")
+	}
+	fmt.Fprintf(&b, "%d bundle entries unpacked", entries)
+	return b.String()
+}
+
+// normZipName canonicalizes one zip entry to slash form: Compress-Archive
+// writes backslashes (bin\ggml-base.dll), Go-written zips use slashes.
+// The gate below must accept both (v1.46.99: backslash entries failed
+// the bin/ prefix test and all 30 server files skipped silently).
+// Pure, tested.
+func normZipName(name string) string {
+	n := strings.ReplaceAll(name, "\\", "/")
+	return strings.TrimPrefix(n, "./")
+}
+
+// bundleEntrySample lists the first n entry names of bundle bytes
+// (install-time layout evidence: the next screenshot shows what was
+// inside). Pure, tested.
+func bundleEntrySample(data []byte, n int) []string {
+	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, f := range zr.File {
+		if f.FileInfo().IsDir() {
+			continue
+		}
+		out = append(out, f.Name)
+		if len(out) >= n {
+			break
+		}
+	}
+	return out
+}
+
+// validBundleEntry allows only the sidecar layout (bin/*, model.gguf),
+// either separator style (v1.46.99: Compress-Archive writes backslashes).
 // Pure, tested.
 func validBundleEntry(name string) bool {
-	n := strings.TrimPrefix(name, "./")
+	n := normZipName(name)
 	return n == "model.gguf" || strings.HasPrefix(n, "bin/")
 }
 
 // extractLLMBundle unpacks bundle bytes into dest (llmHome layout:
 // dest/bin, dest/model.gguf). Zip-slip entries are rejected, unknown
-// files skipped. Pure I/O on caller-supplied bytes: unit-tested with
-// synthetic zips.
-func extractLLMBundle(data []byte, dest string) error {
+// files skipped. Returns accepted entry count. Pure I/O on
+// caller-supplied bytes: unit-tested with synthetic zips.
+func extractLLMBundle(data []byte, dest string) (int, error) {
 	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
-		return err
+		return 0, err
 	}
 	base := filepath.Clean(dest) + string(os.PathSeparator)
+	entries := 0
 	for _, f := range zr.File {
 		if f.FileInfo().IsDir() || !validBundleEntry(f.Name) {
 			continue
 		}
-		out := filepath.Join(dest, filepath.FromSlash(f.Name))
+		out := filepath.Join(dest, filepath.FromSlash(normZipName(f.Name)))
 		if !strings.HasPrefix(out, base) {
-			return fmt.Errorf("zip-slip entry %q", f.Name)
+			return 0, fmt.Errorf("zip-slip entry %q", f.Name)
 		}
 		if err := os.MkdirAll(filepath.Dir(out), 0755); err != nil {
-			return err
+			return entries, err
 		}
 		rc, err := f.Open()
 		if err != nil {
-			return err
+			return entries, err
 		}
 		w, err := os.OpenFile(out, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 		if err != nil {
 			rc.Close()
-			return err
+			return entries, err
 		}
 		_, err = io.Copy(w, rc)
 		rc.Close()
 		w.Close()
 		if err != nil {
-			return err
+			return entries, err
 		}
+		entries++
 	}
-	return nil
+	return entries, nil
 }
 
 // controllerTaskXML renders the watchdog task: logon + 15-min repetition

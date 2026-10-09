@@ -139,6 +139,19 @@ func shaFileHex(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// modelFileVerified reports a usable model file at path (size + SHA).
+// Pure on the path: unit-tested with temp files. Powers the per-phase
+// pull skip (v1.46.99: never re-download 800MB when only the server half
+// is missing).
+func modelFileVerified(path string) bool {
+	st, err := os.Stat(path)
+	if err != nil || st.Size() != llmModelSize {
+		return false
+	}
+	sum, err := shaFileHex(path)
+	return err == nil && sum == llmModelSHA
+}
+
 // llmStatus reports one line for llm-status and logs.
 func (s *Server) llmStatus() string {
 	st := s.llm
@@ -400,14 +413,39 @@ func (s *Server) llmPullRun() {
 		st.mu.Unlock()
 	}
 	// 1. Server zip (small): download, verify, unpack to bin/.
+	// Already present (bundled installer, previous pull): skip the fetch.
 	setPhase("server")
+	if _, err := os.Stat(llmExe()); err == nil {
+		log.Printf("[llm] server present, skipping fetch")
+	} else if err := llmFetchServer(st); err != nil {
+		return
+	}
+	// 2. Model (big): a verified file skips the 800MB fetch (v1.46.99).
+	setPhase("model")
+	if modelFileVerified(llmModel()) {
+		log.Printf("[llm] model verified present, skipping fetch")
+	} else if err := llmFetchModel(st); err != nil {
+		return
+	}
+	st.mu.Lock()
+	st.ready = true
+	st.verified = true
+	st.lastErr = ""
+	st.mu.Unlock()
+	log.Printf("[llm] pull complete — sidecar ready")
+	s.broadcastWS(map[string]interface{}{"type": "output", "data": "🗣 local model ready.", "success": true})
+}
+
+// llmFetchServer downloads, verifies, and unpacks the server zip.
+// Extracted from llmPullRun (per-phase skip needs callable phases).
+func llmFetchServer(st *llmState) error {
 	zpath := filepath.Join(llmHome(), "llama.zip.tmp")
 	if err := llmFetch(llmServerURL, zpath, 0, st, "server"); err != nil {
 		st.mu.Lock()
 		st.lastErr = err.Error()
 		st.mu.Unlock()
 		log.Printf("[llm] pull server: %v", err)
-		return
+		return err
 	}
 	sum, err := shaFileHex(zpath)
 	if err != nil || sum != llmServerSHA {
@@ -416,43 +454,40 @@ func (s *Server) llmPullRun() {
 		st.lastErr = "server hash mismatch"
 		st.mu.Unlock()
 		log.Printf("[llm] pull server: hash mismatch")
-		return
+		return fmt.Errorf("server hash mismatch")
 	}
 	if err := llmUnzipBin(zpath, llmBinDir()); err != nil {
 		st.mu.Lock()
 		st.lastErr = err.Error()
 		st.mu.Unlock()
 		log.Printf("[llm] unpack server: %v", err)
-		return
+		return err
 	}
 	os.Remove(zpath)
-	// 2. Model (big): download, size+hash verify.
-	setPhase("model")
+	return nil
+}
+
+// llmFetchModel downloads and verifies the model file.
+func llmFetchModel(st *llmState) error {
 	mpath := filepath.Join(llmHome(), "model.gguf.tmp")
 	if err := llmFetch(llmModelURL, mpath, llmModelSize, st, "model"); err != nil {
 		st.mu.Lock()
 		st.lastErr = err.Error()
 		st.mu.Unlock()
 		log.Printf("[llm] pull model: %v", err)
-		return
+		return err
 	}
-	sum, err = shaFileHex(mpath)
+	sum, err := shaFileHex(mpath)
 	if err != nil || sum != llmModelSHA {
 		os.Remove(mpath)
 		st.mu.Lock()
 		st.lastErr = "model hash mismatch"
 		st.mu.Unlock()
 		log.Printf("[llm] pull model: hash mismatch")
-		return
+		return fmt.Errorf("model hash mismatch")
 	}
 	os.Rename(mpath, llmModel())
-	st.mu.Lock()
-	st.ready = true
-	st.verified = true
-	st.lastErr = ""
-	st.mu.Unlock()
-	log.Printf("[llm] pull complete — sidecar ready")
-	s.broadcastWS(map[string]interface{}{"type": "output", "data": "🗣 local model ready.", "success": true})
+	return nil
 }
 
 // llmFetch streams url to dst with progress + stopPull checks. wantSize>0

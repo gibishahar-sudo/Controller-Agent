@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -156,5 +158,25 @@ func TestLLMPromptWordCap(t *testing.T) {
 	sys, _ := llmPrompt("ctx", "")
 	if !strings.Contains(sys, "20 words") {
 		t.Fatalf("prompt must cap length: %q", sys)
+	}
+}
+
+// modelFileVerified gates the per-phase pull skip (v1.46.99): exact
+// size + pinned SHA, nothing else counts.
+func TestModelFileVerified(t *testing.T) {
+	dir := t.TempDir()
+	missing := filepath.Join(dir, "model.gguf")
+	if modelFileVerified(missing) {
+		t.Fatal("missing must fail")
+	}
+	short := filepath.Join(dir, "short.gguf")
+	if err := os.WriteFile(short, []byte("tiny"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if modelFileVerified(short) {
+		t.Fatal("wrong size must fail")
+	}
+	if !strings.Contains(llmModelSHA, "6f85a640") || llmModelSize != 807694464 {
+		t.Fatal("pinned supply chain drifted")
 	}
 }
