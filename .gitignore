@@ -1,6 +1,9 @@
 certs/server.key
 screenshots/
 *.exe
+# 900MB LLM bundle (llama-server + model): fetched at build time, staged
+# into the controller installer payload, never committed.
+cmd/installer-dev/payload/llm-bundle.zip
 # Release helper scripts embed the GitHub token - never commit them.
 ship*_tmp.ps1
 upload*_tmp.ps1

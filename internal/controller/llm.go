@@ -151,6 +151,13 @@ func (s *Server) llmStatus() string {
 		idle := time.Since(st.lastUse).Round(time.Second)
 		return fmt.Sprintf("ready (pid %d, idle %s)%s, cache %d", st.cmd.Process.Pid, idle, warmTag(st), len(st.phraseCache))
 	}
+	// Files may have arrived without us (bundled installer): detect once.
+	if !st.verified {
+		if err := llmVerifyFiles(); err == nil {
+			st.verified = true
+			st.ready = true
+		}
+	}
 	if st.ready {
 		return fmt.Sprintf("ready (server down, starts on demand)%s, cache %d", warmTag(st), len(st.phraseCache))
 	}
@@ -354,6 +361,18 @@ func (s *Server) llmPull() string {
 	}
 	st := s.llm
 	st.mu.Lock()
+	// Bundled installer already placed verified files: nothing to fetch.
+	if !st.verified {
+		if err := llmVerifyFiles(); err == nil {
+			st.verified = true
+			st.ready = true
+		}
+	}
+	if st.ready {
+		ready := fmt.Sprintf("model already present (~800MB on disk)%s — say llm-warm on to prewarm", warmTag(st))
+		st.mu.Unlock()
+		return ready
+	}
 	if st.pulling {
 		p := fmt.Sprintf("already pulling %s %d%%", st.pullWhat, st.pullPct)
 		st.mu.Unlock()

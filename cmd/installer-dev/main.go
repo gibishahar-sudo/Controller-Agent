@@ -1,12 +1,14 @@
 package main
 
 import (
+	"archive/zip"
 	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
 	"embed"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -51,6 +53,86 @@ sh.Run "powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -F
 // watchdogRunValue builds the flash-free Run value. Pure, tested.
 func watchdogRunValue(vbsPath string) string {
 	return fmt.Sprintf(`wscript.exe //B //Nologo "%s"`, vbsPath)
+}
+
+// llmModelSizeWant mirrors internal/controller llmModelSize (sync on
+// model change): fast truncation check after unpack (the runtime hashes
+// once per boot as the authority).
+const llmModelSizeWant = 807694464
+
+// installLLMBundle unpacks the embedded LLM sidecar (llama-server + model)
+// beside the controller so Jarvis phrasing works with zero downloads
+// (v1.46.98: ~811MB zip; first llm-say used to pull it in background).
+// Missing bundle (dev builds) logs and moves on — runtime llm-pull
+// remains the fallback.
+func installLLMBundle(installDir string) {
+	data, err := fs.ReadFile(payloadFS, "payload/llm-bundle.zip")
+	if err != nil {
+		fmt.Println("[*] No LLM bundle embedded, skipping (llm-pull remains available)")
+		return
+	}
+	dest := filepath.Join(installDir, "llm")
+	if err := extractLLMBundle(data, dest); err != nil {
+		msgBox("LLM sidecar", fmt.Sprintf("LLM bundle unpack failed (phrasing will pull on demand):\n%v", err), 0x40)
+		return
+	}
+	st, err := os.Stat(filepath.Join(dest, "model.gguf"))
+	if err != nil || st.Size() != llmModelSizeWant {
+		msgBox("LLM sidecar", "LLM model size mismatch (phrasing will pull on demand).", 0x40)
+		return
+	}
+	if _, err := os.Stat(filepath.Join(dest, "bin", "llama-server.exe")); err != nil {
+		msgBox("LLM sidecar", "LLM server binary missing (phrasing will pull on demand).", 0x40)
+		return
+	}
+	fmt.Println("[*] LLM sidecar installed (no model download needed)")
+}
+
+// validBundleEntry allows only the sidecar layout (bin/*, model.gguf).
+// Pure, tested.
+func validBundleEntry(name string) bool {
+	n := strings.TrimPrefix(name, "./")
+	return n == "model.gguf" || strings.HasPrefix(n, "bin/")
+}
+
+// extractLLMBundle unpacks bundle bytes into dest (llmHome layout:
+// dest/bin, dest/model.gguf). Zip-slip entries are rejected, unknown
+// files skipped. Pure I/O on caller-supplied bytes: unit-tested with
+// synthetic zips.
+func extractLLMBundle(data []byte, dest string) error {
+	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return err
+	}
+	base := filepath.Clean(dest) + string(os.PathSeparator)
+	for _, f := range zr.File {
+		if f.FileInfo().IsDir() || !validBundleEntry(f.Name) {
+			continue
+		}
+		out := filepath.Join(dest, filepath.FromSlash(f.Name))
+		if !strings.HasPrefix(out, base) {
+			return fmt.Errorf("zip-slip entry %q", f.Name)
+		}
+		if err := os.MkdirAll(filepath.Dir(out), 0755); err != nil {
+			return err
+		}
+		rc, err := f.Open()
+		if err != nil {
+			return err
+		}
+		w, err := os.OpenFile(out, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+		if err != nil {
+			rc.Close()
+			return err
+		}
+		_, err = io.Copy(w, rc)
+		rc.Close()
+		w.Close()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // controllerTaskXML renders the watchdog task: logon + 15-min repetition
@@ -247,6 +329,9 @@ func main() {
 			return nil
 		}
 		rel, _ := filepath.Rel("payload", path)
+		if strings.EqualFold(filepath.Base(rel), "llm-bundle.zip") {
+			return nil // unpacked separately by installLLMBundle (never dumped raw)
+		}
 		dest := filepath.Join(installDir, rel)
 		if err := os.MkdirAll(filepath.Dir(dest), 0755); err != nil {
 			return err
@@ -267,6 +352,7 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Printf("[*] Extracted %d files\n", count)
+	installLLMBundle(installDir)
 
 	// Create desktop shortcut
 	desktop := filepath.Join(os.Getenv("USERPROFILE"), "Desktop")
