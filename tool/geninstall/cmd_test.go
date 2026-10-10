@@ -8,7 +8,7 @@ import (
 // The size gate is the whole point (v1.47.3: 8% truncated binary ran
 // silent). Shape + retry + gate must all survive refactors.
 func TestBuildInstallCMD(t *testing.T) {
-	got := buildInstallCMD("TOK", "123", 18616816)
+	got := buildInstallCMD("TOK", "123", 18616816, "v1.47.5")
 	for _, want := range []string{
 		"Bearer TOK",
 		"releases/assets/123",
@@ -23,11 +23,14 @@ func TestBuildInstallCMD(t *testing.T) {
 		"UAC failed (",
 		"approve on the box screen or run from an elevated prompt",
 		"e='+$c.ExitCode",
-		cmdMarker,
+		cmdMarkerFor("v1.47.5"),
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("cmd missing %q:\n%s", want, got)
 		}
+	}
+	if strings.Contains(got, "v1.47.4") {
+		t.Fatal("wrong-tag leak: a v1.47.5 mint must never name another release")
 	}
 	if strings.Contains(got, `"`) {
 		t.Fatal("double quote leak breaks the outer call shape")
@@ -55,15 +58,31 @@ func TestBuildInstallCMD(t *testing.T) {
 	}
 }
 
+// Stale-paste triage (v1.47.5): two mints for different releases must be
+// distinguishable by their first line alone.
+func TestCmdMarkerFor(t *testing.T) {
+	a := buildInstallCMD("T", "1", 2, "v1.47.4")
+	b := buildInstallCMD("T", "1", 2, "v1.47.5")
+	if !strings.Contains(a, "v1.47.4") || strings.Contains(a, "v1.47.5") {
+		t.Fatalf("v1.47.4 mint mislabeled:\n%s", a)
+	}
+	if !strings.Contains(b, "v1.47.5") || strings.Contains(b, "v1.47.4") {
+		t.Fatalf("v1.47.5 mint mislabeled:\n%s", b)
+	}
+	if cmdMarkerFor("") != cmdMarker {
+		t.Fatal("empty tag must fall back to the bare revision marker")
+	}
+}
+
 func TestBuildInstallCMDMode(t *testing.T) {
-	iwr := buildInstallCMDMode("TOK", "123", 18616816, "iwr")
+	iwr := buildInstallCMDMode("TOK", "123", 18616816, "iwr", "v1.47.5")
 	if !strings.Contains(iwr, "iwr -Headers @{Authorization=") {
 		t.Fatalf("iwr mode lost its fetcher:\n%s", iwr)
 	}
 	if strings.Contains(iwr, "curl.exe") {
 		t.Fatal("iwr mode must not mention curl")
 	}
-	curl := buildInstallCMDMode("TOK", "123", 18616816, "curl")
+	curl := buildInstallCMDMode("TOK", "123", 18616816, "curl", "v1.47.5")
 	for _, want := range []string{
 		"curl.exe", "--retry", "--retry-all-errors", "--max-time",
 		"18616816", "releases/assets/123", "ri $o -ea 0",
@@ -81,7 +100,7 @@ func TestBuildInstallCMDMode(t *testing.T) {
 		t.Fatal("curl mode must inline headers (no $h array)")
 	}
 	for _, m := range []string{"iwr", "curl", "bogus"} {
-		line, err := encodeCMD(buildInstallCMDMode("T", "1", 2, m))
+		line, err := encodeCMD(buildInstallCMDMode("T", "1", 2, m, "v9"))
 		if err != nil {
 			t.Fatalf("mode %q encode: %v", m, err)
 		}
@@ -92,7 +111,7 @@ func TestBuildInstallCMDMode(t *testing.T) {
 }
 
 func TestEncodeCMD(t *testing.T) {
-	line, err := encodeCMD(buildInstallCMD("T", "1", 2))
+	line, err := encodeCMD(buildInstallCMD("T", "1", 2, "v9"))
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}

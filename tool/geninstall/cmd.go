@@ -12,14 +12,25 @@ import (
 // short files (v1.47.3 post-mortem: iwr silently accepted an 8%
 // truncated binary and Start-Process "ran" it — "the cmd doesn't
 // update" with zero diagnostics). Pure, tested.
-func buildInstallCMD(token, assetID string, size int64) string {
-	return buildInstallCMDMode(token, assetID, size, "iwr")
+func buildInstallCMD(token, assetID string, size int64, tag string) string {
+	return buildInstallCMDMode(token, assetID, size, "iwr", tag)
 }
 
 // cmdMarker identifies the minter revision in every run (v1.47.3
 // follow-up: a hand-spliced stale copy wasted an evening — the first
 // output line now names exactly what is running).
 const cmdMarker = "rmm-install curl/5 relaunch/2"
+
+// cmdMarkerFor tags the canary with the target release (v1.47.5
+// post-mortem: visually identical pastes from different releases kept
+// getting mixed up — the first output line now proves WHICH release the
+// CMD installs, so a stale paste is caught before it runs).
+func cmdMarkerFor(tag string) string {
+	if tag == "" {
+		return cmdMarker
+	}
+	return cmdMarker + " " + tag
+}
 
 // ps1Marker is the same canary for the file-delivered variant (v1.47.3
 // follow-up two: a 2800-char chat paste arrived with invisible damage —
@@ -77,13 +88,13 @@ func curlFetch(authExpr, idExpr string) string {
 // Elevation note: whoami group check (proven for months across all
 // boxes; the .NET IsInRole shorthand failed type resolution on PS 5.1);
 // the outer encode cap (4000) enforces the budget on every mint.
-func buildInstallCMDMode(token, assetID string, size int64, mode string) string {
+func buildInstallCMDMode(token, assetID string, size int64, mode, tag string) string {
 	fetch := fmt.Sprintf(`try{iwr -Headers @{Authorization='Bearer %s';Accept='application/octet-stream'} -Uri https://api.github.com/repos/gibishahar-sudo/Controller-/releases/assets/%s -OutFile $o -TimeoutSec 600}catch{}`, token, assetID)
 	if mode == "curl" {
 		fetch = curlFetch(fmt.Sprintf(`'Authorization: Bearer %s'`, token), assetID)
 	}
 	parts := []string{
-		`Write-Host '` + cmdMarker + `'`,
+		`Write-Host '` + cmdMarkerFor(tag) + `'`,
 		`$o=($env:TEMP+'\A.exe')`,
 	}
 	return strings.Join(append(parts, installTail(fetch, fmt.Sprintf("%d", size))...), ";")

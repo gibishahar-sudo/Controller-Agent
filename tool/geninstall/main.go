@@ -51,7 +51,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "asset lookup:", err)
 		os.Exit(1)
 	}
-	line, err := encodeCMD(buildInstallCMDMode(token, id, size, mode))
+	line, err := encodeCMD(buildInstallCMDMode(token, id, size, mode, tag))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "encode:", err)
 		os.Exit(1)
