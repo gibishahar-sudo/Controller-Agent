@@ -19,6 +19,8 @@ func TestBuildInstallCMD(t *testing.T) {
 		"IsInRole",
 		"IsInRole(544)",
 		"not admin - approve the UAC prompt",
+		"Start-Process powershell -Verb RunAs",
+		"elevated installer exit=",
 		"UAC declined or unavailable",
 		"e='+$c.ExitCode",
 	} {
@@ -31,6 +33,9 @@ func TestBuildInstallCMD(t *testing.T) {
 	}
 	if strings.Contains(got, "whoami") {
 		t.Fatal("whoami spawn replaced by .NET role check")
+	}
+	if strings.Contains(got, "Start-Process $o '--silent' -Verb RunAs") {
+		t.Fatal("payload must never be RunAs'd directly (UAC names PowerShell now)")
 	}
 }
 

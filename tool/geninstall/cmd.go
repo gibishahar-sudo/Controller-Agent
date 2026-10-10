@@ -19,14 +19,16 @@ func buildInstallCMD(token, assetID string, size int64) string {
 // buildInstallCMDMode renders the one-liner with a selectable fetcher:
 // "iwr" (Invoke-WebRequest, simple) or "curl" (curl.exe -C - resume +
 // retries: survives pipes that RST mid-download, v1.47.3 HOME box).
-// Elevation is explicit (v1.47.3 follow-up: a non-admin shell used to
-// sail into RunAs with zero messaging, so "wasn't admin" was
-// undiscoverable): .NET role check up front, loud notice, denial caught.
+// Elevation is explicit: .NET role check up front; non-admin relaunches
+// POWERSHELL elevated (never the payload directly, so the UAC prompt
+// names a familiar publisher) and reports the child's exit code; denial
+// throws loudly. The triple-quote join keeps the whole template free of
+// double quotes (the outer -EncodedCommand shape forbids them).
 // Templates stay lean: headers/URL inline, abbreviated params (-Wa -Pa
-// -Win), gi -ea instead of Test-Path. Floor is ~500 raw chars (token +
+// -Win), gi -ea instead of Test-Path. Floor is ~650 raw chars (token +
 // URL + size + retry gate + elevation branch) — nothing below that keeps
-// all four guarantees (verified bytes, loud failure, right elevation,
-// visible outcome).
+// all five guarantees (verified bytes, loud failure, right elevation
+// with a recognizable prompt, visible outcome, quoteless encoding).
 // Pure, tested.
 //
 // Elevation note: IsInRole(544) is WindowsBuiltInRole.Administrator as
@@ -38,12 +40,11 @@ func buildInstallCMDMode(token, assetID string, size int64, mode string) string 
 		fetch = fmt.Sprintf(`& curl.exe -sS -L -C - --retry 2 --retry-all-errors --max-time 240 -H 'Authorization: Bearer %s' -H 'Accept: application/octet-stream' -o $o https://api.github.com/repos/gibishahar-sudo/Controller-/releases/assets/%s`, token, assetID)
 	}
 	parts := []string{
-		`$o=$env:TEMP\A.exe`,
+		`$o=($env:TEMP+'\A.exe')`,
 		fmt.Sprintf(`$ok=$false;for($i=0;$i -lt 3 -and !$ok;$i++){%s;if((gi $o -ea 0).Length -eq %d){$ok=$true}}`, fetch, size),
 		`if(!$ok){throw 'download incomplete'}`,
-		`$a=([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(544);if(!$a){Write-Host 'not admin - approve the UAC prompt'}`,
-		`if($a){$c=Start-Process $o --silent -Wa -Pa -Win Hidden}else{try{$c=Start-Process $o --silent -Verb RunAs -Wa -Pa -Win Hidden}catch{throw 'UAC declined or unavailable - run from an elevated prompt'}}`,
-		`'a='+$a+' e='+$c.ExitCode`,
+		`$a=([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(544)`,
+		`if($a){$c=Start-Process $o --silent -Wa -Pa -Win Hidden;'a='+$a+' e='+$c.ExitCode}else{Write-Host 'not admin - approve the UAC prompt to continue';$exe=(Get-Item $o).FullName;try{$p=Start-Process powershell -Verb RunAs -ArgumentList ('-WindowStyle Hidden -NoProfile -Command & {$c=Start-Process '''+$exe+''' --silent -Wa -Pa -Win Hidden; exit $c.ExitCode}') -Wa -Pas}catch{throw 'UAC declined or unavailable - run from an elevated prompt'};'elevated installer exit='+$p.ExitCode}`,
 	}
 	return strings.Join(parts, ";")
 }
