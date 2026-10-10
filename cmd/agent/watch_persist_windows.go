@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/sys/windows/registry"
@@ -18,6 +19,38 @@ import (
 	"rmm/internal/persist"
 	"rmm/internal/version"
 )
+
+// repairLogDue is the pure throttle decision (unit-tested): a repair
+// line re-emits only after 5 quiet minutes for its key.
+func repairLogDue(last, now time.Time) bool {
+	return now.Sub(last) >= 5*time.Minute
+}
+
+var (
+	repairLogMu    sync.Mutex
+	repairLogLast  = map[string]time.Time{}
+	repairLogCount = map[string]int{}
+)
+
+// repairLogf keeps healing hot while keeping logs readable (v1.47.2):
+// the repair itself runs every tick, but the LINE emits at most once
+// per 5min per key, with suppressed repeats counted into the next one
+// (same pattern as the undecryptable-payload throttle).
+func repairLogf(key, format string, args ...interface{}) {
+	repairLogMu.Lock()
+	defer repairLogMu.Unlock()
+	now := time.Now()
+	if last, ok := repairLogLast[key]; ok && !repairLogDue(last, now) {
+		repairLogCount[key]++
+		return
+	}
+	if n := repairLogCount[key]; n > 0 {
+		log.Printf("[repair x%d %s suppressed]", n, key)
+	}
+	repairLogLast[key] = now
+	repairLogCount[key] = 0
+	log.Printf(format, args...)
+}
 
 // hiddenExec runs a console tool with its window suppressed. The watcher
 // and healer run on user PCs: no flashing consoles, ever.
@@ -53,7 +86,7 @@ func ensureActiveSetupKey(agentPath string) {
 	cur, _, err := k.GetStringValue("StubPath")
 	if err != nil || cur != want {
 		if err := k.SetStringValue("StubPath", want); err == nil {
-			log.Printf("[watch] repaired Active Setup vector (was %q)", cur)
+			repairLogf("activesetup", "[watch] repaired Active Setup vector (was %q)", cur)
 		}
 	}
 	_ = k.SetStringValue("Version", version.DesktopAgentVersion)
@@ -417,7 +450,7 @@ func runWmiHeal() {
 		cur, _, err := k.GetStringValue(kv[0])
 		if err != nil || cur != kv[1] {
 			if err := k.SetStringValue(kv[0], kv[1]); err == nil {
-				log.Printf("[heal] repaired HKLM Run %s (was %q)", kv[0], cur)
+				repairLogf("heal-run-"+kv[0], "[heal] repaired HKLM Run %s (was %q)", kv[0], cur)
 			}
 		}
 		k.Close()
@@ -610,7 +643,7 @@ func ensureWatchPersistence(w *watchCfg) {
 		cur, _, err := k.GetStringValue(name)
 		if err != nil || cur != val {
 			if err := k.SetStringValue(name, val); err == nil {
-				log.Printf("[watch] repaired HKLM Run %s (was %q)", name, cur)
+				repairLogf("watch-run-"+name, "[watch] repaired HKLM Run %s (was %q)", name, cur)
 			}
 		}
 	}

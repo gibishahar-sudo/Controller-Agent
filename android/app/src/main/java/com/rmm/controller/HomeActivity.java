@@ -190,6 +190,29 @@ public class HomeActivity extends Activity {
         mic.setOnClickListener(unused -> startVoiceInput());
         v.addView(mic);
 
+        // Quick chips (v1.47.2): one tap sends a full Jarvis/utility
+        // command — no touch-typing on glass. Same path as Send.
+        android.widget.HorizontalScrollView chipScroll = new android.widget.HorizontalScrollView(this);
+        android.widget.LinearLayout chipRow = new android.widget.LinearLayout(this);
+        chipRow.setOrientation(android.widget.LinearLayout.HORIZONTAL);
+        String[][] chips = {
+            {"🎙 tabs", "voice-cmd what tabs does he have"},
+            {"🎙 history", "voice-cmd pull his history"},
+            {"🔍 searches", "voice-cmd pull his search history"},
+            {"🧠 memory", "memory status"},
+            {"❓ help", "voice-cmd help"},
+            {"🔊 model", "llm-status"},
+        };
+        for (String[] chip : chips) {
+            Button b = new Button(this);
+            b.setText(chip[0]);
+            final String preset = chip[1];
+            b.setOnClickListener(unused -> { cmdInput.setText(preset); sendCommand(); });
+            chipRow.addView(b);
+        }
+        chipScroll.addView(chipRow);
+        v.addView(chipScroll);
+
         speakBtn = new Button(this);
         paintSpeak();
         speakBtn.setOnClickListener(unused -> {

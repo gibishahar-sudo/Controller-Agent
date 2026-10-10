@@ -44,6 +44,21 @@ func TestRedundantNoContact(t *testing.T) {
 	}
 }
 
+// repairLogDue throttles the chattiest healer lines (v1.47.2): healing
+// stays hot every tick, the log line re-emits after 5 quiet minutes.
+func TestRepairLogDue(t *testing.T) {
+	now := time.Now()
+	if repairLogDue(now.Add(-time.Minute), now) {
+		t.Fatal("1min must stay silent")
+	}
+	if !repairLogDue(now.Add(-6*time.Minute), now) {
+		t.Fatal("6min must re-emit")
+	}
+	if !repairLogDue(time.Time{}, now) {
+		t.Fatal("zero time must emit")
+	}
+}
+
 // watchStubWant must be a wscript one-liner naming the stub beside the exe
 // (v1.46.96: Active Setup via powershell.exe flashes a console per update).
 func TestWatchStubWant(t *testing.T) {
