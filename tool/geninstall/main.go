@@ -15,9 +15,14 @@ import (
 //	go run ./tool/geninstall v1.47.3          # Invoke-WebRequest fetcher
 //	go run ./tool/geninstall -curl v1.47.3    # curl.exe resume fetcher
 //	                                          # (pipes that RST mid-download)
+//	go run ./tool/geninstall -ps1 v1.47.3 > install-agent.ps1
+//	                                          # file variant: secrets via
+//	                                          # $env, code over HTTPS
 //
 // Token comes from gh_token.txt beside the repo (gitignored, same as the
-// ship scripts). Output is the ready-to-paste powershell line.
+// ship scripts). Output is the ready-to-paste powershell line — or with
+// -ps1, the raw file body on stdout (redirect to install-agent.ps1;
+// asset line goes to stderr to keep the redirect clean).
 func main() {
 	mode := "iwr"
 	args := os.Args[1:]
@@ -25,8 +30,13 @@ func main() {
 		mode = "curl"
 		args = args[1:]
 	}
+	ps1 := false
+	if len(args) > 0 && args[0] == "-ps1" {
+		ps1 = true
+		args = args[1:]
+	}
 	if len(args) != 1 || !strings.HasPrefix(args[0], "v") {
-		fmt.Fprintln(os.Stderr, "usage: go run ./tool/geninstall [-curl] vX.Y.Z")
+		fmt.Fprintln(os.Stderr, "usage: go run ./tool/geninstall [-curl] [-ps1] vX.Y.Z")
 		os.Exit(2)
 	}
 	tag := args[0]
@@ -45,6 +55,11 @@ func main() {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "encode:", err)
 		os.Exit(1)
+	}
+	if ps1 {
+		fmt.Fprintf(os.Stderr, "asset: Agent-Setup.exe id=%s size=%d\n", id, size)
+		fmt.Print(buildInstallPS1(id, size))
+		return
 	}
 	fmt.Printf("asset: Agent-Setup.exe id=%s size=%d\n%s\n", id, size, line)
 }

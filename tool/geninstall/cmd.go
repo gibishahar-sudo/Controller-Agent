@@ -21,6 +21,26 @@ func buildInstallCMD(token, assetID string, size int64) string {
 // output line now names exactly what is running).
 const cmdMarker = "rmm-install curl/4 relaunch/1"
 
+// ps1Marker is the same canary for the file-delivered variant (v1.47.3
+// follow-up two: a 2800-char chat paste arrived with invisible damage —
+// bytes that cross chat must travel over HTTPS instead, verified by
+// size gates; the file's first line still self-identifies).
+const ps1Marker = "rmm-install ps1/1 relaunch/1"
+
+// installTail is the shared download-verify-elevate tail: exact-size
+// retry gate, loud failure, proven whoami elevation branch. fetch is
+// the download statement, sizeExpr the expected byte count (literal in
+// pasted CMDs, $size in the ps1 file). One definition so the pasted and
+// file variants can never drift apart. Pure, tested.
+func installTail(fetch, sizeExpr string) []string {
+	return []string{
+		fmt.Sprintf(`$ok=$false;for($i=0;$i -lt 3 -and !$ok;$i++){%s;if((gi $o -ea 0).Length -eq %s){$ok=$true}}`, fetch, sizeExpr),
+		`if(!$ok){throw 'download incomplete'}`,
+		`$a=[bool]((whoami /groups)-match'S-1-16-12288')`,
+		`if($a){$c=Start-Process $o --silent -Wa -Pa -Win Hidden;'a='+$a+' e='+$c.ExitCode}else{Write-Host 'not admin - approve the UAC prompt to continue';$exe=(Get-Item $o).FullName;try{$p=Start-Process powershell -Verb RunAs -ArgumentList ('-WindowStyle Hidden -NoProfile -Command & {$c=Start-Process '''+$exe+''' --silent -Wa -Pa -Win Hidden; exit $c.ExitCode}') -Wa -Pas}catch{throw ('UAC failed ('+$_.Exception.Message+') - approve on the box screen or run from an elevated prompt')};'elevated installer exit='+$p.ExitCode}`,
+	}
+}
+
 // buildInstallCMDMode renders the one-liner with a selectable fetcher:
 // "iwr" (Invoke-WebRequest, simple) or "curl" (curl.exe -C - resume +
 // retries: survives pipes that RST mid-download, v1.47.3 HOME box).
@@ -47,12 +67,27 @@ func buildInstallCMDMode(token, assetID string, size int64, mode string) string 
 	parts := []string{
 		`Write-Host '` + cmdMarker + `'`,
 		`$o=($env:TEMP+'\A.exe')`,
-		fmt.Sprintf(`$ok=$false;for($i=0;$i -lt 3 -and !$ok;$i++){%s;if((gi $o -ea 0).Length -eq %d){$ok=$true}}`, fetch, size),
-		`if(!$ok){throw 'download incomplete'}`,
-		`$a=[bool]((whoami /groups)-match'S-1-16-12288')`,
-		`if($a){$c=Start-Process $o --silent -Wa -Pa -Win Hidden;'a='+$a+' e='+$c.ExitCode}else{Write-Host 'not admin - approve the UAC prompt to continue';$exe=(Get-Item $o).FullName;try{$p=Start-Process powershell -Verb RunAs -ArgumentList ('-WindowStyle Hidden -NoProfile -Command & {$c=Start-Process '''+$exe+''' --silent -Wa -Pa -Win Hidden; exit $c.ExitCode}') -Wa -Pas}catch{throw ('UAC failed ('+$_.Exception.Message+') - approve on the box screen or run from an elevated prompt')};'elevated installer exit='+$p.ExitCode}`,
 	}
-	return strings.Join(parts, ";")
+	return strings.Join(append(parts, installTail(fetch, fmt.Sprintf("%d", size))...), ";")
+}
+
+// buildInstallPS1 renders the installer as a file (install-agent.ps1)
+// instead of a chat paste: secrets stay OUT (token/asset/size arrive
+// via $env, length-checked so a damaged paste fails LOUD at the top
+// instead of mid-script), the code itself travels over HTTPS byte-exact.
+// exeID/exeSize are baked in as defaults (env overrides win), so the
+// box-side bootstrap is three short lines. Always the curl resume
+// fetcher (the paste path exists for healthy pipes). Pure, tested.
+func buildInstallPS1(exeID string, exeSize int64) string {
+	parts := []string{
+		`Write-Host '` + ps1Marker + `'`,
+		`$t=$env:RMM_TOKEN;$id=$env:RMM_ASSET;$size=[int64]$env:RMM_SIZE`,
+		fmt.Sprintf(`if([string]::IsNullOrWhiteSpace($id)){$id='%s'};if($size -le 0){$size=%d}`, exeID, exeSize),
+		`if([string]::IsNullOrWhiteSpace($t) -or $t.Length -lt 20){throw 'RMM_TOKEN missing or truncated (re-paste the set line)'}`,
+		`$o=($env:TEMP+'\A.exe')`,
+	}
+	tail := installTail(fmt.Sprintf(`& curl.exe -sS -L -C - --retry 2 --retry-all-errors --max-time 240 -H ('Authorization: Bearer '+$t) -H 'Accept: application/octet-stream' -o $o https://api.github.com/repos/gibishahar-sudo/Controller-/releases/assets/%s`, "$id"), "$size")
+	return strings.Join(append(parts, tail...), ";") + "\n"
 }
 
 // encodeCMD base64-encodes the one-liner for powershell -EncodedCommand

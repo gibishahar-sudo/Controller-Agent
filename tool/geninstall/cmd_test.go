@@ -90,3 +90,42 @@ func TestEncodeCMD(t *testing.T) {
 		t.Fatal("double quotes must be refused")
 	}
 }
+
+func TestBuildInstallPS1(t *testing.T) {
+	got := buildInstallPS1("627496598", 18616816)
+	for _, want := range []string{
+		ps1Marker,
+		"$env:RMM_TOKEN",
+		"$env:RMM_ASSET",
+		"$env:RMM_SIZE",
+		"RMM_TOKEN missing or truncated",
+		"627496598",
+		"18616816",
+		"curl.exe",
+		"download incomplete",
+		"((whoami /groups)-match'",
+		"Start-Process powershell -Verb RunAs",
+		"elevated installer exit=",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("ps1 missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, `"`) {
+		t.Fatal("double quotes break chat-paste safety; keep single-only")
+	}
+	if strings.Contains(got, "Bearer ghp_") || strings.Contains(got, "Bearer TOK") {
+		t.Fatal("no secret may be baked into the file variant (env only)")
+	}
+	// Tail parity: pasted CMD and file ps1 share installTail — a fix in
+	// one reaches the other. Pin it from both sides.
+	cmdTail := installTail("FETCH", "SIZEEXPR")
+	for _, want := range []string{"FETCH", "SIZEEXPR", "download incomplete", "elevated installer exit="} {
+		if !strings.Contains(strings.Join(cmdTail, ";"), want) {
+			t.Fatalf("shared tail lost %q", want)
+		}
+	}
+	if !strings.Contains(got, "download incomplete") || !strings.Contains(got, "elevated installer exit=") {
+		t.Fatal("ps1 lost the shared tail")
+	}
+}
