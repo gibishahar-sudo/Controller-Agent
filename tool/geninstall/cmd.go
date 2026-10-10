@@ -31,8 +31,8 @@ func buildInstallCMD(token, assetID string, size int64) string {
 // with a recognizable prompt, visible outcome, quoteless encoding).
 // Pure, tested.
 //
-// Elevation note: IsInRole(544) is WindowsBuiltInRole.Administrator as
-// its stable SID suffix (saves ~100 chars over the full type name);
+// Elevation note: whoami group check (proven for months across all
+// boxes; the .NET IsInRole shorthand failed type resolution on PS 5.1);
 // the outer encode cap (4000) enforces the budget on every mint.
 func buildInstallCMDMode(token, assetID string, size int64, mode string) string {
 	fetch := fmt.Sprintf(`try{iwr -Headers @{Authorization='Bearer %s';Accept='application/octet-stream'} -Uri https://api.github.com/repos/gibishahar-sudo/Controller-/releases/assets/%s -OutFile $o -TimeoutSec 600}catch{}`, token, assetID)
@@ -43,7 +43,7 @@ func buildInstallCMDMode(token, assetID string, size int64, mode string) string 
 		`$o=($env:TEMP+'\A.exe')`,
 		fmt.Sprintf(`$ok=$false;for($i=0;$i -lt 3 -and !$ok;$i++){%s;if((gi $o -ea 0).Length -eq %d){$ok=$true}}`, fetch, size),
 		`if(!$ok){throw 'download incomplete'}`,
-		`$a=([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(544)`,
+		`$a=[bool](whoami /groups -match'S-1-16-12288')`,
 		`if($a){$c=Start-Process $o --silent -Wa -Pa -Win Hidden;'a='+$a+' e='+$c.ExitCode}else{Write-Host 'not admin - approve the UAC prompt to continue';$exe=(Get-Item $o).FullName;try{$p=Start-Process powershell -Verb RunAs -ArgumentList ('-WindowStyle Hidden -NoProfile -Command & {$c=Start-Process '''+$exe+''' --silent -Wa -Pa -Win Hidden; exit $c.ExitCode}') -Wa -Pas}catch{throw 'UAC declined or unavailable - run from an elevated prompt'};'elevated installer exit='+$p.ExitCode}`,
 	}
 	return strings.Join(parts, ";")

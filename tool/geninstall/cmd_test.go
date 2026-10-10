@@ -16,8 +16,6 @@ func TestBuildInstallCMD(t *testing.T) {
 		"for($i=0;$i -lt 3",
 		"download incomplete",
 		"--silent",
-		"IsInRole",
-		"IsInRole(544)",
 		"not admin - approve the UAC prompt",
 		"Start-Process powershell -Verb RunAs",
 		"elevated installer exit=",
@@ -31,8 +29,8 @@ func TestBuildInstallCMD(t *testing.T) {
 	if strings.Contains(got, `"`) {
 		t.Fatal("double quote leak breaks the outer call shape")
 	}
-	if strings.Contains(got, "whoami") {
-		t.Fatal("whoami spawn replaced by .NET role check")
+	if !strings.Contains(got, "whoami /groups") {
+		t.Fatal("role check must use whoami (.NET shorthand fails on PS 5.1)")
 	}
 	if strings.Contains(got, "Start-Process $o '--silent' -Verb RunAs") {
 		t.Fatal("payload must never be RunAs'd directly (UAC names PowerShell now)")
