@@ -94,10 +94,10 @@ a:hover{text-decoration:underline}
 .toolbar label{font-size:11px;color:var(--fg-dim)}
 .select{background:var(--bg-input);border:1px solid var(--border);color:var(--fg);padding:5px 8px;border-radius:6px;font-family:inherit;font-size:11px;outline:none}
 .screen-wrap{flex:1 1 auto;min-height:0;background:var(--bg-input);border:1px solid var(--border);border-radius:8px;overflow:hidden;position:relative;display:flex;align-items:center;justify-content:center}
-.screen-wrap img{max-width:100%;max-height:100%;object-fit:contain;display:block}
+.screen-wrap img, .screen-wrap canvas{width:100%;height:100%;object-fit:contain;display:block}
 .screen-wrap .placeholder{color:var(--fg-dim);font-size:13px;text-align:center;padding:20px}
 .screen-wrap:fullscreen{background:#000;border-radius:0}
-.screen-wrap:fullscreen img{max-width:100vw;max-height:100vh;width:100vw;height:100vh}
+.screen-wrap:fullscreen img, .screen-wrap:fullscreen canvas{max-width:100vw;max-height:100vh;width:100vw;height:100vh}
 #screenExitBtn{display:none;position:absolute;top:10px;right:10px;z-index:5}
 .screen-wrap:fullscreen #screenExitBtn{display:block}
 #remoteCursor{display:none;position:absolute;width:12px;height:12px;margin:0;border:2px solid #ff5252;border-radius:50%;background:rgba(255,82,82,.25);z-index:4;pointer-events:none}
@@ -809,7 +809,7 @@ function connectWS(){
           // arrives before pixels decode; clicks must map to visible
           // pixels, never to a frame still decoding).
           showScreen(m.data, fmt, {w:m.width||0, h:m.height||0, ox:(m.ox||0), oy:(m.oy||0), scale:(m.scale||1), fseq:(m.fseq||0)});
-          const sc=(m.scale&&m.scale<1)?" (½ res)":"";
+          const sc=(m.scale&&m.scale<1)?" ("+(m.scale===0.5?"½":m.scale===0.25?"¼":m.scale)+" res)":"";
           $("screenRes").textContent=m.width+"×"+m.height+" "+fmt.toUpperCase()+sc;
           topUpShots();
         } else { pushFrameStats(Date.now(), 0); topUpShots(); } // heartbeat: alive, nothing changed
@@ -1611,7 +1611,7 @@ function screenCanvas(){
     cv.id="screenImg";
     Object.defineProperty(cv,"naturalWidth",{get:()=>cv.width});
     Object.defineProperty(cv,"naturalHeight",{get:()=>cv.height});
-    cv.style.cssText="max-width:100%;max-height:100%;cursor:crosshair";
+    cv.style.cssText="width:100%;height:100%;object-fit:contain;cursor:crosshair";
     cv.title="Tap to move mouse, double-tap to click, pinch to zoom";
     wrap.appendChild(cv);
     bindScreenClick(); bindScreenPinch(); bindScreenWheel(); bindScreenFollow();

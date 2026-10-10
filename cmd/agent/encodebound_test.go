@@ -59,3 +59,27 @@ func TestEncodeBounded(t *testing.T) {
 		t.Fatalf("cap drifted: %d", keyframeByteCap)
 	}
 }
+
+// nextPushScale must ratchet both ways with sane stops (v1.47.3: the
+// old down-only ratchet stranded a 6fps stream at 480x270 forever).
+func TestNextPushScale(t *testing.T) {
+	cases := []struct {
+		cur  float64
+		up   bool
+		want float64
+	}{
+		{1, false, 0.5},
+		{0.5, false, 0.25},
+		{0.25, false, 0.25},
+		{0.25, true, 0.5},
+		{0.5, true, 1},
+		{1, true, 1},
+		{0.75, false, 0.5},
+		{0.75, true, 1},
+	}
+	for _, c := range cases {
+		if got := nextPushScale(c.cur, c.up); got != c.want {
+			t.Fatalf("scale(%v,%v) = %v want %v", c.cur, c.up, got, c.want)
+		}
+	}
+}

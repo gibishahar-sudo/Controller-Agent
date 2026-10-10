@@ -1175,7 +1175,7 @@ func (a *agent) startPushStream(send func(protocol.Message) error, quality, moni
 		q, qHi, scCur := q0, q0, sc0
 		interval := baseInterval
 		var emaMs float64
-		var sendFails, idleBeats int
+		var sendFails, idleBeats, fastStreak int
 		var bEmaMs float64 // stage B's own pace (diff+encode+send): paces stage A
 		lastPace := paceCtl{interval: interval, q: q, sc: scCur}
 		maybeSendPace := func() {
@@ -1254,29 +1254,37 @@ func (a *agent) startPushStream(send func(protocol.Message) error, quality, moni
 					maybeSendPace()
 					continue
 				}
-				// Adaptive resolution: quality already floored at 40 and the
-				// box still can't keep up on REAL frames (heartbeats don't
-				// count — stillness must never cost detail). Steps down
-				// 1.0->0.5->0.25, never up within a stream (oscillation
-				// costs a keyframe + geometry jump each way; stability
-				// wins). A stream restart restores the requested scale.
-				// The tile key includes scale, so each step keyframes once.
-				realFrame := false
-				for _, m := range msgs {
-					if m.Data != "" {
-						realFrame = true
-						break
-					}
+			// Adaptive resolution: quality already floored and the box
+			// still can't keep up on REAL frames (heartbeats don't
+			// count — stillness must never cost detail). Steps down
+			// 1.0->0.5->0.25, and back up after sustained headroom
+			// (60 fast real frames — hysteresis against oscillation,
+			// which costs a keyframe + geometry jump each way). Never
+			// above the requested scale. The tile key includes scale,
+			// so each step keyframes once.
+			realFrame := false
+			for _, m := range msgs {
+				if m.Data != "" {
+					realFrame = true
+					break
 				}
-				if realFrame && emaMs > 100 && q <= pushMinQuality && scCur > 0.25 {
+			}
+			if realFrame && emaMs > 100 && q <= pushMinQuality && scCur > 0.25 {
+				prevSc := scCur
+				scCur = nextPushScale(scCur, false)
+				fastStreak = 0
+				dlog.Printf("[push] weak box: resolution %.2g->%.2g", prevSc, scCur)
+			} else if realFrame && emaMs < 50 && scCur < sc0 {
+				fastStreak++
+				if fastStreak >= 60 {
+					fastStreak = 0
 					prevSc := scCur
-					if scCur > 0.5 {
-						scCur = 0.5
-					} else {
-						scCur = 0.25
-					}
-					dlog.Printf("[push] weak box: resolution %.2g->%.2g (restores on restart)", prevSc, scCur)
+					scCur = nextPushScale(scCur, true)
+					dlog.Printf("[push] headroom: resolution %.2g->%.2g", prevSc, scCur)
 				}
+			} else {
+				fastStreak = 0
+			}
 				sendFails = 0
 				// Idle backoff: heartbeats (nothing changed) slow the pace
 				// 25ms -> 100ms -> 250ms so an idle box stops burning a
@@ -1373,6 +1381,28 @@ func encodeBounded(img image.Image, q, floorQ, maxBytes int) ([]byte, int) {
 		if q < floorQ {
 			q = floorQ
 		}
+	}
+}
+
+// nextPushScale steps stream resolution one notch (v1.47.3: the old
+// one-way ratchet stranded streams at quarter-res forever — the box in
+// the screenshot sat at 480x270 with 6fps of headroom). Pure, tested.
+func nextPushScale(scCur float64, up bool) float64 {
+	if up {
+		switch {
+		case scCur < 0.5:
+			return 0.5
+		case scCur < 1:
+			return 1
+		default:
+			return scCur
+		}
+	}
+	switch {
+	case scCur > 0.5:
+		return 0.5
+	default:
+		return 0.25
 	}
 }
 
