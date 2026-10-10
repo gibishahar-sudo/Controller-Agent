@@ -56,6 +56,33 @@ func TestStealthDefaultLimits(t *testing.T) {
 	}
 }
 
+// QuietLimits is the barely-noticeable preset: legal minimums on every
+// axis (v1.47.4 "limit-agent quiet").
+func TestQuietLimits(t *testing.T) {
+	q := QuietLimits()
+	if q.CPU != 5 || q.MemMB != 256 || q.Prio != "idle" {
+		t.Fatalf("quiet = %+v", q)
+	}
+	if _, err := ParseAgentLimits("cpu=5 mem=256 prio=idle"); err != nil {
+		t.Fatalf("preset must pass the parser's own floors: %v", err)
+	}
+}
+
+// ExpandLimitPreset rewrites only the bare preset, byte-identical else.
+func TestExpandLimitPreset(t *testing.T) {
+	if got := ExpandLimitPreset("quiet"); got != "cpu=5 mem=256 prio=idle" {
+		t.Fatalf("quiet = %q", got)
+	}
+	if got := ExpandLimitPreset("  QUIET  "); got != "cpu=5 mem=256 prio=idle" {
+		t.Fatalf("QUIET = %q", got)
+	}
+	for _, passthrough := range []string{"", "clear", "cpu=10", "cpu=5 mem=256 prio=idle", "quieter", "unquiet"} {
+		if got := ExpandLimitPreset(passthrough); got != passthrough {
+			t.Fatalf("passthrough %q mangled to %q", passthrough, got)
+		}
+	}
+}
+
 func TestLimitsReportSmoke(t *testing.T) {
 	// Read-only syscalls only: must never error on a healthy box.
 	rep, err := limitsReport()

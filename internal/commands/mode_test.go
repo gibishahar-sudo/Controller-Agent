@@ -51,3 +51,15 @@ func TestSetAgentModeRejects(t *testing.T) {
 		}
 	}
 }
+
+// limit-agent rides everywhere agent-limits does (v1.47.4 alias).
+func TestModeAllowsLimitAgent(t *testing.T) {
+	for _, m := range []string{ModeNormal, ModePerformance, ModeStealth, ModeSpy, ModeGhost, ModeKiosk, ModeAudit} {
+		if !modeAllows(m, "limit-agent") {
+			t.Fatalf("mode %q must allow limit-agent", m)
+		}
+		if !modeAllows(m, "agent-limits") {
+			t.Fatalf("mode %q must allow agent-limits", m)
+		}
+	}
+}

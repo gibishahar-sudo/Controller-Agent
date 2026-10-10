@@ -519,6 +519,27 @@ func TestWhatIsRecall(t *testing.T) {
 	}
 }
 
+func TestQuietBranch(t *testing.T) {
+	s := ordTestServer()
+	for _, in := range []string{
+		"voice-cmd limit-agent quiet",
+		"voice-cmd make him quiet",
+		"voice-cmd go quiet",
+		"voice-cmd low profile",
+		"voice-cmd barely noticeable",
+		"voice-cmd quiet",
+	} {
+		h, _, run, _, _ := s.tryVoiceCmd(nil, in, "c1")
+		if !h || run != "limit-agent quiet" {
+			t.Fatalf("%q: handled=%v run=%q", in, h, run)
+		}
+	}
+	h, _, run, rep, _ := s.tryVoiceCmd(nil, "voice-cmd be quiet", "c2")
+	if !h || run != "" || !strings.Contains(rep, "🔊") {
+		t.Fatalf("be quiet = mute pointer: handled=%v run=%q rep=%q", h, run, rep)
+	}
+}
+
 func TestPickVoiceReply(t *testing.T) {
 	s := memTestServer()
 	if _, _, ok := s.pickVoiceReply(0); ok {

@@ -100,6 +100,16 @@ func parseVoiceCmd(text, hostname string) (handled bool, run, reply string) {
 	if hasAny(s, "remember", "recall", "what do you remember", "forget ", "forget his", "forget that", "who is ", "who's ", "whats his name", "what's his name", "his name") {
 		return say("Say it fuller: 'remember <fact>', 'what do you remember?', 'forget <word>', 'who is <name>' — or 'memory status'.")
 	}
+	// Quiet box: barely-noticeable caps (v1.47.4). "Be quiet / shut up"
+	// means HER (mute pointer); everything else means the box. Memory
+	// utterances never reach here (guard above answers first).
+	if hasAny(s, "be quiet", "shut up", "quiet down") {
+		return say("That's the 🔊 button next to the mic — I only quiet the box on 'limit him'.")
+	}
+	if hasAny(s, "limit-agent", "limit him", "make him quiet", "go quiet", "low profile", "barely noticeable", "quiet mode") ||
+		s == "quiet" {
+		return true, "limit-agent quiet", ""
+	}
 	// Bare ordinals with no listing behind them.
 	if hasAny(s, "first one", "second one", "third one", "fourth one", "fifth one", "that one", "those", "the other one") &&
 		!hasAny(s, "open ", "pull", "history", "tabs") {

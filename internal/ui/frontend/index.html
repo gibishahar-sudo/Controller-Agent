@@ -482,6 +482,7 @@ html{touch-action:manipulation}
         <select id="limitPrio" class="select" title="Process priority"><option value="">prio</option><option value="idle">idle</option><option value="below">below</option><option value="normal">normal</option></select>
         <button class="btn btn-small" id="limitSet">Set</button>
         <button class="btn btn-small" id="limitClear" title="Lift explicit caps">Clear</button>
+        <button class="btn btn-small" id="limitQuiet" title="Barely noticeable: cpu=5 mem=256 prio=idle">🤫 Quiet</button>
         <button class="btn btn-small" id="limitRefresh" title="Refresh from selected agent">⟳</button>
       </div>
       <div id="cmdFavs" class="cmd-favs"><span style="font-size:11px;color:#888">Favorites:</span>
@@ -3236,6 +3237,11 @@ $("limitClear")?.addEventListener("click", ()=>{
   if(!needAgent()) return;
   pendingLimitsCheck=true;
   sendCmdVal("agent-limits clear");
+});
+$("limitQuiet")?.addEventListener("click", ()=>{
+  if(!needAgent()) return;
+  pendingLimitsCheck=true;
+  sendCmdVal("limit-agent quiet");
 });
 document.addEventListener("keydown", e=>{ if(e.ctrlKey&&e.shiftKey&&e.key.toLowerCase()==="r"){ e.preventDefault(); const cur=$("cmdInput")?.value.trim(); if(cur) addTerm("Recorded: "+cur,"out"); }});
 

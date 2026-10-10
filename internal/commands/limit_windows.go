@@ -83,6 +83,24 @@ func StealthDefaultLimits() AgentLimits {
 	return AgentLimits{CPU: 15, MemMB: 512, Prio: "idle"}
 }
 
+// QuietLimits is the barely-noticeable preset behind "limit-agent
+// quiet": the legal minimums on every axis (cpu floor 5, mem floor
+// 128MB, idle priority). Pure, tested.
+func QuietLimits() AgentLimits {
+	return AgentLimits{CPU: 5, MemMB: 256, Prio: "idle"}
+}
+
+// ExpandLimitPreset rewrites the "quiet" preset to explicit key=value
+// args (v1.47.4: "limit-agent quiet"); anything else passes through
+// byte-identical. Pure, tested.
+func ExpandLimitPreset(args string) string {
+	if strings.EqualFold(strings.TrimSpace(args), "quiet") {
+		q := QuietLimits()
+		return fmt.Sprintf("cpu=%d mem=%d prio=%s", q.CPU, q.MemMB, q.Prio)
+	}
+	return args
+}
+
 // ParseAgentLimits parses "cpu=15 mem=512 prio=idle" (any subset, any
 // order). Pure for unit tests.
 func ParseAgentLimits(args string) (AgentLimits, error) {

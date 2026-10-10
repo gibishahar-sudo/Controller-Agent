@@ -106,7 +106,7 @@ func modeAllows(mode, cmd string) bool {
 		// listed here for documentation; set-mode itself bypasses.)
 		switch cmd {
 		case "get-status", "get-version", "version", "get-mode",
-			"set-mode", "agent-limits", "kill-agent", "agent-kill", "agent-exit",
+			"set-mode", "agent-limits", "limit-agent", "kill-agent", "agent-kill", "agent-exit",
 			"play-troll", "stop-troll":
 			return true
 		}
@@ -115,7 +115,7 @@ func modeAllows(mode, cmd string) bool {
 		// Screen + input only: look and click, no damage possible.
 		switch cmd {
 		case "get-status", "get-version", "version", "get-mode",
-			"set-mode", "agent-limits",
+			"set-mode", "agent-limits", "limit-agent",
 			"get-screen-size", "get-display-info", "get-monitors",
 			"get-active-window", "get-foreground-window", "get-position",
 			"mouse-move", "mouse-click", "mouse-button", "mouse-scroll",
@@ -128,7 +128,7 @@ func modeAllows(mode, cmd string) bool {
 		// Read-only: observe + download, never write.
 		switch cmd {
 		case "get-status", "get-version", "version", "get-mode",
-			"set-mode", "agent-limits",
+			"set-mode", "agent-limits", "limit-agent",
 			"get-hostname", "get-username", "get-os-version",
 			"get-system-info", "get-cpu-info", "get-cpu-usage",
 			"get-memory-usage", "get-disk-usage", "get-disk-health",

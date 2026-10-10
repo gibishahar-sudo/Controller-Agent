@@ -172,8 +172,8 @@ func Execute(cmd, args string) (string, error) {
 		return SetAgentToken(args)
 	case "get-mode":
 		return AgentMode(), nil
-	case "agent-limits":
-		return AgentLimitsCmd(args)
+	case "agent-limits", "limit-agent":
+		return AgentLimitsCmd(ExpandLimitPreset(args))
 	case "set-mode":
 		return SetAgentMode(args)
 	case "get-spy-log":

