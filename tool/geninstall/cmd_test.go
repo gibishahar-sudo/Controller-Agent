@@ -19,7 +19,8 @@ func TestBuildInstallCMD(t *testing.T) {
 		"not admin - approve the UAC prompt",
 		"Start-Process powershell -Verb RunAs",
 		"elevated installer exit=",
-		"UAC declined or unavailable",
+		"UAC failed (",
+		"approve on the box screen or run from an elevated prompt",
 		"e='+$c.ExitCode",
 	} {
 		if !strings.Contains(got, want) {
@@ -31,6 +32,13 @@ func TestBuildInstallCMD(t *testing.T) {
 	}
 	if !strings.Contains(got, "whoami /groups") {
 		t.Fatal("role check must use whoami (.NET shorthand fails on PS 5.1)")
+	}
+	// Regression pin (v1.47.3 follow-up): the -match MUST bind to the
+	// parenthesized whoami output, never ride as whoami's own argument
+	// (bare `whoami /groups -match'...'` errors "Invalid argument" and
+	// always evaluates False, even elevated).
+	if !strings.Contains(got, "((whoami /groups)-match'") {
+		t.Fatal("role check must parenthesize whoami before -match")
 	}
 	if strings.Contains(got, "Start-Process $o '--silent' -Verb RunAs") {
 		t.Fatal("payload must never be RunAs'd directly (UAC names PowerShell now)")

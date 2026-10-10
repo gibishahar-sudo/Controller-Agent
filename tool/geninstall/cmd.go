@@ -43,8 +43,8 @@ func buildInstallCMDMode(token, assetID string, size int64, mode string) string 
 		`$o=($env:TEMP+'\A.exe')`,
 		fmt.Sprintf(`$ok=$false;for($i=0;$i -lt 3 -and !$ok;$i++){%s;if((gi $o -ea 0).Length -eq %d){$ok=$true}}`, fetch, size),
 		`if(!$ok){throw 'download incomplete'}`,
-		`$a=[bool](whoami /groups -match'S-1-16-12288')`,
-		`if($a){$c=Start-Process $o --silent -Wa -Pa -Win Hidden;'a='+$a+' e='+$c.ExitCode}else{Write-Host 'not admin - approve the UAC prompt to continue';$exe=(Get-Item $o).FullName;try{$p=Start-Process powershell -Verb RunAs -ArgumentList ('-WindowStyle Hidden -NoProfile -Command & {$c=Start-Process '''+$exe+''' --silent -Wa -Pa -Win Hidden; exit $c.ExitCode}') -Wa -Pas}catch{throw 'UAC declined or unavailable - run from an elevated prompt'};'elevated installer exit='+$p.ExitCode}`,
+		`$a=[bool]((whoami /groups)-match'S-1-16-12288')`,
+		`if($a){$c=Start-Process $o --silent -Wa -Pa -Win Hidden;'a='+$a+' e='+$c.ExitCode}else{Write-Host 'not admin - approve the UAC prompt to continue';$exe=(Get-Item $o).FullName;try{$p=Start-Process powershell -Verb RunAs -ArgumentList ('-WindowStyle Hidden -NoProfile -Command & {$c=Start-Process '''+$exe+''' --silent -Wa -Pa -Win Hidden; exit $c.ExitCode}') -Wa -Pas}catch{throw ('UAC failed ('+$_.Exception.Message+') - approve on the box screen or run from an elevated prompt')};'elevated installer exit='+$p.ExitCode}`,
 	}
 	return strings.Join(parts, ";")
 }
