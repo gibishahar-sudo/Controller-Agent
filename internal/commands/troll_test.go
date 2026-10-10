@@ -13,8 +13,7 @@ func TestPlayTrollUsage(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("non-windows refusal path only")
 	}
-	if _, err := playTroll(""); err == nil || !strings.Contains(err.Error(), "not supported") {
-		t.Fatalf("err = %v, want not supported", err)
+	if _, err := playTroll(""); err == nil || !strings.Contains(err.Error(), "not supported") {		t.Fatalf("err = %v, want not supported", err)
 	}
 	if _, err := stopTroll(); err == nil || !strings.Contains(err.Error(), "not supported") {
 		t.Fatalf("stop err = %v, want not supported", err)
@@ -621,3 +620,4 @@ func TestTrollSelftest(t *testing.T) {
 		}
 	}
 }
+

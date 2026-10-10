@@ -19,8 +19,7 @@ import (
 // vote: unknown phrases must run, not lecture).
 
 // voiceSites fuzzy-matches spoken site names to URLs for "open X".
-var voiceSites = map[string]string{
-	"youtube":  "https://www.youtube.com",
+var voiceSites = map[string]string{	"youtube":  "https://www.youtube.com",
 	"gmail":    "https://mail.google.com",
 	"facebook": "https://www.facebook.com",
 	"whatsapp": "https://web.whatsapp.com",
@@ -40,6 +39,8 @@ var voiceSites = map[string]string{
 	"chatgpt":  "https://chatgpt.com",
 	"x":        "https://x.com",
 	"twitter":  "https://x.com",
+	"new tab":  "chrome://newtab",
+	"newtab":   "chrome://newtab",
 }
 
 var jarvisPrefix = regexp.MustCompile(`^(hey[ ,]+)?jarvis([,. ]+|$)`)
@@ -65,13 +66,29 @@ func isVoiceCmd(cmd string) bool {
 
 // parseVoiceCmd maps operator text to an action. run = agent command to
 // execute instead ("" = none); reply = direct operator text ("" = none).
-// handled=false means "not a voice command shape at all / unknown" — the
-// caller must pass the text on untouched.
+// handled=false means "shape unknown" — since v1.46.97 the caller answers
+// with best guesses INSTEAD of forwarding: every forward died as
+// 'not recognized' (the agent has no voice-cmd verb), so the old
+// "unknown phrases must run" vote is retired.
 func parseVoiceCmd(text, hostname string) (handled bool, run, reply string) {
 	s := normVoice(text)
 	_ = hostname // selection only matters for memory retargeting (tryVoiceCmd layer)
-	say := func(t string) (bool, string, string) { return true, "", "🎙 "+t }
+	say := func(t string) (bool, string, string) { return true, "", "🎙 " + t }
 
+	// "can you X" -> X ("can you open youtube" acts; bare "can you do" helps).
+	if rest, ok := cutPrefixWord(s, "can you"); ok {
+		if rest == "" || rest == "do" || rest == "help" {
+			return say(voiceHelpText())
+		}
+		s = rest
+	}
+	// "show me X" -> X ("show me the tabs" reads tabs).
+	if rest, ok := cutPrefixWord(s, "show me"); ok {
+		if rest == "" {
+			return say(voiceHelpText())
+		}
+		s = rest
+	}
 	if s == "" {
 		return say("Yes? Tell me what to do — try: what tabs does he have.")
 	}
@@ -97,8 +114,8 @@ func parseVoiceCmd(text, hostname string) (handled bool, run, reply string) {
 		}
 		return true, "get-chrome-history 20", ""
 	}
-	// Tabs / browsing.
-	if hasAny(s, "tab", "brows") {
+	// Tabs / browsing ("open a new tab" belongs to open below).
+	if hasAny(s, "tab", "brows") && !strings.Contains(s, "new tab") {
 		return true, "get-chrome-tabs", ""
 	}
 	// Live activity.
@@ -116,7 +133,7 @@ func parseVoiceCmd(text, hostname string) (handled bool, run, reply string) {
 		}
 		var kept []string
 		for _, tok := range strings.Fields(rest) {
-			if tok == "please" || tok == "up" {
+			if tok == "please" || tok == "up" || tok == "a" || tok == "the" {
 				continue
 			}
 			kept = append(kept, tok)
@@ -251,7 +268,10 @@ var searchViewTriggers = map[string]bool{
 // history pull (no new run). Matched=true whenever the trigger fires,
 // even to say "pull history first" or "no searches in that pull".
 func (s *Server) historySearchesReply(snorm string) (tac *AgentConn, run, reply string, matched bool) {
-	if !searchViewTriggers[snorm] {
+	if !searchViewTriggers[snorm] &&
+		!strings.Contains(snorm, "only search") &&
+		!strings.Contains(snorm, "just search") &&
+		!strings.Contains(snorm, "search filter") {
 		return nil, "", "", false
 	}
 	say := func(t string) (*AgentConn, string, string, bool) { return nil, "", t, true }
@@ -403,7 +423,8 @@ func (s *Server) parseMemoryCmd(text, host string, viaMemory bool) (bool, *Agent
 // name-aware tryVoiceCmd path share it).
 func isHelpRequest(s string) bool {
 	switch s {
-	case "help", "what can you do", "commands", "what can i ask", "help me", "what do you do":
+	case "help", "what can you do", "commands", "what can i ask", "help me", "what do you do",
+		"can you do", "can you", "what can you do for me":
 		return true
 	}
 	return false
@@ -961,6 +982,11 @@ func (s *Server) memoryRecall(scope, host string) (bool, *AgentConn, string, str
 	if scope != "" {
 		rh, ok := s.memoryScopeHost(scope)
 		if !ok {
+			// Fall back to fact-text search ("what is this pc" finds
+			// "this is the pc at my mom's house").
+			if hits := s.memorySearchFacts(scope); len(hits) > 0 {
+				return say("Here's what I know about " + scope + ":\n" + strings.Join(hits, "\n"))
+			}
 			return say("I don't know '" + scope + "'.")
 		}
 		h, disp = rh, scope
@@ -995,6 +1021,35 @@ func (s *Server) memoryRecall(scope, host string) (bool, *AgentConn, string, str
 	s.voice.recall = &voiceResult{lines: lines[1:], host: h, at: time.Now()}
 	s.voiceMu.Unlock()
 	return say(b.String())
+}
+
+// memorySearchFacts finds stored facts containing frag (fillers
+// stripped), rendered "host: fact", capped at 10 across hosts sorted.
+// Powers "what is X" recall for things that were never bound as names.
+func (s *Server) memorySearchFacts(frag string) []string {
+	frag = strings.ToLower(strings.TrimSpace(stripFillers(strings.ToLower(strings.TrimSpace(frag)))))
+	if frag == "" {
+		return nil
+	}
+	s.memoryMu.Lock()
+	defer s.memoryMu.Unlock()
+	var hosts []string
+	for h := range s.memory.Agents {
+		hosts = append(hosts, h)
+	}
+	sort.Strings(hosts)
+	var out []string
+	for _, h := range hosts {
+		for _, f := range s.memory.Agents[h].Facts {
+			if strings.Contains(strings.ToLower(f), frag) {
+				out = append(out, h+": "+f)
+			}
+		}
+		if len(out) >= 10 {
+			break
+		}
+	}
+	return out
 }
 
 func (s *Server) memoryWhoIs(name string) (bool, *AgentConn, string, string) {
@@ -1513,9 +1568,11 @@ func parseRememberFact(s string) (fact, scope string, ok bool) {
 	return strings.TrimSpace(fact), strings.TrimSpace(scope), strings.TrimSpace(fact) != ""
 }
 
-// parseRecall matches recall verbs with optional scope.
+// parseRecall matches recall verbs with optional scope. Activity-shaped
+// scopes ("he doing", "active window") decline so P1's live-activity
+// branch answers them instead of the fact store.
 func parseRecall(s string) (scope string, ok bool) {
-	verbs := []string{"what do you remember", "recall", "list facts", "my notes", "show facts"}
+	verbs := []string{"what do you remember", "what do you know about", "recall", "list facts", "my notes", "show facts", "tell me about", "what is"}
 	matched := false
 	rest := s
 	for _, v := range verbs {
@@ -1525,6 +1582,10 @@ func parseRecall(s string) (scope string, ok bool) {
 		}
 	}
 	if !matched {
+		return "", false
+	}
+	// Activity-shaped scopes belong to P1's live window, not the store.
+	if hasAny(rest, "doing", "active window", "looking at", "working on", "foreground") {
 		return "", false
 	}
 	if scope, ok := cutAbout(rest); ok {

@@ -200,31 +200,55 @@ func trollEngine(codec string, indexOK, edgeOK bool) (string, error) {
 	return "wpf", nil
 }
 
+// splitTrollArgs parses "<path|url> [seconds] [noloop]" from the right:
+// trailing noloop, then trailing all-digit seconds, the rest is the path
+// (quoted or not, spaces allowed — v1.47.1: naive Fields splitting broke
+// every path with a space). A trailing bare number is always seconds
+// (out-of-range non-positive is a usage error, over-max clamps).
+// Pure, tested.
+func splitTrollArgs(arg string) (src string, secs int, loop bool, ok bool) {
+	secs = defaultTrollSeconds
+	loop = true
+	rest := strings.TrimSpace(arg)
+	if rest == "" {
+		return "", 0, true, false
+	}
+	cutLast := func() string {
+		f := strings.Fields(rest)
+		return strings.TrimSpace(rest[:len(rest)-len(f[len(f)-1])])
+	}
+	if f := strings.Fields(rest); len(f) > 0 && strings.EqualFold(f[len(f)-1], "noloop") {
+		loop = false
+		rest = cutLast()
+	}
+	if f := strings.Fields(rest); len(f) > 1 {
+		if v, err := strconv.Atoi(f[len(f)-1]); err == nil {
+			if v <= 0 {
+				return "", 0, true, false
+			}
+			if v > maxTrollSeconds {
+				v = maxTrollSeconds
+			}
+			secs = v
+			rest = cutLast()
+		}
+	}
+	src = strings.Trim(strings.TrimSpace(rest), `"`)
+	if src == "" {
+		return "", 0, true, false
+	}
+	return src, secs, loop, true
+}
+
 // play-troll <path|url> [seconds] [noloop]
 // seconds: 1-3600, default 300. noloop: play once then auto-close.
 func playTroll(arg string) (string, error) {
 	if runtime.GOOS != "windows" {
 		return "", fmt.Errorf("not supported on %s", runtime.GOOS)
 	}
-	fields := strings.Fields(strings.TrimSpace(arg))
-	if len(fields) == 0 {
+	src, secs, loop, ok := splitTrollArgs(arg)
+	if !ok {
 		return "", fmt.Errorf("usage: play-troll <path|url> [seconds 1-3600] [noloop]")
-	}
-	src := fields[0]
-	secs := defaultTrollSeconds
-	loop := true
-	if len(fields) >= 2 {
-		n, err := strconv.Atoi(fields[1])
-		if err != nil || n <= 0 {
-			return "", fmt.Errorf("usage: play-troll <path|url> [seconds 1-3600] [noloop]")
-		}
-		if n > maxTrollSeconds {
-			n = maxTrollSeconds
-		}
-		secs = n
-	}
-	if len(fields) >= 3 && strings.EqualFold(fields[2], "noloop") {
-		loop = false
 	}
 
 	// Serialize with other GUI spawns (see guiSpawnMu): a previous

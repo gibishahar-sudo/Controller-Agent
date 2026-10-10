@@ -475,6 +475,50 @@ func TestSuggestIntents(t *testing.T) {
 	}
 }
 
+func TestCanYouAndShowMe(t *testing.T) {
+	s := ordTestServer()
+	ac := &AgentConn{id: "a1", hostname: "DCHQHAK", user: "Admin", version: "1.46.97"}
+	h, _, run, rep, _ := s.tryVoiceCmd(ac, "voice-cmd can you do", "c1")
+	if !h || run != "" || !strings.Contains(rep, "Try:") {
+		t.Fatalf("can you do = help: handled=%v run=%q rep=%q", h, run, rep)
+	}
+	h, _, run, _, _ = s.tryVoiceCmd(ac, "voice-cmd can you open youtube", "c2")
+	if !h || run != "open-url chrome https://www.youtube.com" {
+		t.Fatalf("can you open: handled=%v run=%q", h, run)
+	}
+	h, _, run, _, _ = s.tryVoiceCmd(ac, "voice-cmd show me the tabs", "c3")
+	if !h || run != "get-chrome-tabs" {
+		t.Fatalf("show tabs: handled=%v run=%q", h, run)
+	}
+	h, _, run, _, _ = s.tryVoiceCmd(ac, "voice-cmd show me history", "c4")
+	if !h || run != "get-chrome-history 20" {
+		t.Fatalf("show history: handled=%v run=%q", h, run)
+	}
+	h, _, run, _, _ = s.tryVoiceCmd(ac, "voice-cmd open a new tab", "c5")
+	if !h || run != "open-url chrome chrome://newtab" {
+		t.Fatalf("new tab: handled=%v run=%q", h, run)
+	}
+	h, _, run, _, _ = s.tryVoiceCmd(ac, "voice-cmd what is he doing", "c6")
+	if !h || run != "get-active-window" {
+		t.Fatalf("doing guard: handled=%v run=%q", h, run)
+	}
+}
+
+func TestWhatIsRecall(t *testing.T) {
+	s := memTestServer()
+	s.memoryMu.Lock()
+	s.memory.Agents["DESKTOP-DCHQHAK"] = &agentMemory{Facts: []string{"this is the pc at my mom's house"}}
+	s.memoryMu.Unlock()
+	h, _, run, rep, _ := s.tryVoiceCmd(nil, "voice-cmd what is this pc", "c1")
+	if !h || run != "" || !strings.Contains(rep, "mom's") {
+		t.Fatalf("what-is recall: handled=%v run=%q rep=%q", h, run, rep)
+	}
+	h, _, run, rep, _ = s.tryVoiceCmd(nil, "voice-cmd tell me about the pc", "c2")
+	if !h || run != "" || !strings.Contains(rep, "mom's") {
+		t.Fatalf("tell-me recall: handled=%v run=%q rep=%q", h, run, rep)
+	}
+}
+
 func TestPickVoiceReply(t *testing.T) {
 	s := memTestServer()
 	if _, _, ok := s.pickVoiceReply(0); ok {
