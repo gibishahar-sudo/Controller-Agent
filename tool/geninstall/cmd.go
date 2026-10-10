@@ -16,6 +16,11 @@ func buildInstallCMD(token, assetID string, size int64) string {
 	return buildInstallCMDMode(token, assetID, size, "iwr")
 }
 
+// cmdMarker identifies the minter revision in every run (v1.47.3
+// follow-up: a hand-spliced stale copy wasted an evening — the first
+// output line now names exactly what is running).
+const cmdMarker = "rmm-install curl/4 relaunch/1"
+
 // buildInstallCMDMode renders the one-liner with a selectable fetcher:
 // "iwr" (Invoke-WebRequest, simple) or "curl" (curl.exe -C - resume +
 // retries: survives pipes that RST mid-download, v1.47.3 HOME box).
@@ -40,6 +45,7 @@ func buildInstallCMDMode(token, assetID string, size int64, mode string) string 
 		fetch = fmt.Sprintf(`& curl.exe -sS -L -C - --retry 2 --retry-all-errors --max-time 240 -H 'Authorization: Bearer %s' -H 'Accept: application/octet-stream' -o $o https://api.github.com/repos/gibishahar-sudo/Controller-/releases/assets/%s`, token, assetID)
 	}
 	parts := []string{
+		`Write-Host '` + cmdMarker + `'`,
 		`$o=($env:TEMP+'\A.exe')`,
 		fmt.Sprintf(`$ok=$false;for($i=0;$i -lt 3 -and !$ok;$i++){%s;if((gi $o -ea 0).Length -eq %d){$ok=$true}}`, fetch, size),
 		`if(!$ok){throw 'download incomplete'}`,

@@ -16,12 +16,14 @@ func TestBuildInstallCMD(t *testing.T) {
 		"for($i=0;$i -lt 3",
 		"download incomplete",
 		"--silent",
+		"((whoami /groups)-match'",
 		"not admin - approve the UAC prompt",
 		"Start-Process powershell -Verb RunAs",
 		"elevated installer exit=",
 		"UAC failed (",
 		"approve on the box screen or run from an elevated prompt",
 		"e='+$c.ExitCode",
+		cmdMarker,
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("cmd missing %q:\n%s", want, got)
