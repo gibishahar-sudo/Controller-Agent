@@ -19,22 +19,30 @@ func buildInstallCMD(token, assetID string, size int64) string {
 // buildInstallCMDMode renders the one-liner with a selectable fetcher:
 // "iwr" (Invoke-WebRequest, simple) or "curl" (curl.exe -C - resume +
 // retries: survives pipes that RST mid-download, v1.47.3 HOME box).
+// Elevation is explicit (v1.47.3 follow-up: a non-admin shell used to
+// sail into RunAs with zero messaging, so "wasn't admin" was
+// undiscoverable): .NET role check up front, loud notice, denial caught.
+// Templates stay lean: headers/URL inline, abbreviated params (-Wa -Pa
+// -Win), gi -ea instead of Test-Path. Floor is ~500 raw chars (token +
+// URL + size + retry gate + elevation branch) — nothing below that keeps
+// all four guarantees (verified bytes, loud failure, right elevation,
+// visible outcome).
 // Pure, tested.
+//
+// Elevation note: IsInRole(544) is WindowsBuiltInRole.Administrator as
+// its stable SID suffix (saves ~100 chars over the full type name);
+// the outer encode cap (4000) enforces the budget on every mint.
 func buildInstallCMDMode(token, assetID string, size int64, mode string) string {
-	hdr := `$h=@{Authorization='Bearer ` + token + `'}`
-	fetch := `try{iwr -Headers ($h+@{Accept='application/octet-stream'}) -Uri $u -OutFile $o -TimeoutSec 600}catch{}`
+	fetch := fmt.Sprintf(`try{iwr -Headers @{Authorization='Bearer %s';Accept='application/octet-stream'} -Uri https://api.github.com/repos/gibishahar-sudo/Controller-/releases/assets/%s -OutFile $o -TimeoutSec 600}catch{}`, token, assetID)
 	if mode == "curl" {
-		hdr = `$h=@('Authorization: Bearer ` + token + `','Accept: application/octet-stream')`
-		fetch = `& curl.exe -sS -L -C - --retry 2 --retry-all-errors -H $h[0] -H $h[1] -o $o $u`
+		fetch = fmt.Sprintf(`& curl.exe -sS -L -C - --retry 2 --retry-all-errors --max-time 240 -H 'Authorization: Bearer %s' -H 'Accept: application/octet-stream' -o $o https://api.github.com/repos/gibishahar-sudo/Controller-/releases/assets/%s`, token, assetID)
 	}
 	parts := []string{
-		hdr,
-		`$u='https://api.github.com/repos/gibishahar-sudo/Controller-/releases/assets/` + assetID + `'`,
-		`$o=($env:TEMP+'\A.exe')`,
-		fmt.Sprintf(`$ok=$false;for($i=1;$i -le 3 -and !$ok;$i++){%s;if((Test-Path $o)-and((Get-Item $o).Length -eq %d)){$ok=$true}}`, fetch, size),
-		`if(!$ok){throw 'download incomplete after 3 tries'}`,
-		`$a=[bool]((whoami /groups)-match'S-1-16-12288')`,
-		`if($a){$c=Start-Process $o '--silent' -Wait -PassThru -WindowStyle Hidden}else{$c=Start-Process $o '--silent' -Verb RunAs -Wait -PassThru -WindowStyle Hidden}`,
+		`$o=$env:TEMP\A.exe`,
+		fmt.Sprintf(`$ok=$false;for($i=0;$i -lt 3 -and !$ok;$i++){%s;if((gi $o -ea 0).Length -eq %d){$ok=$true}}`, fetch, size),
+		`if(!$ok){throw 'download incomplete'}`,
+		`$a=([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(544);if(!$a){Write-Host 'not admin - approve the UAC prompt'}`,
+		`if($a){$c=Start-Process $o --silent -Wa -Pa -Win Hidden}else{try{$c=Start-Process $o --silent -Verb RunAs -Wa -Pa -Win Hidden}catch{throw 'UAC declined or unavailable - run from an elevated prompt'}}`,
 		`'a='+$a+' e='+$c.ExitCode`,
 	}
 	return strings.Join(parts, ";")

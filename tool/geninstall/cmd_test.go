@@ -13,10 +13,13 @@ func TestBuildInstallCMD(t *testing.T) {
 		"Bearer TOK",
 		"releases/assets/123",
 		"18616816",
-		"for($i=1;$i -le 3",
-		"Test-Path",
-		"download incomplete after 3 tries",
+		"for($i=0;$i -lt 3",
+		"download incomplete",
 		"--silent",
+		"IsInRole",
+		"IsInRole(544)",
+		"not admin - approve the UAC prompt",
+		"UAC declined or unavailable",
 		"e='+$c.ExitCode",
 	} {
 		if !strings.Contains(got, want) {
@@ -26,11 +29,14 @@ func TestBuildInstallCMD(t *testing.T) {
 	if strings.Contains(got, `"`) {
 		t.Fatal("double quote leak breaks the outer call shape")
 	}
+	if strings.Contains(got, "whoami") {
+		t.Fatal("whoami spawn replaced by .NET role check")
+	}
 }
 
 func TestBuildInstallCMDMode(t *testing.T) {
 	iwr := buildInstallCMDMode("TOK", "123", 18616816, "iwr")
-	if !strings.Contains(iwr, "Invoke-WebRequest") && !strings.Contains(iwr, "iwr -Headers ($h+@{Accept=") {
+	if !strings.Contains(iwr, "iwr -Headers @{Authorization=") {
 		t.Fatalf("iwr mode lost its fetcher:\n%s", iwr)
 	}
 	if strings.Contains(iwr, "curl.exe") {
@@ -38,15 +44,15 @@ func TestBuildInstallCMDMode(t *testing.T) {
 	}
 	curl := buildInstallCMDMode("TOK", "123", 18616816, "curl")
 	for _, want := range []string{
-		"curl.exe", "-C -", "--retry", "--retry-all-errors",
-		"-H $h[0]", "-H $h[1]", "18616816", "releases/assets/123",
+		"curl.exe", "-C -", "--retry", "--retry-all-errors", "--max-time",
+		"18616816", "releases/assets/123",
 	} {
 		if !strings.Contains(curl, want) {
 			t.Fatalf("curl mode missing %q:\n%s", want, curl)
 		}
 	}
-	if strings.Contains(curl, "($h+@{Accept=") {
-		t.Fatal("curl mode must not use hashtable header merge")
+	if strings.Contains(curl, "$h[") {
+		t.Fatal("curl mode must inline headers (no $h array)")
 	}
 	for _, m := range []string{"iwr", "curl", "bogus"} {
 		line, err := encodeCMD(buildInstallCMDMode("T", "1", 2, m))
