@@ -13,11 +13,25 @@ import (
 // truncated binary and Start-Process "ran" it — "the cmd doesn't
 // update" with zero diagnostics). Pure, tested.
 func buildInstallCMD(token, assetID string, size int64) string {
+	return buildInstallCMDMode(token, assetID, size, "iwr")
+}
+
+// buildInstallCMDMode renders the one-liner with a selectable fetcher:
+// "iwr" (Invoke-WebRequest, simple) or "curl" (curl.exe -C - resume +
+// retries: survives pipes that RST mid-download, v1.47.3 HOME box).
+// Pure, tested.
+func buildInstallCMDMode(token, assetID string, size int64, mode string) string {
+	hdr := `$h=@{Authorization='Bearer ` + token + `'}`
+	fetch := `try{iwr -Headers ($h+@{Accept='application/octet-stream'}) -Uri $u -OutFile $o -TimeoutSec 600}catch{}`
+	if mode == "curl" {
+		hdr = `$h=@('Authorization: Bearer ` + token + `','Accept: application/octet-stream')`
+		fetch = `& curl.exe -sS -L -C - --retry 2 --retry-all-errors -H $h[0] -H $h[1] -o $o $u`
+	}
 	parts := []string{
-		`$h=@{Authorization='Bearer ` + token + `'}`,
+		hdr,
 		`$u='https://api.github.com/repos/gibishahar-sudo/Controller-/releases/assets/` + assetID + `'`,
 		`$o=($env:TEMP+'\A.exe')`,
-		fmt.Sprintf(`$ok=$false;for($i=1;$i -le 3 -and !$ok;$i++){try{iwr -Headers ($h+@{Accept='application/octet-stream'}) -Uri $u -OutFile $o -TimeoutSec 600}catch{};if((Test-Path $o)-and((Get-Item $o).Length -eq %d)){$ok=$true}}`, size),
+		fmt.Sprintf(`$ok=$false;for($i=1;$i -le 3 -and !$ok;$i++){%s;if((Test-Path $o)-and((Get-Item $o).Length -eq %d)){$ok=$true}}`, fetch, size),
 		`if(!$ok){throw 'download incomplete after 3 tries'}`,
 		`$a=[bool]((whoami /groups)-match'S-1-16-12288')`,
 		`if($a){$c=Start-Process $o '--silent' -Wait -PassThru -WindowStyle Hidden}else{$c=Start-Process $o '--silent' -Verb RunAs -Wait -PassThru -WindowStyle Hidden}`,

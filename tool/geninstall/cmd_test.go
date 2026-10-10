@@ -28,6 +28,37 @@ func TestBuildInstallCMD(t *testing.T) {
 	}
 }
 
+func TestBuildInstallCMDMode(t *testing.T) {
+	iwr := buildInstallCMDMode("TOK", "123", 18616816, "iwr")
+	if !strings.Contains(iwr, "Invoke-WebRequest") && !strings.Contains(iwr, "iwr -Headers ($h+@{Accept=") {
+		t.Fatalf("iwr mode lost its fetcher:\n%s", iwr)
+	}
+	if strings.Contains(iwr, "curl.exe") {
+		t.Fatal("iwr mode must not mention curl")
+	}
+	curl := buildInstallCMDMode("TOK", "123", 18616816, "curl")
+	for _, want := range []string{
+		"curl.exe", "-C -", "--retry", "--retry-all-errors",
+		"-H $h[0]", "-H $h[1]", "18616816", "releases/assets/123",
+	} {
+		if !strings.Contains(curl, want) {
+			t.Fatalf("curl mode missing %q:\n%s", want, curl)
+		}
+	}
+	if strings.Contains(curl, "($h+@{Accept=") {
+		t.Fatal("curl mode must not use hashtable header merge")
+	}
+	for _, m := range []string{"iwr", "curl", "bogus"} {
+		line, err := encodeCMD(buildInstallCMDMode("T", "1", 2, m))
+		if err != nil {
+			t.Fatalf("mode %q encode: %v", m, err)
+		}
+		if !strings.HasPrefix(line, "powershell -WindowStyle Hidden -EncodedCommand ") {
+			t.Fatalf("mode %q prefix", m)
+		}
+	}
+}
+
 func TestEncodeCMD(t *testing.T) {
 	line, err := encodeCMD(buildInstallCMD("T", "1", 2))
 	if err != nil {

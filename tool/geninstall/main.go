@@ -12,16 +12,24 @@ import (
 
 // Command geninstall mints the agent install CMD for a release tag:
 //
-//	go run ./tool/geninstall v1.47.3
+//	go run ./tool/geninstall v1.47.3          # Invoke-WebRequest fetcher
+//	go run ./tool/geninstall -curl v1.47.3    # curl.exe resume fetcher
+//	                                          # (pipes that RST mid-download)
 //
 // Token comes from gh_token.txt beside the repo (gitignored, same as the
 // ship scripts). Output is the ready-to-paste powershell line.
 func main() {
-	if len(os.Args) != 2 || !strings.HasPrefix(os.Args[1], "v") {
-		fmt.Fprintln(os.Stderr, "usage: go run ./tool/geninstall vX.Y.Z")
+	mode := "iwr"
+	args := os.Args[1:]
+	if len(args) > 0 && args[0] == "-curl" {
+		mode = "curl"
+		args = args[1:]
+	}
+	if len(args) != 1 || !strings.HasPrefix(args[0], "v") {
+		fmt.Fprintln(os.Stderr, "usage: go run ./tool/geninstall [-curl] vX.Y.Z")
 		os.Exit(2)
 	}
-	tag := os.Args[1]
+	tag := args[0]
 	rawTok, err := os.ReadFile("gh_token.txt")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "gh_token.txt missing:", err)
@@ -33,7 +41,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "asset lookup:", err)
 		os.Exit(1)
 	}
-	line, err := encodeCMD(buildInstallCMD(token, id, size))
+	line, err := encodeCMD(buildInstallCMDMode(token, id, size, mode))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "encode:", err)
 		os.Exit(1)
