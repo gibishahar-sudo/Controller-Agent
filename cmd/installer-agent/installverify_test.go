@@ -170,3 +170,29 @@ func TestWmiTermCmd(t *testing.T) {
 		t.Fatalf("cmd = %q", got)
 	}
 }
+
+// serviceStopped parses sc query STATE codes (v1.47.6: the repair
+// service must read STOPPED before the exe write, absent = success).
+func TestServiceStopped(t *testing.T) {
+	stopped := "SERVICE_NAME: WindowsUpdateOrchestrator\r\n        TYPE               : 10  WIN32_OWN_PROCESS\r\n        STATE              : 1  STOPPED\r\n        WIN32_EXIT_CODE    : 0  (0x0)\r\n"
+	running := "SERVICE_NAME: WindowsUpdateOrchestrator\r\n        STATE              : 4  RUNNING\r\n"
+	pending := "        STATE              : 3  STOP_PENDING\r\n"
+	if !serviceStopped(stopped, false) {
+		t.Fatal("STOPPED must read stopped")
+	}
+	if serviceStopped(running, false) {
+		t.Fatal("RUNNING must not read stopped")
+	}
+	if serviceStopped(pending, false) {
+		t.Fatal("STOP_PENDING must not read stopped")
+	}
+	if !serviceStopped("", true) {
+		t.Fatal("query failure (absent service) must read stopped")
+	}
+	if !serviceStopped("[SC] OpenService FAILED 1060:\r\nThe specified service does not exist as an installed service.\r\n", false) {
+		t.Fatal("1060 must read stopped")
+	}
+	if serviceStopped("garbage with no state", false) {
+		t.Fatal("stateless output must not read stopped")
+	}
+}

