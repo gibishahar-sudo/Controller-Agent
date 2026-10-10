@@ -286,8 +286,29 @@ func auditDuplicates() {
 	}
 }
 
+// wmiTermCmd builds the single-PID terminate snippet (twin of the
+// agent's helper in singleton_windows.go; keep in sync. Sequential
+// calls only — batch invokes OOM the provider, proven on a 14-zombie
+// box). Pure, tested.
+func wmiTermCmd(pid int) string {
+	return `(Get-CimInstance Win32_Process -Filter "ProcessId=` + strconv.Itoa(pid) + `" | Invoke-CimMethod -MethodName Terminate).ReturnValue`
+}
+
+// wmiTerminatePID kills one PID via the WMI provider (SYSTEM-side
+// handle: succeeds where taskkill/OpenProcess fail on wedged
+// processes). True only on provider ReturnValue 0.
+func wmiTerminatePID(pid int) bool {
+	out, err := hiddenExec("powershell", "-NoProfile", "-Command", wmiTermCmd(pid)).CombinedOutput()
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(out)) == "0"
+}
+
 // unkillableAgentPIDs returns listed PIDs that are actually still alive:
 // each gets one targeted kill; phantoms ("no running instance") drop out.
+// A taskkill survivor gets one sequential WMI single before it counts
+// as live (v1.47.5: taskkill called live wedged processes nonexistent).
 // Non-empty = real survivors, abort the install.
 func unkillableAgentPIDs() []int {
 	out, _ := hiddenExec("tasklist", "/FI", "IMAGENAME eq MicrosoftWindowsClient.exe", "/FO", "CSV", "/NH").CombinedOutput()
@@ -295,6 +316,14 @@ func unkillableAgentPIDs() []int {
 	for _, pid := range tasklistAgentPIDs(string(out)) {
 		ko, _ := hiddenExec("taskkill", "/F", "/PID", strconv.Itoa(pid)).CombinedOutput()
 		if classifyKillResult(string(ko)) == killAlive {
+			log.Printf("taskkill failed pid %d, trying WMI single", pid)
+			if wmiTerminatePID(pid) {
+				time.Sleep(time.Second)
+				ko2, _ := hiddenExec("taskkill", "/F", "/PID", strconv.Itoa(pid)).CombinedOutput()
+				if classifyKillResult(string(ko2)) == killDead {
+					continue
+				}
+			}
 			live = append(live, pid)
 		}
 	}

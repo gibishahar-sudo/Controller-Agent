@@ -160,3 +160,13 @@ func TestCopyPayloadExe(t *testing.T) {
 		t.Fatal("unwritable destination must error (rounds=1: no sleep)")
 	}
 }
+
+// wmiTermCmd must name the exact PID, single-call form (v1.47.5: the
+// installer escalation for processes taskkill calls nonexistent).
+func TestWmiTermCmd(t *testing.T) {
+	got := wmiTermCmd(48584)
+	want := `(Get-CimInstance Win32_Process -Filter "ProcessId=48584" | Invoke-CimMethod -MethodName Terminate).ReturnValue`
+	if got != want {
+		t.Fatalf("cmd = %q", got)
+	}
+}

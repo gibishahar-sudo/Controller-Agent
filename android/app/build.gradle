@@ -11,9 +11,9 @@ android {
         minSdk = 28
         targetSdk = 34
         // Suite version is mirrored manually on each release:
-        // versionName = suite (e.g. 1.47.4), versionCode = M*1000000+m*1000+p.
-        versionCode = 1047004
-        versionName = "1.47.4"
+        // versionName = suite (e.g. 1.47.5), versionCode = M*1000000+m*1000+p.
+        versionCode = 1047005
+        versionName = "1.47.5"
     }
 
     signingConfigs {
