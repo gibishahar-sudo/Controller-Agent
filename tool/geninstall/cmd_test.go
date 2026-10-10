@@ -45,6 +45,14 @@ func TestBuildInstallCMD(t *testing.T) {
 	if strings.Contains(got, "Start-Process $o '--silent' -Verb RunAs") {
 		t.Fatal("payload must never be RunAs'd directly (UAC names PowerShell now)")
 	}
+	// -Wa binds WarningAction (MissingArgument on real PS 5.1, proved by
+	// stub execution) — only -Wai may launch processes here.
+	if !strings.Contains(got, "-Wai") {
+		t.Fatal("process launches must use unambiguous -Wai (Wait)")
+	}
+	if strings.Contains(got, "-Wa ") {
+		t.Fatal("-Wa binds WarningAction, not Wait")
+	}
 }
 
 func TestBuildInstallCMDMode(t *testing.T) {
@@ -57,12 +65,17 @@ func TestBuildInstallCMDMode(t *testing.T) {
 	}
 	curl := buildInstallCMDMode("TOK", "123", 18616816, "curl")
 	for _, want := range []string{
-		"curl.exe", "-C -", "--retry", "--retry-all-errors", "--max-time",
-		"18616816", "releases/assets/123",
+		"curl.exe", "--retry", "--retry-all-errors", "--max-time",
+		"18616816", "releases/assets/123", "ri $o -ea 0",
 	} {
 		if !strings.Contains(curl, want) {
 			t.Fatalf("curl mode missing %q:\n%s", want, curl)
 		}
+	}
+	// The asset endpoint honors no Range requests: -C - resume aborts
+	// with curl 33 on any stale partial (proved on the HOME box).
+	if strings.Contains(curl, "-C -") {
+		t.Fatal("resume flag -C - is incompatible with the asset endpoint")
 	}
 	if strings.Contains(curl, "$h[") {
 		t.Fatal("curl mode must inline headers (no $h array)")
@@ -102,6 +115,7 @@ func TestBuildInstallPS1(t *testing.T) {
 		"627496598",
 		"18616816",
 		"curl.exe",
+		"ri $o -ea 0",
 		"download incomplete",
 		"((whoami /groups)-match'",
 		"Start-Process powershell -Verb RunAs",
@@ -116,6 +130,9 @@ func TestBuildInstallPS1(t *testing.T) {
 	}
 	if strings.Contains(got, "Bearer ghp_") || strings.Contains(got, "Bearer TOK") {
 		t.Fatal("no secret may be baked into the file variant (env only)")
+	}
+	if strings.Contains(got, "-C -") {
+		t.Fatal("resume flag -C - is incompatible with the asset endpoint")
 	}
 	// Tail parity: pasted CMD and file ps1 share installTail — a fix in
 	// one reaches the other. Pin it from both sides.
