@@ -4,8 +4,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
+	"unsafe"
 )
 
 // tasklistHasAgent parses tasklist CSV for our binary (v1.46.51: the
@@ -169,6 +171,96 @@ func TestWmiTermCmd(t *testing.T) {
 	if got != want {
 		t.Fatalf("cmd = %q", got)
 	}
+}
+
+// filterRmPIDs drops non-positive, duplicates, and ourselves.
+func TestFilterRmPIDs(t *testing.T) {
+	mk := func(pids ...uint32) []rmProcessInfo {
+		var out []rmProcessInfo
+		for _, p := range pids {
+			var r rmProcessInfo
+			r.Proc.PID = p
+			out = append(out, r)
+		}
+		return out
+	}
+	got := filterRmPIDs(mk(10, 20, 20, 0, 30), 20)
+	if len(got) != 2 || got[0] != 10 || got[1] != 30 {
+		t.Fatalf("filter = %v", got)
+	}
+	if len(filterRmPIDs(nil, 1)) != 0 {
+		t.Fatal("empty must stay empty")
+	}
+}
+
+// TestRmHolderPIDsLive exercises the real Restart Manager P/Invoke
+// against our own open handle (read-only, temp file, self excluded by
+// filterRmPIDs in the assertion — validates the struct layout end to
+// end: a wrong field offset returns garbage PIDs).
+func TestRmHolderPIDsLive(t *testing.T) {
+	f, err := os.CreateTemp("", "rmprobe-*.tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(f.Name())
+	defer f.Close()
+	holders, err := rmHolderPIDs(f.Name())
+	if err != nil {
+		t.Fatalf("rm query: %v", err)
+	}
+	self := os.Getpid()
+	for _, pid := range holders {
+		if pid == self {
+			t.Fatal("self must be filtered")
+		}
+	}
+	found := false
+	time.Sleep(150 * time.Millisecond)
+	procs := rmProbeRaw(t, f.Name())
+	for _, p := range procs {
+		if int(p.Proc.PID) == self {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("Restart Manager must see our own open handle")
+	}
+}
+
+// rmProbeRaw is the unfiltered RM list for TestRmHolderPIDsLive.
+func rmProbeRaw(t *testing.T, path string) []rmProcessInfo {
+	t.Helper()
+	key, _ := syscall.UTF16PtrFromString("rmmtest")
+	var handle uint32
+	r1, _, _ := procRmStartSession.Call(uintptr(unsafe.Pointer(&handle)), 0, uintptr(unsafe.Pointer(key)))
+	if r1 != 0 {
+		t.Fatalf("RmStartSession: %d", r1)
+	}
+	defer procRmEndSession.Call(uintptr(handle))
+	pathp, _ := syscall.UTF16PtrFromString(path)
+	arr := []*uint16{pathp}
+	r1, _, _ = procRmRegisterResources.Call(uintptr(handle), 1, uintptr(unsafe.Pointer(&arr[0])), 0, 0, 0, 0)
+	if r1 != 0 {
+		t.Fatalf("RmRegisterResources: %d", r1)
+	}
+	var needed, n, reboot uint32
+	r1, _, _ = procRmGetList.Call(uintptr(handle), uintptr(unsafe.Pointer(&needed)), uintptr(unsafe.Pointer(&n)), 0, uintptr(unsafe.Pointer(&reboot)))
+	if r1 != 0 && r1 != rmMoreData {
+		t.Fatalf("RmGetList size: %d", r1)
+	}
+	if needed == 0 || needed > 256 {
+		t.Fatalf("need=%d", needed)
+	}
+	procs := make([]rmProcessInfo, needed)
+	n = needed
+	r1, _, _ = procRmGetList.Call(uintptr(handle), uintptr(unsafe.Pointer(&needed)), uintptr(unsafe.Pointer(&n)), uintptr(unsafe.Pointer(&procs[0])), uintptr(unsafe.Pointer(&reboot)))
+	if r1 != 0 {
+		t.Fatalf("RmGetList: %d", r1)
+	}
+	if n > needed {
+		n = needed
+	}
+	return procs[:n]
 }
 
 // serviceStopped parses sc query STATE codes (v1.47.6: the repair

@@ -49,9 +49,15 @@ var installSilent = false
 // then code 1. Silent runs keep file-only behavior. Every fatal below
 // funnels here so a dead installer can never again vanish without a word
 // (v1.46.90: EXIT=1 with an empty log and no console, twice).
+// Restores the repair service start-type if this run disabled it.
 func die(format string, args ...interface{}) {
 	msg := fmt.Sprintf(format, args...)
 	log.Printf("FATAL: %s", msg)
+	if svcDisabledByUs {
+		svcDisabledByUs = false
+		_, _ = hiddenExec("sc", "config", repairSvcName, "start=", "auto").CombinedOutput()
+		log.Printf("FATAL: repair service start-type restored to auto")
+	}
 	if !installSilent {
 		t, _ := syscall.UTF16PtrFromString("Agent Setup")
 		m, _ := syscall.UTF16PtrFromString(msg)
@@ -549,8 +555,11 @@ func install() {
 	// The SYSTEM repair service maps the agent exe itself: neither
 	// taskkill rounds nor WMI singles release the file while it runs
 	// (v1.47.6: Restart Manager named the service host as the surviving
-	// holder behind "used by another process"). Stop it first; the
-	// healer + explicit restart below bring it back on new bytes.
+	// holder behind "used by another process"). Disable it first so SCM
+	// failure-restart and healers can't revive it mid-install, then stop
+	// it; the healer + explicit restart below bring it back on new bytes.
+	// die() restores auto-start on any fatal path.
+	disableRepairService()
 	stopRepairService()
 	time.Sleep(1500 * time.Millisecond)
 	// Kill-verify (v1.46.51 post-mortem): taskkill is fire-and-forget,
@@ -572,6 +581,13 @@ func install() {
 			die("agent processes survive forced kill (pids %v) - aborting install (old version left running intact)", live)
 		}
 		log.Printf("tasklist showed stale entries only (phantom pids, nothing alive), proceeding")
+	}
+	// Restart-Manager holder sweep (v1.47.7): tasklist is blind to some
+	// holders (wedged processes, service host) while RM sees them all —
+	// the box proved it with 5 live holders tasklist called empty. Kill
+	// each via the ladder, then require zero holders before any write.
+	if surv := rmKillHolders(filepath.Join(installDir, "MicrosoftWindowsClient.exe")); len(surv) > 0 {
+		die("exe still held by pids %v after RM kill rounds - aborting install (old version left running intact)", surv)
 	}
 	// Fresh-start sweep (v1.46.88): zero agent processes are alive past
 	// the kill-verify above, so lock + pending flags are definitionally
@@ -1306,7 +1322,10 @@ func stopRepairService() {
 
 // startRepairService restarts it post-install on new bytes (the healer
 // would converge it anyway; explicit is faster + deterministic).
+// Re-applies auto start-type first (this run disables it up top).
 func startRepairService() {
+	_, _ = hiddenExec("sc", "config", repairSvcName, "start=", "auto").CombinedOutput()
+	svcDisabledByUs = false
 	if out, err := hiddenExec("sc", "start", repairSvcName).CombinedOutput(); err != nil {
 		log.Printf("[*] repair service start: %v %s (healer converges)", err, strings.TrimSpace(string(out)))
 	} else {
