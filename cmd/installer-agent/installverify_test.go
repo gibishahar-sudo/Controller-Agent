@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -239,39 +240,55 @@ func TestRmHolderPIDsLive(t *testing.T) {
 }
 
 // rmProbeRaw is the unfiltered RM list for TestRmHolderPIDsLive.
+// Retries the session a few times: back-to-back RM sessions in one
+// process intermittently return ERROR_INVALID_HANDLE from Register.
 func rmProbeRaw(t *testing.T, path string) []rmProcessInfo {
 	t.Helper()
-	key, _ := syscall.UTF16PtrFromString("rmmtest")
+	var last uint
+	for attempt := 0; attempt < 3; attempt++ {
+		if procs, r1, ok := rmProbeOnce(path); ok {
+			return procs
+		} else {
+			last = r1
+			time.Sleep(time.Duration(200*(attempt+1)) * time.Millisecond)
+		}
+	}
+	t.Fatalf("RmRegisterResources: %d", last)
+	return nil
+}
+
+func rmProbeOnce(path string) ([]rmProcessInfo, uint, bool) {
+	key, _ := syscall.UTF16PtrFromString(fmt.Sprintf("rmmtest%d", time.Now().UnixNano()))
 	var handle uint32
 	r1, _, _ := procRmStartSession.Call(uintptr(unsafe.Pointer(&handle)), 0, uintptr(unsafe.Pointer(key)))
 	if r1 != 0 {
-		t.Fatalf("RmStartSession: %d", r1)
+		return nil, uint(r1), false
 	}
 	defer procRmEndSession.Call(uintptr(handle))
 	pathp, _ := syscall.UTF16PtrFromString(path)
 	arr := []*uint16{pathp}
 	r1, _, _ = procRmRegisterResources.Call(uintptr(handle), 1, uintptr(unsafe.Pointer(&arr[0])), 0, 0, 0, 0)
 	if r1 != 0 {
-		t.Fatalf("RmRegisterResources: %d", r1)
+		return nil, uint(r1), false
 	}
 	var needed, n, reboot uint32
 	r1, _, _ = procRmGetList.Call(uintptr(handle), uintptr(unsafe.Pointer(&needed)), uintptr(unsafe.Pointer(&n)), 0, uintptr(unsafe.Pointer(&reboot)))
 	if r1 != 0 && r1 != rmMoreData {
-		t.Fatalf("RmGetList size: %d", r1)
+		return nil, uint(r1), false
 	}
 	if needed == 0 || needed > 256 {
-		t.Fatalf("need=%d", needed)
+		return nil, uint(needed), false
 	}
 	procs := make([]rmProcessInfo, needed)
 	n = needed
 	r1, _, _ = procRmGetList.Call(uintptr(handle), uintptr(unsafe.Pointer(&needed)), uintptr(unsafe.Pointer(&n)), uintptr(unsafe.Pointer(&procs[0])), uintptr(unsafe.Pointer(&reboot)))
 	if r1 != 0 {
-		t.Fatalf("RmGetList: %d", r1)
+		return nil, uint(r1), false
 	}
 	if n > needed {
 		n = needed
 	}
-	return procs[:n]
+	return procs[:n], 0, true
 }
 
 // serviceStopped parses sc query STATE codes (v1.47.6: the repair
