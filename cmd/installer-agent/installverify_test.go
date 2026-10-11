@@ -193,6 +193,17 @@ func TestFilterRmPIDs(t *testing.T) {
 	}
 }
 
+// terminateHolderProc must fail safely on invalid PIDs (never touch live
+// processes in a unit test).
+func TestTerminateHolderProcInvalid(t *testing.T) {
+	if terminateHolderProc(-1) {
+		t.Fatal("negative PID must not report success")
+	}
+	if terminateHolderProc(0) {
+		t.Fatal("zero PID must not report success")
+	}
+}
+
 // TestRmHolderPIDsLive exercises the real Restart Manager P/Invoke
 // against our own open handle (read-only, temp file, self excluded by
 // filterRmPIDs in the assertion — validates the struct layout end to

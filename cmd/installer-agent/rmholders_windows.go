@@ -8,6 +8,8 @@ import (
 	"syscall"
 	"time"
 	"unsafe"
+
+	"golang.org/x/sys/windows"
 )
 
 var (
@@ -111,11 +113,58 @@ func rmHolderPIDs(exePath string) ([]int, error) {
 	return filterRmPIDs(procs[:n], os.Getpid()), nil
 }
 
+// enableDebugPriv turns on SeDebugPrivilege so SYSTEM/session-0 holders
+// can actually be terminated. Administrators hold it disabled-by-default;
+// without it OpenProcess fails and every kill misses (v1.47.8: two
+// SYSTEM/session-0 holders survived taskkill + WMI with Access denied).
+// Reports whether it took effect.
+func enableDebugPriv() bool {
+	const seDebug = "SeDebugPrivilege"
+	var hTok windows.Token
+	if err := windows.OpenProcessToken(windows.CurrentProcess(),
+		windows.TOKEN_ADJUST_PRIVILEGES|windows.TOKEN_QUERY, &hTok); err != nil {
+		return false
+	}
+	defer hTok.Close()
+	luidStr, err := windows.UTF16PtrFromString(seDebug)
+	if err != nil {
+		return false
+	}
+	var luid windows.LUID
+	if err := windows.LookupPrivilegeValue(nil, luidStr, &luid); err != nil {
+		return false
+	}
+	tp := windows.Tokenprivileges{PrivilegeCount: 1}
+	tp.Privileges[0].Luid = luid
+	tp.Privileges[0].Attributes = windows.SE_PRIVILEGE_ENABLED
+	if err := windows.AdjustTokenPrivileges(hTok, false, &tp, 0, nil, nil); err != nil {
+		return false
+	}
+	return windows.GetLastError() == nil
+}
+
+// terminateHolderProc kills one holder PID directly (OpenProcess +
+// TerminateProcess) after SeDebug is enabled. Reports success only.
+func terminateHolderProc(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	h, err := windows.OpenProcess(windows.PROCESS_TERMINATE, false, uint32(pid))
+	if err != nil {
+		return false
+	}
+	defer windows.CloseHandle(h)
+	return windows.TerminateProcess(h, 1) == nil
+}
+
 // rmKillHolders enumerates exe holders via Restart Manager and kills each
-// (taskkill, then one WMI single), re-querying until clear. Returns
-// surviving PIDs. Sequential throughout (provider OOM rule). Up to 3
-// rounds; post-flight verification remains the backstop.
+// (taskkill, direct terminate with SeDebug, then one WMI single),
+// re-querying until clear. Returns surviving PIDs. Sequential throughout
+// (provider OOM rule). Up to 3 rounds; post-flight verification remains
+// the backstop.
 func rmKillHolders(exePath string) []int {
+	dbg := enableDebugPriv()
+	log.Printf("[*] holder-kill power: sedebug=%v", dbg)
 	for round := 0; round < 3; round++ {
 		holders, err := rmHolderPIDs(exePath)
 		if err != nil {
@@ -131,8 +180,14 @@ func rmKillHolders(exePath string) []int {
 			if classifyKillResult(string(ko)) == killDead {
 				continue
 			}
+			if terminateHolderProc(pid) {
+				time.Sleep(time.Second)
+				continue
+			}
 			if wmiTerminatePID(pid) {
 				time.Sleep(time.Second)
+			} else {
+				log.Printf("[!] holder pid %d survived taskkill/direct/WMI", pid)
 			}
 		}
 		time.Sleep(2 * time.Second)
