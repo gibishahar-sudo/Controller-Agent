@@ -157,11 +157,12 @@ func terminateHolderProc(pid int) bool {
 	return windows.TerminateProcess(h, 1) == nil
 }
 
-// rmKillHolders enumerates exe holders via Restart Manager and kills each
-// (taskkill, direct terminate with SeDebug, then one WMI single),
-// re-querying until clear. Returns surviving PIDs. Sequential throughout
-// (provider OOM rule). Up to 3 rounds; post-flight verification remains
-// the backstop.
+// rmKillHolders enumerates exe holders via Restart Manager and hits each
+// with every kill path (taskkill, direct terminate with SeDebug, one WMI
+// single) without trusting any single report — v1.47.9: a SUCCESS report
+// left SYSTEM holders alive. Re-queries until clear. Returns surviving
+// PIDs. Sequential throughout (provider OOM rule). Up to 3 rounds;
+// post-flight verification remains the backstop.
 func rmKillHolders(exePath string) []int {
 	dbg := enableDebugPriv()
 	log.Printf("[*] holder-kill power: sedebug=%v", dbg)
@@ -177,18 +178,11 @@ func rmKillHolders(exePath string) []int {
 		log.Printf("[*] %d holder(s) of exe (round %d): %v", len(holders), round+1, holders)
 		for _, pid := range holders {
 			ko, _ := hiddenExec("taskkill", "/F", "/PID", strconv.Itoa(pid)).CombinedOutput()
-			if classifyKillResult(string(ko)) == killDead {
-				continue
-			}
-			if terminateHolderProc(pid) {
-				time.Sleep(time.Second)
-				continue
-			}
-			if wmiTerminatePID(pid) {
-				time.Sleep(time.Second)
-			} else {
-				log.Printf("[!] holder pid %d survived taskkill/direct/WMI", pid)
-			}
+			tk := classifyKillResult(string(ko))
+			direct := terminateHolderProc(pid)
+			wmi := wmiTerminatePID(pid)
+			log.Printf("[*] holder pid %d taskkill=%v direct=%v wmi=%v", pid, tk, direct, wmi)
+			time.Sleep(time.Second)
 		}
 		time.Sleep(2 * time.Second)
 	}
