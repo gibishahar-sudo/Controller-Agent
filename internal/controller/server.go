@@ -98,6 +98,10 @@ type AgentConn struct {
 	protDetail string
 	// mode is the agent operation mode from hello ("normal" when empty).
 	mode string
+	// role is the process role from hello ("" = agent worker, "nms" =
+	// network-management-system monitor). Commands route by id either
+	// way; role only marks the row.
+	role string
 	mu   sync.Mutex
 
 	lastSeenMu sync.Mutex
@@ -284,6 +288,11 @@ type Server struct {
 	groups   map[string]string
 	groupsMu sync.Mutex
 
+	// NMS health reports v1.49: latest raw report JSON per NMS agent id
+	// (+ arrival time). Served by /api/health; latest-write-wins so a
+	// dead prober's data visibly ages instead of vanishing.
+	nmsHealth   map[string]nmsReportRec
+	nmsHealthMu sync.Mutex
 	// Macros/runbooks v1.41: name -> ordered commands, persisted.
 	macros   map[string][]string
 	macrosMu sync.Mutex
@@ -315,6 +324,25 @@ type schedJob struct {
 type gzipBlob struct {
 	data []byte
 	sha  string
+}
+
+// nmsReportRec is one stored NMS health report (raw JSON + arrival time).
+type nmsReportRec struct {
+	at     time.Time
+	report json.RawMessage
+}
+
+// noteHealth stores the latest NMS report per agent id (latest-write-wins).
+func (s *Server) noteHealth(id string, raw string) {
+	if raw == "" {
+		return
+	}
+	s.nmsHealthMu.Lock()
+	if s.nmsHealth == nil {
+		s.nmsHealth = map[string]nmsReportRec{}
+	}
+	s.nmsHealth[id] = nmsReportRec{at: time.Now(), report: json.RawMessage(raw)}
+	s.nmsHealthMu.Unlock()
 }
 
 type haveReport struct {
@@ -2439,7 +2467,7 @@ func (s *Server) Agents() []map[string]interface{} {
 			"version": a.version, "outdated": outdated,
 			"updateRequired": updateRequired,
 			"rollbackBad": rb, "rollbackTo": rt,
-			"untrusted": a.untrusted, "prot": prot, "group": grp, "mode": a.mode,
+			"untrusted": a.untrusted, "prot": prot, "group": grp, "mode": a.mode, "role": a.role,
 			"connected": online, "seenAgoSec": seenAgo,
 			"latency": lat, "remote": a.remote(), "e2e": s.e2eHas(a.id),
 		})
@@ -2970,7 +2998,7 @@ func (s *Server) handleAgent(conn net.Conn, id string) {
 	if !allow {
 		return
 	}
-	ac := &AgentConn{conn: conn, enc: enc, hostname: first.Hostname, user: first.User, id: id, version: first.Version, untrusted: untrusted, mode: first.Mode}
+	ac := &AgentConn{conn: conn, enc: enc, hostname: first.Hostname, user: first.User, id: id, version: first.Version, untrusted: untrusted, mode: first.Mode, role: first.Role}
 	s.setAgent(ac)
 	s.dupCheck(first.Hostname)
 	if first.Version != "" && first.Version != version.DesktopAgentVersion {
@@ -3034,6 +3062,13 @@ func (s *Server) handleAgent(conn net.Conn, id string) {
 			s.broadcastWS(map[string]interface{}{"type": "filelist", "isRemote": true, "data": msg.Result, "id": id})
 		case protocol.TypePing:
 			_ = ac.send(protocol.Message{Type: protocol.TypePong})
+		case protocol.TypeHealth:
+			// NMS probe batch: store latest per id for /api/health.
+			// ALARM-marked guard events also hit the alarms channel.
+			s.noteHealth(id, msg.Result)
+			if strings.Contains(msg.Result, "ALARM:") {
+				s.broadcastWS(map[string]interface{}{"type": "output", "id": id, "data": "NMS: " + msg.Result, "success": false})
+			}
 		case protocol.TypePong:
 			ac.pingSentMu.Lock()
 			sent := ac.pingSent

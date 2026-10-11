@@ -61,6 +61,9 @@ type Message struct {
 	// Mode (in TypeConnect/hello): agent operation mode (normal, stealth,
 	// spy, ghost, performance, kiosk, audit). Empty = normal (old agent).
 	Mode string `json:"mode,omitempty"`
+	// Role (in TypeConnect/hello): process role, "" = agent worker,
+	// "nms" = network-management-system monitor (own row, own commands).
+	Role string `json:"role,omitempty"`
 	// Prot (in TypeConnect/hello): persistence layers intact, "5/6" form,
 	// written by the watcher (protection.json). Empty = unknown (old
 	// install or watcher not yet run). The controller alarms when it drops.
@@ -128,4 +131,5 @@ const (
 	TypeMacroExec         = "macro_exec"    // controller -> agent: run a saved macro/runbook (v1.41)
 	TypeVoiceChunk        = "voice_chunk"   // controller -> agent: PCM/Opus chunk for talk-back (v1.41 gated)
 	TypeKeyExchange       = "keyxchg" // agent -> controller: RSA-wrapped AES data key (see relay.SealPayload)
+	TypeHealth            = "health"  // nms -> controller: LAN probe batch (Result carries JSON, see commands.NMSReport)
 )

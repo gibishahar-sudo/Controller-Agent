@@ -678,6 +678,52 @@ func (s *Server) startHTTP(addr, dir string) {
 			"controllerVersion": version.Version,
 		})
 	})
+	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
+		// NMS reports + managed matching: a probed host counts as managed
+		// when its IP matches a connected agent's remote addr or its
+		// hostname matches an agent hostname.
+		agents := s.Agents()
+		byIP := map[string]string{}
+		byHost := map[string]string{}
+		for _, a := range agents {
+			id, _ := a["id"].(string)
+			hn, _ := a["hostname"].(string)
+			if rem, _ := a["remote"].(string); rem != "" && rem != "mqtt" && rem != "ntfy" {
+				if h, _, err := net.SplitHostPort(rem); err == nil {
+					byIP[h] = id
+				} else {
+					byIP[rem] = id
+				}
+			}
+			if hn != "" {
+				byHost[strings.ToLower(hn)] = id
+			}
+		}
+		s.nmsHealthMu.Lock()
+		type repOut struct {
+			ID       string          `json:"id"`
+			Hostname string          `json:"hostname"`
+			At       string          `json:"at"`
+			AgeSec   int64           `json:"age_sec"`
+			Report   json.RawMessage `json:"report"`
+		}
+		var reps []repOut
+		for id, rec := range s.nmsHealth {
+			hn := ""
+			for _, a := range agents {
+				if aid, _ := a["id"].(string); aid == id {
+					hn, _ = a["hostname"].(string)
+				}
+			}
+			reps = append(reps, repOut{ID: id, Hostname: hn, At: rec.at.UTC().Format(time.RFC3339), AgeSec: int64(time.Since(rec.at).Seconds()), Report: rec.report})
+		}
+		s.nmsHealthMu.Unlock()
+		sort.Slice(reps, func(i, j int) bool { return reps[i].ID < reps[j].ID })
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"reports": reps, "managedByIP": byIP, "managedByHost": byHost,
+		})
+	})
 	mux.HandleFunc("/api/groups", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet {
 			s.groupsMu.Lock()

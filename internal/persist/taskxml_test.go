@@ -16,6 +16,7 @@ func TestTaskXMLWellFormed(t *testing.T) {
 		"watchdog_task.xml":     WatchdogTaskXML(ap),
 		"orchestrator_task.xml": OrchestratorTaskXML(ap),
 		"decoy_task.xml":        DecoyTaskXML(ap),
+		"nms_task.xml":          NMSTaskXML(ap),
 	}
 	for name, doc := range docs {
 		if err := ValidateTaskXML(doc); err != nil {

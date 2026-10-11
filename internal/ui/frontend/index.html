@@ -462,6 +462,8 @@ html{touch-action:manipulation}
       <div id="dashAlarms" style="max-height:160px;overflow:auto;border:1px solid var(--border);border-radius:6px;padding:6px;background:var(--bg-input);font-size:11px"></div>
       <div style="margin-top:10px;font-size:11px;color:#888">By version / group</div>
       <div id="dashBreakdown" style="font-size:11px;color:#888"></div>
+      <div style="margin-top:10px;font-size:11px;color:#888">Monitored hosts (NMS) <span id="nmsAge" style="color:#666"></span></div>
+      <div id="nmsCards" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:8px;margin-top:8px;font-size:11px"></div>
     </section>
 
     <!-- Commands -->
@@ -3164,7 +3166,32 @@ function renderDashboard(j){
     else alarms.innerHTML=list.map(a=>`<div>⚠️ ${a.hostname} ${a.rollbackBad?"rollback v"+a.rollbackBad:""} ${a.protDetail||""} ${a.prot?"layers "+a.prot:""}</div>`).join("");
   }
 }
-function fetchDashboard(){ fetch("/api/dashboard").then(r=>r.json()).then(renderDashboard).catch(()=>{}); }
+function fetchDashboard(){ fetch("/api/dashboard").then(r=>r.json()).then(renderDashboard).catch(()=>{}); fetchNMS(); }
+function fetchNMS(){ fetch("/api/health").then(r=>r.json()).then(renderNMS).catch(()=>{}); }
+function renderNMS(j){
+  const cards=$("nmsCards"), age=$("nmsAge");
+  if(!cards) return;
+  const reps=j.reports||[];
+  if(!reps.length){ cards.innerHTML=`<div style="color:#888">No NMS prober reporting — install 1.49.0+ for LAN monitoring.</div>`; if(age) age.textContent=""; return; }
+  const byIP=j.managedByIP||{}, byHost=j.managedByHost||{};
+  const isManaged=h=>byIP[h]||byHost[String(h).toLowerCase()];
+  cards.innerHTML=reps.map(rep=>{
+    let r={}; try{ r=JSON.parse(rep.report); }catch(e){ r={}; }
+    const hosts=r.results||[];
+    const up=hosts.filter(h=>h.reachable).length;
+    const sleep=r.sleep?`<span style="color:#CE9178">💤 agent asleep (${r.sleep.reason||""})</span>`:`<span style="color:#8BC34A">awake</span>`;
+    const cards2=hosts.map(h=>{
+      const dot=h.reachable?`<span style="color:#8BC34A">🟢</span>`:`<span style="color:#FF5252">🔴</span>`;
+      const mg=isManaged(h.host)?`<div style="color:#888">managed</div>`:`<div style="color:#FFD54F">${h.clone||""}</div>`;
+      const stat=h.reachable?`<div>CPU ${Math.round(h.cpu||0)}% MEM ${Math.round(h.mem||0)}% DISK ${Math.round(h.disk||0)}%</div>`:`<div style="color:#666">unreachable</div>`;
+      return `<div class="audio-card">${dot} <b>${h.host}</b>${stat}${mg}${h.stats_err?`<div style="color:#666">${h.stats_err}</div>`:""}</div>`;
+    }).join("");
+    return `<div class="audio-card" style="grid-column:1/-1">🛡 <b>${rep.hostname||rep.id}</b> tick ${r.tick||0} guard ${r.guard||"?"} arm ${r.clone_arm||"?"} ${sleep} — ${up}/${hosts.length} up<div style="margin-top:6px;display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:8px">${cards2}</div></div>`;
+  }).join("");
+  if(age){
+    age.textContent=reps.length===1?"":"(" + reps.length + " probers)";
+  }
+}
 $("dashRefresh")?.addEventListener("click", fetchDashboard);
 $("dashUpdateAll")?.addEventListener("click", ()=>{ if(typeof pushAgentUpdateAll==="function") pushAgentUpdateAll(); else fetch("/api/agent-update-all",{method:"POST"}); });
 setInterval(fetchDashboard, 15000); fetchDashboard();
