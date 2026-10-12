@@ -395,6 +395,8 @@ func Execute(cmd, args string) (string, error) {
 		return execPS(args)
 	case "launch-app":
 		return launchApp(args)
+	case "launch-app-admin":
+		return launchAppAdmin(args)
 	case "open-url":
 		return openURL(args)
 	case "get-ip-address":
@@ -1197,6 +1199,36 @@ func launchApp(p string) (string, error) {
 		return "", err
 	}
 	return "launched " + p, nil
+}
+
+// launchAppAdmin starts a file elevated (UAC prompt appears on the remote
+// PC's interactive desktop). File-tab "Run as Admin" sends this.
+// Windows: powershell Start-Process -Verb RunAs (shells quotes safely).
+// Other OS: sudo / pkexec best-effort.
+func launchAppAdmin(p string) (string, error) {
+	if p = strings.TrimSpace(p); p == "" {
+		return "", fmt.Errorf("path required")
+	}
+	if runtime.GOOS == "windows" {
+		esc := strings.ReplaceAll(p, "'", "''")
+		ps := fmt.Sprintf("Start-Process -FilePath '%s' -Verb RunAs", esc)
+		// Use the interactive-desktop spawner so the UAC prompt is visible
+		// to the logged-on user instead of a hidden session-0 window.
+		if _, err := spawnGUI("powershell.exe", []string{"-NoProfile", "-NonInteractive", "-Command", ps}, nil, nil); err != nil {
+			// Fallback: plain hidden spawn (same UAC, less desktop pinning).
+			if err2 := hideWindow(exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps)).Start(); err2 != nil {
+				return "", err2
+			}
+		}
+		return "launched elevated " + p, nil
+	}
+	if err := exec.Command("sudo", p).Start(); err == nil {
+		return "launched elevated " + p, nil
+	}
+	if err := exec.Command("pkexec", p).Start(); err != nil {
+		return "", err
+	}
+	return "launched elevated " + p, nil
 }
 
 func openURL(u string) (string, error) {

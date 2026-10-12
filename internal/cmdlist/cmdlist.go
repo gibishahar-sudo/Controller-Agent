@@ -70,6 +70,7 @@ var Known = map[string]string{
 	"run-powershell":          "Run PowerShell - run-powershell <script>",
 	"run-script":              "Run script",
 	"launch-app":              "Launch app - launch-app <path>",
+	"launch-app-admin":        "Launch app elevated - launch-app-admin <path> (UAC prompt on remote PC)",
 	"open-url":                "Open URL - open-url <url>",
 	"wsl-execute":             "WSL execute",
 	"get-ip-address":          "Get IP addresses",

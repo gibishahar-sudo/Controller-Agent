@@ -406,6 +406,9 @@ func (s *Server) startHTTP(addr, dir string) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{"agents": s.Agents()})
 	})
+	// Real LAN discovery: ARP cache + TCP sweep for house PCs that have no
+	// agent yet (old Discover only listed dialed-in agents). See lanscan.go.
+	mux.HandleFunc("/api/lan-scan", s.handleLanScan)
 	// Live remote-audio stream health (played/dropped/concealed/gaps) for
 	// the Audio tab readout — dropouts are diagnosed, not guessed.
 	mux.HandleFunc("/api/audio-stats", func(w http.ResponseWriter, r *http.Request) {
@@ -1039,6 +1042,9 @@ func (s *Server) startHTTP(addr, dir string) {
 			"b64": cmd[len("powershell -EncodedCommand "):],
 		})
 	})
+	// Auto-clone: run the install one-liner ON a LAN PC (admin creds).
+	// See clone.go. LAN-only by design.
+	mux.HandleFunc("/api/clone", s.handleClone)
 
 	s.httpSrv = &http.Server{
 		Addr:              addr,
