@@ -438,6 +438,66 @@ func TestCloneJobDedupeCooldown(t *testing.T) {
 	}
 }
 
+// sweepTargets unifies sweep cache + fresh ARP seeds + extra hosts, deduped.
+func TestSweepTargetsUnify(t *testing.T) {
+	withNMSRoot(t, t.TempDir())
+	freezeSweepCache(t)
+	oldSeed := arpSeedHosts
+	arpSeedHosts = func() []string { return []string{"192.0.2.7", "192.0.2.60"} }
+	t.Cleanup(func() { arpSeedHosts = oldSeed })
+	_ = SaveNMSConfig(NMSConfig{IntervalSec: 60, SweepEveryMin: 5, Subnets: []string{},
+		ExtraHosts: []string{"192.0.2.60", "192.0.2.61"}})
+	got := sweepTargets(LoadNMSConfig())
+	if len(got) != 3 || got[0] != "192.0.2.7" || got[1] != "192.0.2.60" || got[2] != "192.0.2.61" {
+		t.Fatalf("targets: got %v", got)
+	}
+}
+
+// Numeric IP ordering: 192.168.1.100 after .20; garbage sorts last.
+func TestIPLess(t *testing.T) {
+	if !ipLess("192.168.1.20", "192.168.1.100") || ipLess("192.168.1.100", "192.168.1.20") {
+		t.Fatal("numeric octet order wrong")
+	}
+	if !ipLess("10.0.0.1", "nope") || ipLess("nope", "10.0.0.1") {
+		t.Fatal("non-IP must sort last")
+	}
+	if ipLess("abc", "abd") == ipLess("abd", "abc") {
+		t.Fatal("non-IP tiebreak must be lexical")
+	}
+}
+
+// nms-now sees the same targets as a cycle (ARP seeds included).
+func TestNMSNowSeesArp(t *testing.T) {
+	withNMSRoot(t, t.TempDir())
+	stubDiscoveryNil(t)
+	oldSeed := arpSeedHosts
+	arpSeedHosts = func() []string { return []string{"192.0.2.81", "192.0.2.82"} }
+	t.Cleanup(func() { arpSeedHosts = oldSeed })
+	res, err := NMSHandle("nms-now", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(res, "nms-now: 0/2 reachable") {
+		t.Fatalf("nms-now: got %q", res)
+	}
+}
+
+// nms-status reports the truthful target/arp breakdown.
+func TestNMSStatusCountsArp(t *testing.T) {
+	withNMSRoot(t, t.TempDir())
+	freezeSweepCache(t)
+	oldSeed := arpSeedHosts
+	arpSeedHosts = func() []string { return []string{"192.0.2.91", "192.0.2.92"} }
+	t.Cleanup(func() { arpSeedHosts = oldSeed })
+	res, err := NMSHandle("nms-status", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(res, "targets=2 sweep=0 arp=2") {
+		t.Fatalf("status counts: got %q", res)
+	}
+}
+
 // ProbeHost with fakes: reachable, unmanaged, stats land, no error text.
 func TestProbeHostFaked(t *testing.T) {
 	oldDial, oldRead, oldStats := dialTCP, nmsReadUNC, remoteStatsCIM

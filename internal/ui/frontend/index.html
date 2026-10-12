@@ -3244,9 +3244,20 @@ function renderNMS(j){
     const hosts=r.results||[];
     const up=hosts.filter(h=>h.reachable).length;
     const sleep=r.sleep?`<span style="color:#CE9178">💤 agent asleep (${r.sleep.reason||""})</span>`:`<span style="color:#8BC34A">awake</span>`;
+    const cloneLabel=s=>{
+      if(!s||s==="self") return "";
+      if(s==="cloning") return `🔄 cloning…`;
+      if(s==="cloned-verified") return `✅ cloned + verified`;
+      if(s==="launched-unverified") return `📤 launched — awaiting verify`;
+      if(s==="no-payload") return `❌ no installer payload`;
+      if(s==="copy-failed"||s==="launch-failed") return `❌ ${s}`;
+      if(s.indexOf("clone-cooldown-")===0) return `⏳ cooling down (${s.slice(15)})`;
+      if(s.indexOf("skip-")===0) return `<span style="color:#666">skip ${s.slice(5)}</span>`;
+      return s;
+    };
     const cards2=hosts.map(h=>{
       const dot=h.reachable?`<span style="color:#8BC34A">🟢</span>`:`<span style="color:#FF5252">🔴</span>`;
-      const mg=isManaged(h.host)?`<div style="color:#888">managed</div>`:(h.managed_unknown?`<div style="color:#FFD54F">❓ unknown — skipped</div>`:`<div style="color:#FFD54F">${h.clone||""}</div>`);
+      const mg=isManaged(h.host)?`<div style="color:#888">managed</div>`:(h.managed_unknown?`<div style="color:#FFD54F">❓ unknown — skipped</div>`:`<div style="color:#FFD54F">${cloneLabel(h.clone)}</div>`);
       const stat=h.reachable?`<div>CPU ${Math.round(h.cpu||0)}% MEM ${Math.round(h.mem||0)}% DISK ${Math.round(h.disk||0)}%</div>`:`<div style="color:#666">unreachable</div>`;
       return `<div class="audio-card">${dot} <b>${h.host}</b>${stat}${mg}${h.clone_detail?`<div style="color:#666">${h.clone_detail}</div>`:""}${h.stats_err?`<div style="color:#666">${h.stats_err}</div>`:""}</div>`;
     }).join("");

