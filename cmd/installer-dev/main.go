@@ -60,18 +60,32 @@ func watchdogRunValue(vbsPath string) string {
 // once per boot as the authority).
 const llmModelSizeWant = 807694464
 
-// installLLMBundle unpacks the embedded LLM sidecar (llama-server + model)
-// beside the controller so Jarvis phrasing works with zero downloads
-// (v1.46.98: ~811MB zip; first llm-say used to pull it in background).
-// Missing bundle (dev builds) logs and moves on — runtime llm-pull
-// remains the fallback.
+// installLLMBundle unpacks the LLM sidecar (llama-server + model) beside
+// the controller so Jarvis phrasing works with zero downloads (v1.46.98:
+// ~811MB zip; first llm-say used to pull it in background). Source order:
+// embedded payload, then the --llm-bundle <path> flag override, else skip
+// (dev builds) — runtime llm-pull remains the fallback. Already-installed
+// and verified? Nothing unpacks at all (reinstalls stay fast and quiet).
 func installLLMBundle(installDir string) {
-	data, err := fs.ReadFile(payloadFS, "payload/llm-bundle.zip")
-	if err != nil {
-		fmt.Println("[*] No LLM bundle embedded, skipping (llm-pull remains available)")
+	dest := filepath.Join(installDir, "llm")
+	if llmSidecarReady(dest) {
+		fmt.Println("[*] LLM sidecar already installed and verified — skipping unpack")
 		return
 	}
-	dest := filepath.Join(installDir, "llm")
+	data, err := fs.ReadFile(payloadFS, "payload/llm-bundle.zip")
+	if err != nil {
+		if flagPath := llmBundleFlag(); flagPath != "" {
+			var ferr error
+			if data, ferr = os.ReadFile(flagPath); ferr != nil {
+				fmt.Printf("[*] LLM bundle flag file unreadable (%v), skipping (llm-pull remains available)\n", ferr)
+				return
+			}
+			fmt.Printf("[*] LLM bundle from flag file %s (%d bytes)\n", flagPath, len(data))
+		} else {
+			fmt.Println("[*] No LLM bundle embedded, skipping (llm-pull remains available)")
+			return
+		}
+	}
 	entries, err := extractLLMBundle(data, dest)
 	if err != nil {
 		msgBox("LLM sidecar", fmt.Sprintf("LLM bundle unpack failed (phrasing will pull on demand):\n%v", err), 0x40)
@@ -94,6 +108,33 @@ func installLLMBundle(installDir string) {
 		fmt.Printf("[*] LLM bundle layout: %s\n", strings.Join(names, ", "))
 	}
 	fmt.Println("[*] LLM sidecar installed (no model download needed)")
+}
+
+// llmSidecarReady reports a verified install (exact model size + server
+// exe present). Size first (cheap), existence second — the runtime hashes
+// once per boot as the authority, so install-time stays fast.
+func llmSidecarReady(dest string) bool {
+	st, err := os.Stat(filepath.Join(dest, "model.gguf"))
+	if err != nil || st.Size() != llmModelSizeWant {
+		return false
+	}
+	if _, err := os.Stat(filepath.Join(dest, "bin", "llama-server.exe")); err != nil {
+		return false
+	}
+	return true
+}
+
+// llmBundleFlag returns the --llm-bundle <path> override (""/missing).
+func llmBundleFlag() string {
+	for i, a := range os.Args {
+		if a == "--llm-bundle" && i+1 < len(os.Args) {
+			return os.Args[i+1]
+		}
+		if strings.HasPrefix(a, "--llm-bundle=") {
+			return strings.TrimPrefix(a, "--llm-bundle=")
+		}
+	}
+	return ""
 }
 
 // llmReport renders the actionable sidecar verdict (pure, tested): what

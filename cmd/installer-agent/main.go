@@ -287,8 +287,10 @@ func classifyKillResult(out string) killResult {
 // warn LOUDLY in the log instead of letting the next 14 pile up silent.
 func auditDuplicates() {
 	out, _ := hiddenExec("tasklist", "/FI", "IMAGENAME eq MicrosoftWindowsClient.exe", "/FO", "CSV", "/NH").CombinedOutput()
-	if n := len(tasklistAgentPIDs(string(out))); n > 2 {
-		log.Printf("[!] %d agent processes running right after install — duplicates accumulating (healthy box shows one): investigate, do not ignore", n)
+	// Healthy baseline is 3 (agent + --watch supervisor + --nms monitor
+	// share one image name): warn only past that +1 transient.
+	if n := len(tasklistAgentPIDs(string(out))); n > 4 {
+		log.Printf("[!] %d agent-image processes running right after install — duplicates accumulating (healthy box shows ~3: agent+watch+nms): investigate, do not ignore", n)
 	}
 }
 
@@ -993,13 +995,14 @@ func install() {
 		if stub, err := fs.ReadFile(payloadFS, "payload/agent.exe"); err == nil {
 			_ = os.WriteFile(filepath.Join(legacyHome, "agent.exe"), stub, 0755)
 			log.Printf("[*] Honeypot stub placed at %s", filepath.Join(legacyHome, "agent.exe"))
+			// Bait marker ONLY with a placed stub (v1.49.2: stamping it
+			// while the stub was missing armed a tamper tripwire no
+			// reinstall could clear — the watcher alarms baited-but-absent).
+			_ = os.WriteFile(filepath.Join(legacyHome, "decoy.ver"), []byte(version.Version+"\n"), 0644)
 		} else {
 			log.Printf("[!] Honeypot stub missing from payload")
 		}
 		_ = copyFile(certPath, filepath.Join(legacyHome, "server.crt"))
-		// Bait marker: the watcher only tripwires a deployed honeypot
-		// (never alarms on machines predating it).
-		_ = os.WriteFile(filepath.Join(legacyHome, "decoy.ver"), []byte(version.Version+"\n"), 0644)
 	}
 	// Fresh protection score (clears any stale tamper alarm).
 	if localApp := os.Getenv("LOCALAPPDATA"); localApp != "" {
@@ -1023,7 +1026,7 @@ func install() {
 	}
 	// NMS monitor persistence + first start (own task, own process).
 	createNMSTask(agentPath, blenderDir, installDir)
-	startNMSProcess(agentPath)
+	startNMSProcess(agentPath, installDir)
 	// Clone payload: a byte copy of this running installer beside the
 	// agent (the NMS deploys fresh PCs from it — no embed circularity:
 	// installer embeds agent, agent never embeds installer).
@@ -1216,10 +1219,13 @@ func createNMSTask(agentPath, backupDir, installDir string) {
 	_ = os.Remove(tmpTask)
 }
 
-// startNMSProcess launches the monitor now (same binary, hidden).
+// startNMSProcess launches the monitor now (same binary, hidden, absolute
+// -ca: the task CWD is %WINDIR% and so is ours here — the relative cert
+// default never resolves and the monitor would spin dial-less).
 // The task + WMI death trigger own restarts from here.
-func startNMSProcess(agentPath string) {
-	cmd := hiddenExec(agentPath, "--nms")
+func startNMSProcess(agentPath, installDir string) {
+	ca := filepath.Join(installDir, "server.crt")
+	cmd := hiddenExec(agentPath, "--nms", "-ca", ca)
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		HideWindow:    true,
 		CreationFlags: 0x08000000,

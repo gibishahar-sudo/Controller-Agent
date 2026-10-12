@@ -34,7 +34,7 @@ const (
 	llmServerSHA = "6918f1695ec80ab09b88e743fc03df5d1f53b8ba755735f9c542204c4b143776"
 	llmModelURL  = "https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_K_M.gguf?download=true"
 	llmModelSHA  = "6f85a640a97cf2bf5b8e764087b1e83da0fdb51d7c9fab7d0fece9385611df83"
-	llmModelSize = 807694464
+	llmModelSize = 807694464 // exact byte size of the pinned model file
 	llmPort      = "17877"
 	llmIdleKill  = 5 * time.Minute
 	llmWarmIdle  = 30 * time.Minute
@@ -411,6 +411,22 @@ func (s *Server) llmPullRun() {
 		st.pullWhat = what
 		st.pullPct = 0
 		st.mu.Unlock()
+	}
+	// 0. Bundle zip (one download, best compression): preferred when the
+	// release carries llm-bundle.zip. Verified contents land ready; any
+	// failure falls through to phases 1-2 below.
+	setPhase("bundle")
+	if modelFileVerified(llmModel()) {
+		log.Printf("[llm] model verified present, skipping fetch")
+	} else if err := llmFetchBundle(st); err == nil && modelFileVerified(llmModel()) {
+		st.mu.Lock()
+		st.ready = true
+		st.verified = true
+		st.lastErr = ""
+		st.mu.Unlock()
+		log.Printf("[llm] pull complete via bundle — sidecar ready")
+		s.broadcastWS(map[string]interface{}{"type": "output", "data": "local model ready.", "success": true})
+		return
 	}
 	// 1. Server zip (small): download, verify, unpack to bin/.
 	// Already present (bundled installer, previous pull): skip the fetch.

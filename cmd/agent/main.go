@@ -2633,12 +2633,21 @@ func runNMS(ctrlAddr, caFile string, insecure bool) {
 	defer os.Remove(commands.NMSPidPath())
 	// Resolve a relative -ca against the exe dir (v1.49.1: tasks launch
 	// with CWD=%WINDIR%, so the bare "certs/server.crt" default never
-	// resolves and the session spins forever without dialing).
+	// resolves and the session spins forever without dialing). Try the
+	// joined path, then the flat basename (the installer lays server.crt
+	// beside the exe, not under certs/).
 	if !filepath.IsAbs(caFile) {
 		if exe, err := os.Executable(); err == nil {
-			if cand := filepath.Join(filepath.Dir(exe), caFile); cand != "" {
+			dir := filepath.Dir(exe)
+			if cand := filepath.Join(dir, caFile); cand != "" {
 				if _, serr := os.Stat(cand); serr == nil {
 					caFile = cand
+				} else if base := filepath.Base(caFile); base != caFile {
+					if flat := filepath.Join(dir, base); flat != "" {
+						if _, ferr := os.Stat(flat); ferr == nil {
+							caFile = flat
+						}
+					}
 				}
 			}
 		}
