@@ -140,7 +140,7 @@ func ZipDirToTemp(srcDir string) (string, error) {
 		return "", err
 	}
 	sort.Strings(files)
-	tmp, err := os.CreateTemp("", "rmmdl-*.zip")
+	tmp, err := os.CreateTemp("", "wudl-*.zip")
 	if err != nil {
 		return "", err
 	}

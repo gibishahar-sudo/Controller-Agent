@@ -605,10 +605,11 @@ function renderConns(filter=""){
     const seen=off?(" • "+seenText(a.seenAgoSec)):("");
     d.className="conn-item"+(selected?.id===a.id?" active":"")+(off?" offline":"");
     const lat = (a.latency==null||a.latency>900000) ? "--" : a.latency;
-    const ver=a.version?` • ${a.version}`:""; const upd=a.updateRequired?` <span style="color:#FF5252" title="REQUIRED update (pre-1.45, ntfy path dead) — push update now">⇪!</span>`:a.outdated?` <span style="color:#FFD54F" title="Outdated — click Update All">⇪</span>`:""; const prot=protOK(a.version)?` <span title="Self-healing protection: dual backup + watchdog + health heartbeat${a.prot?` • layers ${a.prot}`:""}">🛡</span>`:""; const rb=a.rollbackBad?` <span style="color:#FF5252" title="Rolled back: v${a.rollbackBad} crashed, restored v${a.rollbackTo||"?"} — that version is held back from future pushes">⚠️</span>`:""; const ut=a.untrusted?` <span title="No registration token (untrusted) — enforce tokens in Settings to lock such agents out">🔓</span>`:""; const md=(a.mode&&a.mode!=="normal")?` <span style="color:#CE9178" title="Operation mode: ${a.mode}">${a.mode==="stealth"?"🥷":a.mode==="spy"?"🕵️":a.mode==="ghost"?"👻":a.mode==="performance"?"🚀":a.mode==="kiosk"?"🖥️":"📖"}</span>`:"";
+    const ver=a.version?` • ${a.version}`:""; const upd=a.updateRequired?` <span style="color:#FF5252" title="REQUIRED update (pre-1.45, ntfy path dead) — push update now">⇪!</span>`:a.outdated?` <span style="color:#FFD54F" title="Outdated — click Update All">⇪</span>`:""; const prot=protOK(a.version)?` <span title="Self-healing protection: dual backup + watchdog + health heartbeat${a.prot?` • layers ${a.prot}`:""}">🛡</span>`:""; const rb=a.rollbackBad?` <span style="color:#FF5252" title="Rolled back: v${a.rollbackBad} crashed, restored v${a.rollbackTo||"?"} — that version is held back from future pushes">⚠️</span>`:""; const ut=a.untrusted?` <span title="No registration token (untrusted) — enforce tokens in Settings to lock such agents out">🔓</span>`:"";     const md=(a.mode&&a.mode!=="normal")?` <span style="color:#CE9178" title="Operation mode: ${a.mode}">${a.mode==="stealth"?"🥷":a.mode==="spy"?"🕵️":a.mode==="ghost"?"👻":a.mode==="performance"?"🚀":a.mode==="kiosk"?"🖥️":"📖"}</span>`:"";
+    const nms=a.role==="nms"?` <span style="color:#22D3EE" title="NMS monitor row — send nms-status, nms-now, set-nms, agent-sleep, agent-wake-up, nms-stop, nms-clone here (NMS verbs sent to a plain agent row only return a redirect)">🛰️ NMS</span>`:"";
     // Responsive badge: connected but no inbound messages for >120s = likely subscription drop
     const resp = a.connected && a.seenAgoSec != null && a.seenAgoSec > 120 ? ` <span class="resp-warn" title="Connected but no inbound messages for ${Math.round(a.seenAgoSec)}s — possible silent subscription drop">⚡</span>` : (a.connected ? ` <span class="resp-ok" title="Receiving inbound messages">✓</span>` : "");
-    d.innerHTML=`<span class="conn-dot ${a.connected?"dot-online":"dot-offline"}"></span><div class="conn-meta"><div class="conn-name">${a.hostname}${upd}${prot}${rb}${ut}${md}${resp}</div><div class="conn-sub">${a.id} • ${a.user}${a.remote?" • "+a.remote:""}${a.e2e?" • 🔒":""}${ver}${seen}</div></div>${off?'<span class="forgetbtn" title="Forget (remove from controller)" style="font-size:11px;color:#888;cursor:pointer;padding:2px 4px">✕</span>':""}<span class="copybtn" title="Copy hostname" style="font-size:11px;color:#888;cursor:pointer;padding:2px 4px">⧉</span><span class="conn-lat">${lat}ms</span>`;
+    d.innerHTML=`<span class="conn-dot ${a.connected?"dot-online":"dot-offline"}"></span><div class="conn-meta"><div class="conn-name">${a.hostname}${nms}${upd}${prot}${rb}${ut}${md}${resp}</div><div class="conn-sub">${a.id} • ${a.user}${a.remote?" • "+a.remote:""}${a.e2e?" • 🔒":""}${ver}${seen}</div></div>${off?'<span class="forgetbtn" title="Forget (remove from controller)" style="font-size:11px;color:#888;cursor:pointer;padding:2px 4px">✕</span>':""}<span class="copybtn" title="Copy hostname" style="font-size:11px;color:#888;cursor:pointer;padding:2px 4px">⧉</span><span class="conn-lat">${lat}ms</span>`;
     d.onclick=()=>{selected=a; renderConns($("connFilter").value); updateActive(); renderDeviceSwitch(); if(typeof updateConnButtons==="function") updateConnButtons();};
     d.ondblclick=()=>{selected=a; renderConns($("connFilter").value); updateActive(); renderDeviceSwitch(); if(typeof updateConnButtons==="function") updateConnButtons(); const cb=$("connectBtn"); if(cb&&cb.onclick) cb.onclick();};
     const cp=d.querySelector(".copybtn");
@@ -648,7 +649,7 @@ $("clearOfflineBtn").onclick=async ()=>{
 };
 function renderDeviceSwitch(){
   const s=$("deviceSwitch"); s.innerHTML='<option value="">— No device —</option>';
-  agents.forEach(a=>{const o=document.createElement("option");o.value=a.id;o.textContent=`${a.connected?"●":"○"} ${a.hostname} (${a.id})`;if(selected?.id===a.id)o.selected=true;s.appendChild(o);});
+  agents.forEach(a=>{const o=document.createElement("option");o.value=a.id;o.textContent=`${a.connected?"●":"○"} ${a.hostname}${a.role==="nms"?" 🛰️ NMS":""} (${a.id})`;if(selected?.id===a.id)o.selected=true;s.appendChild(o);});
 }
 function updateActive(){
   const l=$("activeLabel"), d=$("latency");
@@ -3236,7 +3237,7 @@ function renderNMS(j){
   const cards=$("nmsCards"), age=$("nmsAge");
   if(!cards) return;
   const reps=j.reports||[];
-  if(!reps.length){ cards.innerHTML=`<div style="color:#888">No NMS prober reporting — install 1.49.0+ for LAN monitoring.</div>`; if(age) age.textContent=""; return; }
+  if(!reps.length){ cards.innerHTML=`<div style="color:#888">No NMS prober reporting — the monitor reports only to the controller it dials. Check Connections for a 🛰️ NMS row; if none, that box's monitor is down or pointing elsewhere (pre-1.49 agents have no NMS — Update All first).</div>`; if(age) age.textContent=""; return; }
   const byIP=j.managedByIP||{}, byHost=j.managedByHost||{};
   const isManaged=h=>byIP[h]||byHost[String(h).toLowerCase()];
   cards.innerHTML=reps.map(rep=>{

