@@ -397,6 +397,12 @@ func TestCloneJobDedupeCooldown(t *testing.T) {
 	if got := findHost(first)["clone"]; got != "cloning" {
 		t.Fatalf("first cycle: clone=%v, want cloning", got)
 	}
+	// The launch runs in a goroutine: allow it a scheduling slice instead
+	// of asserting before it can run (flakes under a loaded suite).
+	launchDeadline := time.Now().Add(5 * time.Second)
+	for calls < 1 && time.Now().Before(launchDeadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
 	if calls != 1 {
 		t.Fatalf("first cycle must launch once, launched %d", calls)
 	}
