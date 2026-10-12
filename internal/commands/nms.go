@@ -31,6 +31,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
@@ -468,15 +469,29 @@ func autoSubnets() []string {
 	return out
 }
 
-// expandSubnet lists candidate host IPs in a /24 (skips .0/.255). Pure, tested.
+// expandSubnet lists candidate host IPs in a /24 (skips .0/.255). Strict:
+// only an exact numeric a.b.c.d/24 expands (the 4th octet selects the same
+// /24, so sloppy-but-equivalent bases still work); a /16, a hostname, or
+// garbage yields nothing instead of a silently wrong range.
 func expandSubnet(sn string) []string {
+	if !strings.HasSuffix(sn, "/24") {
+		return nil
+	}
 	parts := strings.Split(strings.TrimSuffix(sn, "/24"), ".")
 	if len(parts) != 4 {
 		return nil
 	}
+	nums := make([]int, 4)
+	for i, p := range parts {
+		n, err := strconv.Atoi(strings.TrimSpace(p))
+		if err != nil || n < 0 || n > 255 {
+			return nil
+		}
+		nums[i] = n
+	}
 	var out []string
 	for i := 1; i <= 254; i++ {
-		out = append(out, fmt.Sprintf("%s.%s.%s.%d", parts[0], parts[1], parts[2], i))
+		out = append(out, fmt.Sprintf("%d.%d.%d.%d", nums[0], nums[1], nums[2], i))
 	}
 	return out
 }
@@ -488,15 +503,16 @@ func expandSubnet(sn string) []string {
 
 // NMSHostResult is one host's probe outcome.
 type NMSHostResult struct {
-	Host        string  `json:"host"`
-	Reachable   bool    `json:"reachable"`
-	CPU         float64 `json:"cpu"`
-	Mem         float64 `json:"mem"`
-	Disk        float64 `json:"disk"`
-	ManagedHint bool    `json:"managed_hint"`
-	CloneState  string  `json:"clone"`
-	CloneDetail string  `json:"clone_detail,omitempty"`
-	StatsErr    string  `json:"stats_err,omitempty"`
+	Host           string  `json:"host"`
+	Reachable      bool    `json:"reachable"`
+	CPU            float64 `json:"cpu"`
+	Mem            float64 `json:"mem"`
+	Disk           float64 `json:"disk"`
+	ManagedHint    bool    `json:"managed_hint"`
+	ManagedUnknown bool    `json:"managed_unknown,omitempty"`
+	CloneState     string  `json:"clone"`
+	CloneDetail    string  `json:"clone_detail,omitempty"`
+	StatsErr       string  `json:"stats_err,omitempty"`
 }
 
 // dialTCP dials host:port with timeout. Var for tests.
@@ -543,43 +559,59 @@ func managedHintPath(host string) string {
 	return `\\` + host + `\ADMIN$\Microsoft\Windows\Update\version.txt`
 }
 
-// nmsFileStat is a var so tests cut the SMB dependency.
-var nmsFileStat = func(path string) (string, bool) {
-	done := make(chan struct {
-		s   string
-		ok  bool
-	}, 1)
+// nmsReadUNC reads a (possibly remote ADMIN$) file with a hard timeout. Var
+// so tests cut the SMB dependency. Errors are significant: callers must
+// distinguish "no such file" (unmanaged) from "denied / timed out"
+// (unknown — never auto-clone on unknown).
+var nmsReadUNC = func(path string) ([]byte, error) {
+	type res struct {
+		b   []byte
+		err error
+	}
+	done := make(chan res, 1)
 	go func() {
 		b, err := os.ReadFile(path)
-		if err != nil {
-			done <- struct {
-				s   string
-				ok  bool
-			}{"", false}
-			return
-		}
-		done <- struct {
-			s   string
-			ok  bool
-		}{strings.TrimSpace(string(b)), true}
+		done <- res{b, err}
 	}()
 	select {
 	case r := <-done:
-		return r.s, r.ok
+		return r.b, r.err
 	case <-time.After(8 * time.Second):
+		return nil, fmt.Errorf("unc read timed out")
+	}
+}
+
+// nmsFileStat is a var so tests cut the SMB dependency.
+var nmsFileStat = func(path string) (string, bool) {
+	b, err := nmsReadUNC(path)
+	if err != nil {
 		return "", false
 	}
+	return strings.TrimSpace(string(b)), true
 }
 
 // ManagedHint reports whether host already has an agent install (its own
 // NMS owns repair there — never reinstall a managed box).
 func ManagedHint(host string) bool {
+	managed, _ := ManagedHintChecked(host)
+	return managed
+}
+
+// ManagedHintChecked is ManagedHint with the ambiguous third state: unknown
+// is true when the check itself failed (denied/timed out/off-Windows)
+// instead of proving absence. The clone arm treats unknown as a veto — a
+// managed box that refuses the share read must never look "unmanaged".
+func ManagedHintChecked(host string) (managed, unknown bool) {
 	p := managedHintPath(host)
 	if p == "" {
-		return false
+		return false, true
 	}
-	_, ok := nmsFileStat(p)
-	return ok
+	if _, err := nmsReadUNC(p); err == nil {
+		return true, false
+	} else if os.IsPermission(err) || isAccessDenied(err.Error()) || strings.Contains(strings.ToLower(err.Error()), "timed out") {
+		return false, true
+	}
+	return false, false
 }
 
 // remoteStatsCIM queries one Windows host via a hidden powershell CIM
@@ -652,20 +684,31 @@ func remoteStatsCIMCred(host string, timeout time.Duration) (float64, float64, f
 	return r.CPU, r.Mem, r.Disk, nil
 }
 
-// ProbeHost probes one host fully (bounded by caller).
+// ProbeHost probes one host fully (bounded by caller). The managed-hint
+// share read and the CIM stats query run concurrently: serially they cost up
+// to ~33s per host and stall whole cycles on big LANs.
 func ProbeHost(host string) NMSHostResult {
 	r := NMSHostResult{Host: host}
 	if !TCPReachable(host) {
 		return r
 	}
 	r.Reachable = true
-	r.ManagedHint = ManagedHint(host)
-	c, m, d, err := remoteStatsCIM(host, 25*time.Second)
-	if err != nil {
-		r.StatsErr = err.Error()
-		return r
-	}
-	r.CPU, r.Mem, r.Disk = c, m, d
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		r.ManagedHint, r.ManagedUnknown = ManagedHintChecked(host)
+	}()
+	go func() {
+		defer wg.Done()
+		c, m, d, err := remoteStatsCIM(host, 25*time.Second)
+		if err != nil {
+			r.StatsErr = err.Error()
+			return
+		}
+		r.CPU, r.Mem, r.Disk = c, m, d
+	}()
+	wg.Wait()
 	return r
 }
 
@@ -764,21 +807,52 @@ func writeFileAtomic(path string, data []byte) error {
 	return os.Rename(tmp, path)
 }
 
+// goldenCache avoids re-reading our own multi-MB image every cycle. Keyed on
+// the live file's size+mtime: an update replacing bytes under us must NOT
+// keep restoring a stale image — the guard always compares against current
+// bytes (nmsUpdateAvailable exits the loop on version drift regardless).
+var goldenMu sync.Mutex
+var goldenPath string
+var goldenSize int64
+var goldenMtime time.Time
+var goldenData []byte
+var goldenSHACache string
+
+// goldenImage returns our own image bytes + sha, reusing the cache only
+// while the executable file on disk still matches (size+mtime).
+func goldenImage() ([]byte, string, bool) {
+	self, err := os.Executable()
+	if err != nil {
+		return nil, "", false
+	}
+	st, err := os.Stat(self)
+	if err != nil {
+		return nil, "", false
+	}
+	goldenMu.Lock()
+	defer goldenMu.Unlock()
+	if self == goldenPath && st.Size() == goldenSize && st.ModTime().Equal(goldenMtime) && len(goldenData) >= 1024*1024 {
+		return goldenData, goldenSHACache, true
+	}
+	b, err := os.ReadFile(self)
+	if err != nil || len(b) < 1024*1024 {
+		return nil, "", false
+	}
+	goldenPath, goldenSize, goldenMtime = self, st.Size(), st.ModTime()
+	goldenData, goldenSHACache = b, shaBytes(b)
+	return goldenData, goldenSHACache, true
+}
+
 // GuardAgent verifies the agent exe (exists + matches our own image bytes)
 // and its process; restores + restarts on any deviation. Returns a short
 // action word for the report ("ok", "restored-missing", "restored-corrupt",
 // "started-process", "no-golden").
 func GuardAgent() string {
 	agentPath := NMSAgentPath()
-	self, err := os.Executable()
-	if err != nil {
+	golden, goldenSHA, ok := goldenImage()
+	if !ok {
 		return "no-golden"
 	}
-	golden, err := os.ReadFile(self)
-	if err != nil || len(golden) < 1024*1024 {
-		return "no-golden"
-	}
-	goldenSHA := shaBytes(golden)
 	curSHA := shaFile(agentPath)
 	if curSHA == "" {
 		if werr := writeFileAtomic(agentPath, golden); werr != nil {
@@ -1005,6 +1079,97 @@ func nmsClearBreaker() {
 	breakerPausedUntil = time.Time{}
 }
 
+// nmsRecordSuccess decays the storm counter: a verified clone proves the arm
+// is healthy again (failures age out on success instead of only on manual
+// re-arm).
+func nmsRecordSuccess() {
+	breakerMu.Lock()
+	defer breakerMu.Unlock()
+	breakerFails = nil
+	breakerPausedUntil = time.Time{}
+}
+
+// ---------------------------------------------------------------------------
+// Clone job ledger: one entry per host. Kills the re-clone storm (every tick
+// launching CloneToHost for the same host) and makes CloneState honest: the
+// report carries the real terminal word, not a perpetual "job started".
+// ---------------------------------------------------------------------------
+
+// cloneHostCooldown is how long a terminal job state suppresses relaunches
+// for the same host (a dead box stays "cooling down" instead of being
+// re-pushed every interval).
+const cloneHostCooldown = 30 * time.Minute
+
+type cloneJob struct {
+	State  string
+	Detail string
+	At     time.Time
+	Done   bool
+}
+
+var cloneMu sync.Mutex
+var cloneJobs = map[string]*cloneJob{}
+var pendingCloneEvents []string
+
+// nmsCloneExec runs the clone executor. Var so tests record instead of
+// touching the LAN.
+var nmsCloneExec = CloneToHost
+
+func pushCloneEvent(s string) {
+	// Caller holds cloneMu.
+	pendingCloneEvents = append(pendingCloneEvents, s)
+	if len(pendingCloneEvents) > 20 {
+		pendingCloneEvents = pendingCloneEvents[len(pendingCloneEvents)-20:]
+	}
+}
+
+func drainCloneEvents() []string {
+	cloneMu.Lock()
+	defer cloneMu.Unlock()
+	out := append([]string{}, pendingCloneEvents...)
+	pendingCloneEvents = nil
+	return out
+}
+
+// startCloneJob launches one tracked clone unless a job is already in flight
+// or a terminal state is still cooling down. Returns the CloneState word for
+// the report and whether a new job actually started.
+func startCloneJob(host, wantVer string) (state string, started bool) {
+	now := time.Now()
+	cloneMu.Lock()
+	if j, ok := cloneJobs[host]; ok {
+		if !j.Done {
+			cloneMu.Unlock()
+			return "cloning", false
+		}
+		if now.Sub(j.At) < cloneHostCooldown {
+			st := j.State
+			cloneMu.Unlock()
+			return "clone-cooldown-" + st, false
+		}
+	}
+	cloneJobs[host] = &cloneJob{State: "cloning", Detail: "job started", At: now}
+	// Opportunistic prune: drop cold terminal entries so the map can't grow
+	// with LAN churn.
+	for h, j := range cloneJobs {
+		if j.Done && now.Sub(j.At) > 2*cloneHostCooldown {
+			delete(cloneJobs, h)
+		}
+	}
+	cloneMu.Unlock()
+	go func() {
+		st := nmsCloneExec(host, wantVer)
+		cloneMu.Lock()
+		cloneJobs[host] = &cloneJob{State: st, Detail: st, At: time.Now(), Done: true}
+		pushCloneEvent("clone " + host + ": " + st)
+		cloneMu.Unlock()
+		if st == "cloned-verified" {
+			nmsRecordSuccess()
+		}
+	}()
+	return "cloning", true
+}
+
 // ---------------------------------------------------------------------------
 // StepNMS: one full cycle. No stop channel, no mode/sleep reads —
 // structurally unstoppable. Returns ErrNMSShutdown only on the stop file.
@@ -1063,7 +1228,11 @@ func StepNMS(send func(reportJSON string), controllerIPs []string) error {
 		nmsSweepAt = time.Now()
 		nmsSweepCacheMu.Unlock()
 	}
-	targets := append(append([]string{}, swept...), cfg.ExtraHosts...)
+	// ARP seeds ride every cycle (not just on sweep refresh): a PC joining
+	// the LAN appears within one interval instead of waiting out the sweep
+	// cache (default 30min).
+	targets := append(append([]string{}, swept...), arpSeedHosts()...)
+	targets = append(targets, cfg.ExtraHosts...)
 	targets = dedupeHosts(targets)
 
 	// Probe (self first: proves the loop is alive even with zero targets).
@@ -1082,7 +1251,8 @@ func StepNMS(send func(reportJSON string), controllerIPs []string) error {
 		events = append(events, "ALARM: agent "+guard)
 	}
 
-	// Clone arm (auto): eligible reachable unmanaged hosts, bounded jobs.
+	// Clone arm (auto): eligible reachable unmanaged hosts, one tracked job
+	// per host (in-flight dedupe + cooldown, honest terminal states).
 	cloneArm := "idle"
 	if cfg.AutoClone && !CloneArmPaused() {
 		cloneArm = "scanning"
@@ -1094,6 +1264,11 @@ func StepNMS(send func(reportJSON string), controllerIPs []string) error {
 			if strings.HasSuffix(r.Host, "(self)") {
 				continue
 			}
+			if r.ManagedUnknown {
+				r.CloneState = "skip-managed-unknown"
+				r.CloneDetail = "share read denied — refusing to guess"
+				continue
+			}
 			elig, reason := CloneEligible(r.Host, r.Reachable, r.ManagedHint, cfg.Exclude, self, controllerIPs)
 			if !elig {
 				r.CloneState = "skip-" + reason
@@ -1103,17 +1278,26 @@ func StepNMS(send func(reportJSON string), controllerIPs []string) error {
 				r.CloneState = "no-payload"
 				continue
 			}
-			r.CloneState = "cloning"
-			r.CloneDetail = "job started"
-			go func(host string) {
-				_ = CloneToHost(host, version.Version)
-			}(r.Host)
+			st, started := startCloneJob(r.Host, version.Version)
+			r.CloneState = st
+			switch {
+			case started:
+				r.CloneDetail = "job started"
+			case strings.HasPrefix(st, "clone-cooldown-"):
+				r.CloneDetail = "cooling down after " + strings.TrimPrefix(st, "clone-cooldown-")
+			default:
+				r.CloneDetail = "in progress"
+			}
 		}
 	} else if CloneArmPaused() {
 		cloneArm = "paused-breaker"
 		events = append(events, "clone arm paused by circuit breaker (set-nms autoclone=on to re-arm)")
 	} else {
 		cloneArm = "off"
+	}
+	events = append(events, drainCloneEvents()...)
+	if len(events) > 25 {
+		events = events[len(events)-25:]
 	}
 
 	var sleep *NMSSleepState
@@ -1134,7 +1318,64 @@ func StepNMS(send func(reportJSON string), controllerIPs []string) error {
 	return nil
 }
 
-// sweepSubnets TCP-445-sweeps every /24 (bounded, skips .0/.255).
+// sweepTCPPorts are probed in order per IP: SMB first (fast path for
+// Windows), then RPC/EPMAP, then RDP — a firewalled box with 445 closed
+// still shows up instead of vanishing from discovery.
+var sweepTCPPorts = []int{445, 135, 3389}
+
+// sweepHit reports whether any management port answers on ip.
+func sweepHit(ip string) bool {
+	for _, p := range sweepTCPPorts {
+		if dialTCP(ip, p, 400*time.Millisecond) {
+			return true
+		}
+	}
+	return false
+}
+
+var arpIPRe = regexp.MustCompile(`(\d{1,3}(?:\.\d{1,3}){3})`)
+
+// arpSeedExec runs the neighbor-cache dump. Var so tests feed canned output.
+var arpSeedExec = func() ([]byte, error) {
+	if runtime.GOOS == "windows" {
+		return runWithTimeout(5*time.Second, "arp", "-a")
+	}
+	return runWithTimeout(5*time.Second, "sh", "-c", "ip neigh show 2>/dev/null || arp -a 2>/dev/null")
+}
+
+// arpSeedHosts lists IPs from the local ARP/neighbor cache: no probes, so a
+// firewalled house PC is visible here while answering zero TCP ports.
+// Best-effort — empty on any failure. Var so tests stay hermetic.
+var arpSeedHosts = func() []string {
+	b, err := arpSeedExec()
+	if err != nil || len(b) == 0 {
+		return nil
+	}
+	var out []string
+	seen := map[string]bool{}
+	for _, line := range strings.Split(string(b), "\n") {
+		l := strings.ToLower(line)
+		if strings.Contains(l, "interface") || strings.Contains(l, "incomplete") || strings.Contains(l, "no entry") {
+			continue
+		}
+		ipm := arpIPRe.FindString(line)
+		if ipm == "" || strings.HasPrefix(ipm, "224.") || strings.HasPrefix(ipm, "239.") {
+			continue
+		}
+		ip := net.ParseIP(ipm)
+		if ip == nil || ip.IsMulticast() || ip.IsLoopback() {
+			continue
+		}
+		if !seen[ipm] {
+			seen[ipm] = true
+			out = append(out, ipm)
+		}
+	}
+	return out
+}
+
+// sweepSubnets sweeps every subnet for any answering management port and
+// returns live IPs (bounded, skips .0/.255).
 func sweepSubnets(subnets []string) []string {
 	var ips []string
 	for _, sn := range subnets {
@@ -1152,7 +1393,7 @@ func sweepSubnets(subnets []string) []string {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			if dialTCP(ip, 445, 500*time.Millisecond) {
+			if sweepHit(ip) {
 				mu.Lock()
 				out = append(out, ip)
 				mu.Unlock()
@@ -1232,11 +1473,24 @@ func NMSHandle(cmd, args string, controllerIPs []string) (string, error) {
 		if host == "" {
 			return "", fmt.Errorf("usage: nms-clone <host>")
 		}
+		// Probe first: manual clones used to force reachable=true and skip
+		// the managed check, which could push onto an already-managed box
+		// or a dead address.
+		if !TCPReachable(host) {
+			return "", fmt.Errorf("clone refused: %s unreachable (no 445/135/3389)", host)
+		}
+		if managed, unknown := ManagedHintChecked(host); managed {
+			return "", fmt.Errorf("clone refused: %s already managed", host)
+		} else if unknown {
+			return "", fmt.Errorf("clone refused: %s managed-state unknown (share denied) — verify access first", host)
+		}
 		cfg := LoadNMSConfig()
 		if elig, reason := CloneEligible(host, true, false, cfg.Exclude, selfIPs(), controllerIPs); !elig {
 			return "", fmt.Errorf("clone refused: %s", reason)
 		}
-		go func() { _ = CloneToHost(host, version.Version) }()
+		if st, started := startCloneJob(host, version.Version); !started {
+			return "clone " + host + ": " + st + " (already tracked)", nil
+		}
 		return "clone job started for " + host, nil
 	default:
 		return "", fmt.Errorf("unknown NMS command: %s (nms-status, nms-now, set-nms, agent-sleep, agent-wake-up, nms-stop, nms-clone)", cmd)

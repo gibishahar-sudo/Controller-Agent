@@ -702,8 +702,16 @@ func (s *Server) startHTTP(addr, dir string) {
 				byHost[strings.ToLower(hn)] = id
 			}
 		}
-		s.nmsHealthMu.Lock()
-		type repOut struct {
+	s.nmsHealthMu.Lock()
+	// Prune tombstoned probers (reinstalls mint new row ids): drop reports
+	// older than 24h so the map can't grow with fleet churn.
+	cutoff := time.Now().Add(-24 * time.Hour)
+	for id, rec := range s.nmsHealth {
+		if rec.at.Before(cutoff) {
+			delete(s.nmsHealth, id)
+		}
+	}
+	type repOut struct {
 			ID       string          `json:"id"`
 			Hostname string          `json:"hostname"`
 			At       string          `json:"at"`

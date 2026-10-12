@@ -5,9 +5,45 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
+
+// resetCloneState clears the job ledger + pending events (test isolation:
+// the ledger is process-global).
+func resetCloneState() {
+	cloneMu.Lock()
+	defer cloneMu.Unlock()
+	cloneJobs = map[string]*cloneJob{}
+	pendingCloneEvents = nil
+}
+
+// stubDiscoveryNil replaces LAN discovery with "empty network" (hermetic
+// cycles for tests that don't cover discovery: Subnets:nil was meant as "no
+// targets", but LoadNMSConfig substitutes the real autoSubnets).
+func stubDiscoveryNil(t *testing.T) {
+	t.Helper()
+	oldDial, oldSeed := dialTCP, arpSeedHosts
+	dialTCP = func(string, int, time.Duration) bool { return false }
+	arpSeedHosts = func() []string { return nil }
+	t.Cleanup(func() { dialTCP, arpSeedHosts = oldDial, oldSeed })
+}
+// freezeSweepCache empties the subnet sweep cache for a test (restores after)
+// so cycles are deterministic regardless of test order.
+func freezeSweepCache(t *testing.T) {
+	t.Helper()
+	nmsSweepCacheMu.Lock()
+	oldCache, oldAt := nmsSweepCache, nmsSweepAt
+	nmsSweepCache, nmsSweepAt = nil, time.Time{}
+	nmsSweepCacheMu.Unlock()
+	t.Cleanup(func() {
+		nmsSweepCacheMu.Lock()
+		nmsSweepCache, nmsSweepAt = oldCache, oldAt
+		nmsSweepCacheMu.Unlock()
+	})
+}
 
 // withNMSRoot swaps the rendezvous root for a test (restores after).
 func withNMSRoot(t *testing.T, dir string) {
@@ -125,6 +161,7 @@ func TestShutdownSentinel(t *testing.T) {
 func TestTickAdvancesWhileAsleep(t *testing.T) {
 	dir := t.TempDir()
 	withNMSRoot(t, dir)
+	stubDiscoveryNil(t)
 	oldStart := guardStartAgent
 	guardStartAgent = func() error { return nil }
 	t.Cleanup(func() { guardStartAgent = oldStart })
@@ -177,10 +214,253 @@ func TestExpandSubnet(t *testing.T) {
 	}
 }
 
+// ManagedHint tristate: readable version.txt = managed, access-denied or
+// timeout = unknown (never clone), anything else = unmanaged.
+func TestManagedHintChecked(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("managed hint paths are Windows UNC")
+	}
+	old := nmsReadUNC
+	t.Cleanup(func() { nmsReadUNC = old })
+	if m, u := func() (bool, bool) {
+		nmsReadUNC = func(string) ([]byte, error) { return []byte("1.49.2"), nil }
+		return ManagedHintChecked("192.0.2.9")
+	}(); !m || u {
+		t.Fatalf("readable hint: got (%v,%v), want (true,false)", m, u)
+	}
+	if m, u := func() (bool, bool) {
+		nmsReadUNC = func(string) ([]byte, error) { return nil, os.ErrPermission }
+		return ManagedHintChecked("192.0.2.9")
+	}(); m || !u {
+		t.Fatalf("denied hint: got (%v,%v), want (false,true)", m, u)
+	}
+	if m, u := func() (bool, bool) {
+		nmsReadUNC = func(string) ([]byte, error) { return nil, os.ErrNotExist }
+		return ManagedHintChecked("192.0.2.9")
+	}(); m || u {
+		t.Fatalf("absent hint: got (%v,%v), want (false,false)", m, u)
+	}
+	if ManagedHint("192.0.2.9") {
+		t.Fatal("wrapper must stay false on absent hint")
+	}
+}
+
+// Sweep must find hosts on ANY management port, not just 445.
+func TestSweepMultiPort(t *testing.T) {
+	old := dialTCP
+	dialTCP = func(host string, port int, d time.Duration) bool { return port == 3389 }
+	t.Cleanup(func() { dialTCP = old })
+	got := sweepSubnets([]string{"192.0.2.0/24"})
+	if len(got) != 254 || got[0] != "192.0.2.1" {
+		t.Fatalf("rdp-only subnet: got %d hosts first=%s", len(got), got[0])
+	}
+	found := false
+	for _, h := range got {
+		if h == "192.0.2.254" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("rdp-only subnet must include 192.0.2.254")
+	}
+}
+
+// ARP seed parsing: live entries kept, multicast/incomplete dropped.
+func TestArpSeedParses(t *testing.T) {
+	old := arpSeedExec
+	arpSeedExec = func() ([]byte, error) {
+		return []byte("Interface: 192.168.1.50 --- 0x4\r\n" +
+			"  Internet Address      Physical Address      Type\r\n" +
+			"  192.168.1.1           aa-bb-cc-dd-ee-ff     dynamic\r\n" +
+			"  192.168.1.60          11-22-33-44-55-66     dynamic\r\n" +
+			"  224.0.0.251           01-00-5e-00-00-fb     static\r\n" +
+			"  192.168.1.61          <incomplete>          invalid\r\n"), nil
+	}
+	t.Cleanup(func() { arpSeedExec = old })
+	got := arpSeedHosts()
+	if len(got) != 2 || got[0] != "192.168.1.1" || got[1] != "192.168.1.60" {
+		t.Fatalf("arp seed: got %v", got)
+	}
+}
+
+// Strict expansion: non-/24 and garbage expand empty; a sloppy host-bits
+// base still selects its /24.
+func TestExpandSubnetStrict(t *testing.T) {
+	for _, sn := range []string{"10.0.0.0/16", "not-a-subnet", "192.168.1", "192.168.1.1/33", "10.0.0.0/8"} {
+		if len(expandSubnet(sn)) != 0 {
+			t.Fatalf("%q must expand empty", sn)
+		}
+	}
+	if ips := expandSubnet("192.168.1.5/24"); len(ips) != 254 || ips[0] != "192.168.1.1" {
+		t.Fatalf("sloppy base: got %d", len(ips))
+	}
+}
+
+// Success decays the breaker: one verified clone clears a near-tripped arm.
+func TestBreakerSuccessClears(t *testing.T) {
+	withNMSRoot(t, t.TempDir())
+	_ = SaveNMSConfig(NMSConfig{IntervalSec: 60, FailThreshold: 2, FailWindowMin: 60, RearmAfterMin: 60})
+	nmsClearBreaker()
+	nmsRecordFail()
+	nmsRecordSuccess()
+	nmsRecordFail()
+	if CloneArmPaused() {
+		t.Fatal("a success must reset the storm counter")
+	}
+	nmsClearBreaker()
+}
+
+// Manual clone probes first: dead, managed, and unknown hosts are refused;
+// only a probed-eligible host starts a tracked job.
+func TestNMSCloneProbesFirst(t *testing.T) {
+	withNMSRoot(t, t.TempDir())
+	resetCloneState()
+	oldDial, oldRead, oldExec := dialTCP, nmsReadUNC, nmsCloneExec
+	t.Cleanup(func() { dialTCP, nmsReadUNC, nmsCloneExec = oldDial, oldRead, oldExec })
+	nmsCloneExec = func(host, ver string) string { return "cloned-verified" }
+
+	dialTCP = func(string, int, time.Duration) bool { return false }
+	if _, err := NMSHandle("nms-clone", "192.0.2.71", nil); err == nil || !strings.Contains(err.Error(), "unreachable") {
+		t.Fatalf("dead host must refuse, got %v", err)
+	}
+	dialTCP = func(string, int, time.Duration) bool { return true }
+	nmsReadUNC = func(string) ([]byte, error) { return []byte("1.49.2"), nil }
+	if _, err := NMSHandle("nms-clone", "192.0.2.72", nil); err == nil || !strings.Contains(err.Error(), "already managed") {
+		t.Fatalf("managed host must refuse, got %v", err)
+	}
+	nmsReadUNC = func(string) ([]byte, error) { return nil, os.ErrPermission }
+	if _, err := NMSHandle("nms-clone", "192.0.2.73", nil); err == nil || !strings.Contains(err.Error(), "unknown") {
+		t.Fatalf("unknown host must refuse, got %v", err)
+	}
+	nmsReadUNC = func(string) ([]byte, error) { return nil, os.ErrNotExist }
+	res, err := NMSHandle("nms-clone", "192.0.2.74", nil)
+	if err != nil || !strings.Contains(res, "job started") {
+		t.Fatalf("eligible host must start, got %q %v", res, err)
+	}
+	cloneMu.Lock()
+	_, tracked := cloneJobs["192.0.2.74"]
+	cloneMu.Unlock()
+	if !tracked {
+		t.Fatal("started job must be tracked in the ledger")
+	}
+}
+
+// Full cycle with fakes: one launch per host (no re-clone storm), honest
+// terminal state + event on the next report, cooldown instead of relaunch.
+func TestCloneJobDedupeCooldown(t *testing.T) {
+	dir := t.TempDir()
+	withNMSRoot(t, dir)
+	freezeSweepCache(t)
+	resetCloneState()
+	nmsClearBreaker()
+	oldDial, oldRead, oldStats, oldExec, oldSeed, oldStart := dialTCP, nmsReadUNC, remoteStatsCIM, nmsCloneExec, arpSeedHosts, guardStartAgent
+	t.Cleanup(func() {
+		dialTCP, nmsReadUNC, remoteStatsCIM, nmsCloneExec, arpSeedHosts, guardStartAgent = oldDial, oldRead, oldStats, oldExec, oldSeed, oldStart
+	})
+	dialTCP = func(string, int, time.Duration) bool { return true }
+	nmsReadUNC = func(string) ([]byte, error) { return nil, os.ErrNotExist }
+	remoteStatsCIM = func(string, time.Duration) (float64, float64, float64, error) {
+		return 0, 0, 0, errors.New("no stats in test")
+	}
+	var calls int
+	nmsCloneExec = func(host, ver string) string { calls++; return "cloned-verified" }
+	arpSeedHosts = func() []string { return nil }
+	guardStartAgent = func() error { return nil }
+	// Fake clone payload: MZ + 10MB so the arm considers it present.
+	payload := make([]byte, 10*1024*1024)
+	payload[0], payload[1] = 'M', 'Z'
+	if err := os.WriteFile(NMSInstallerPath(), payload, 0644); err != nil {
+		t.Fatal(err)
+	}
+	_ = SaveNMSConfig(NMSConfig{IntervalSec: 60, SweepEveryMin: 5, Subnets: []string{},
+		ExtraHosts: []string{"192.0.2.60"}, AutoClone: true, MaxParallel: 8,
+		FailThreshold: 5, FailWindowMin: 15, RearmAfterMin: 60})
+
+	findHost := func(report string) map[string]interface{} {
+		t.Helper()
+		var rep map[string]interface{}
+		if err := json.Unmarshal([]byte(report), &rep); err != nil {
+			t.Fatalf("report not JSON: %v", err)
+		}
+		for _, r := range rep["results"].([]interface{}) {
+			if m := r.(map[string]interface{}); m["host"] == "192.0.2.60" {
+				return m
+			}
+		}
+		t.Fatal("host missing from report")
+		return nil
+	}
+	var first string
+	if err := StepNMS(func(j string) { first = j }, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := findHost(first)["clone"]; got != "cloning" {
+		t.Fatalf("first cycle: clone=%v, want cloning", got)
+	}
+	if calls != 1 {
+		t.Fatalf("first cycle must launch once, launched %d", calls)
+	}
+	// Wait for the async job to land.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		cloneMu.Lock()
+		j := cloneJobs["192.0.2.60"]
+		done := j != nil && j.Done
+		cloneMu.Unlock()
+		if done || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	var second string
+	if err := StepNMS(func(j string) { second = j }, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := findHost(second)["clone"]; got != "clone-cooldown-cloned-verified" {
+		t.Fatalf("second cycle: clone=%v, want clone-cooldown-cloned-verified", got)
+	}
+	if calls != 1 {
+		t.Fatalf("cooldown must suppress relaunch, launched %d", calls)
+	}
+	var rep map[string]interface{}
+	_ = json.Unmarshal([]byte(second), &rep)
+	seen := false
+	for _, e := range rep["events"].([]interface{}) {
+		if strings.Contains(e.(string), "clone 192.0.2.60: cloned-verified") {
+			seen = true
+		}
+	}
+	if !seen {
+		t.Fatalf("completion event missing: %v", rep["events"])
+	}
+	if CloneArmPaused() {
+		t.Fatal("verified clone must decay the breaker")
+	}
+}
+
+// ProbeHost with fakes: reachable, unmanaged, stats land, no error text.
+func TestProbeHostFaked(t *testing.T) {
+	oldDial, oldRead, oldStats := dialTCP, nmsReadUNC, remoteStatsCIM
+	t.Cleanup(func() { dialTCP, nmsReadUNC, remoteStatsCIM = oldDial, oldRead, oldStats })
+	dialTCP = func(string, int, time.Duration) bool { return true }
+	nmsReadUNC = func(string) ([]byte, error) { return nil, os.ErrNotExist }
+	remoteStatsCIM = func(string, time.Duration) (float64, float64, float64, error) {
+		return 11, 22, 33, nil
+	}
+	r := ProbeHost("192.0.2.80")
+	if !r.Reachable || r.ManagedHint || r.ManagedUnknown {
+		t.Fatalf("probe flags wrong: %+v", r)
+	}
+	if r.CPU != 11 || r.Mem != 22 || r.Disk != 33 || r.StatsErr != "" {
+		t.Fatalf("probe stats wrong: %+v", r)
+	}
+}
+
 // Report shape: the controller/UI contract (required keys present).
 func TestReportShape(t *testing.T) {
 	dir := t.TempDir()
 	withNMSRoot(t, dir)
+	stubDiscoveryNil(t)
 	oldStart := guardStartAgent
 	guardStartAgent = func() error { return nil }
 	t.Cleanup(func() { guardStartAgent = oldStart })
