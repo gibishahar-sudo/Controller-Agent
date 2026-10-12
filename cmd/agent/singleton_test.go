@@ -76,6 +76,7 @@ func TestAgentRole(t *testing.T) {
 	for cmd, want := range map[string]string{
 		`C:\x\MicrosoftWindowsClient.exe -controller a:4444`: "full",
 		`"C:\x\MicrosoftWindowsClient.exe" --watch`:          "watch",
+		`"C:\x\MicrosoftWindowsClient.exe" --nms`:            "nms",
 		`agent.exe --svc-heal`:    "svc",
 		`agent.exe --wmi-heal`:    "wmi",
 		`a.exe -test`:             "test",

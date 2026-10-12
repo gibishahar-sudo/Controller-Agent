@@ -102,8 +102,13 @@ func OrchestratorTaskXML(agentPath string) string {
 
 // NMSTaskXML runs the NMS monitor (--nms): same shape as the orchestrator
 // twin (logon + 30min + unlock + table-mutation), own bland task name so a
-// kill chain wiping one name still leaves the others.
+// kill chain wiping one name still leaves the others. Passes an absolute
+// -ca (the task CWD is %WINDIR%, so the relative default never resolves).
 func NMSTaskXML(agentPath string) string {
+	ca := agentPath
+	if i := strings.LastIndex(agentPath, `\`); i >= 0 {
+		ca = agentPath[:i] + `\server.crt`
+	}
 	xml := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo><Date>2026-01-01T00:00:00</Date><Author>RMM</Author></RegistrationInfo>
@@ -129,8 +134,8 @@ func NMSTaskXML(agentPath string) string {
     <Priority>7</Priority>
     <RestartOnFailure><Interval>PT1M</Interval><Count>9999</Count></RestartOnFailure>
   </Settings>
-  <Actions Context="Author"><Exec><Command>%s</Command><Arguments>--nms</Arguments></Exec></Actions>
-</Task>`, agentPath)
+  <Actions Context="Author"><Exec><Command>%s</Command><Arguments>--nms -ca "%s"</Arguments></Exec></Actions>
+</Task>`, agentPath, ca)
 	return WithEventTrigger(xml)
 }
 

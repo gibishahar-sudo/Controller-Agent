@@ -2631,6 +2631,18 @@ func nmsControllerIPs(ctrlAddr string) []string {
 func runNMS(ctrlAddr, caFile string, insecure bool) {
 	_ = os.WriteFile(commands.NMSPidPath(), []byte(fmt.Sprintf("%d", os.Getpid())), 0644)
 	defer os.Remove(commands.NMSPidPath())
+	// Resolve a relative -ca against the exe dir (v1.49.1: tasks launch
+	// with CWD=%WINDIR%, so the bare "certs/server.crt" default never
+	// resolves and the session spins forever without dialing).
+	if !filepath.IsAbs(caFile) {
+		if exe, err := os.Executable(); err == nil {
+			if cand := filepath.Join(filepath.Dir(exe), caFile); cand != "" {
+				if _, serr := os.Stat(cand); serr == nil {
+					caFile = cand
+				}
+			}
+		}
+	}
 	ctrlIPs := nmsControllerIPs(ctrlAddr)
 	backoff := time.Second
 	const maxBackoff = time.Minute

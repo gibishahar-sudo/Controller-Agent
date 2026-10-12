@@ -18,13 +18,16 @@ var lockFile *os.File
 
 // agentRole classifies a process command line into agent roles. Only
 // "full" processes own the box; every other role (watcher, service,
-// healer, test) coexists and must never be reaped as a "duplicate".
-// Tokens match exactly (both - and -- forms); substrings never count.
+// healer, test, nms monitor) coexists and must never be reaped as a
+// "duplicate". Tokens match exactly (both - and -- forms); substrings
+// never count.
 func agentRole(cmdline string) string {
 	for _, tok := range strings.Fields(cmdline) {
 		switch strings.ToLower(strings.TrimLeft(tok, "-")) {
 		case "watch":
 			return "watch"
+		case "nms":
+			return "nms"
 		case "svc-heal":
 			return "svc"
 		case "wmi-heal":
