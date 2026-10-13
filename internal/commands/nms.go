@@ -27,6 +27,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -39,6 +40,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/shirou/gopsutil/v3/cpu"
@@ -1005,13 +1007,45 @@ func readInstallerBytes() ([]byte, bool) {
 var nmsSMBCopy = func(host string, data []byte) error {
 	dest := `\\` + host + `\ADMIN$\Temp\Agent-Setup.exe`
 	done := make(chan error, 1)
-	go func() { done <- os.WriteFile(dest, data, 0644) }()
+	go func() {
+		if err := os.WriteFile(dest, data, 0644); err != nil {
+			done <- fmt.Errorf("smb copy: %s", classifySMBErr(err))
+			return
+		}
+		done <- nil
+	}()
 	select {
 	case err := <-done:
 		return err
 	case <-time.After(120 * time.Second):
-		return fmt.Errorf("smb copy timed out")
+		return fmt.Errorf("smb copy: stalled over 120s (link down mid-transfer?)")
 	}
+}
+
+// classifySMBErr turns UNC write failures into actionable words (paths
+// carry host+share only — never credentials — so the text is log-safe).
+// Pure, tested.
+func classifySMBErr(err error) string {
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		switch int(errno) {
+		case 5:
+			return "access denied (SMB creds lack ADMIN$ write — check stored account)"
+		case 53:
+			return "bad network path (no route or SMB disabled on target)"
+		case 64:
+			return "network name deleted (host went away mid-copy)"
+		case 1219:
+			return "multiple IPC$ sessions (drop stale net-use sessions to this host)"
+		case 1231:
+			return "network unreachable (no route to host)"
+		}
+		return fmt.Sprintf("os error %d", int(errno))
+	}
+	if pe, ok := err.(*os.PathError); ok {
+		return "path error: " + pe.Err.Error()
+	}
+	return strings.TrimSpace(err.Error())
 }
 
 var nmsRemoteExec = func(host string) error {
@@ -1021,10 +1055,30 @@ var nmsRemoteExec = func(host string) error {
 	if err != nil {
 		return err
 	}
-	if strings.TrimSpace(string(out)) != "0" {
-		return fmt.Errorf("remote create returned %s", strings.TrimSpace(string(out)))
+	if code := strings.TrimSpace(string(out)); code != "0" {
+		return fmt.Errorf("remote create: %s", wmiReturnText(code))
 	}
 	return nil
+}
+
+// wmiReturnText translates Win32_Process.Create ReturnValues (pure, tested).
+func wmiReturnText(code string) string {
+	switch code {
+	case "0":
+		return "ok"
+	case "2":
+		return "access denied (WMI 2 — DCOM/RPC rights or TrustedHosts)"
+	case "3":
+		return "insufficient privilege (WMI 3 — account needs remote-launch rights)"
+	case "8":
+		return "unknown failure (WMI 8 — provider error on target)"
+	case "9":
+		return "path not found (WMI 9 — installer copy missing on target)"
+	case "21":
+		return "invalid parameter (WMI 21)"
+	default:
+		return "unexpected ReturnValue " + code
+	}
 }
 
 var nmsCloneVerify = func(host, wantVer string, timeout time.Duration) bool {
@@ -1039,25 +1093,26 @@ var nmsCloneVerify = func(host, wantVer string, timeout time.Duration) bool {
 	return false
 }
 
-// CloneToHost pushes the installer and launches it remotely. Returns a
-// clone-state word for the report.
-func CloneToHost(host string, wantVer string) string {
+// CloneToHost pushes the installer and launches it remotely. Returns the
+// clone-state word plus a human detail line (surfaced in clone_detail and
+// the ledger event — bare words never again).
+func CloneToHost(host string, wantVer string) (state, detail string) {
 	data, ok := readInstallerBytes()
 	if !ok {
-		return "no-payload"
+		return "no-payload", "installer copy missing beside the agent"
 	}
 	if err := nmsSMBCopy(host, data); err != nil {
 		nmsRecordFail()
-		return "copy-failed"
+		return "copy-failed", strings.TrimSpace(err.Error())
 	}
 	if err := nmsRemoteExec(host); err != nil {
 		nmsRecordFail()
-		return "launch-failed"
+		return "launch-failed", strings.TrimSpace(err.Error())
 	}
 	if nmsCloneVerify(host, wantVer, 5*time.Minute) {
-		return "cloned-verified"
+		return "cloned-verified", "version.txt reports " + wantVer
 	}
-	return "launched-unverified"
+	return "launched-unverified", "launched but version.txt did not confirm within 5min (slow box or installer still running?)"
 }
 
 // --- circuit breaker: failure storms pause the clone ARM only. Probing,
@@ -1196,16 +1251,30 @@ func startCloneJob(host, wantVer string) (state string, started bool) {
 	}
 	cloneMu.Unlock()
 	go func() {
-		st := nmsCloneExec(host, wantVer)
+		st, detail := nmsCloneExec(host, wantVer)
+		if len(detail) > 240 {
+			detail = detail[:240] + "…"
+		}
 		cloneMu.Lock()
-		cloneJobs[host] = &cloneJob{State: st, Detail: st, At: time.Now(), Done: true}
-		pushCloneEvent("clone " + host + ": " + st)
+		cloneJobs[host] = &cloneJob{State: st, Detail: detail, At: time.Now(), Done: true}
+		pushCloneEvent("clone " + host + ": " + st + " — " + detail)
 		cloneMu.Unlock()
 		if st == "cloned-verified" {
 			nmsRecordSuccess()
 		}
 	}()
 	return "cloning", true
+}
+
+// cloneJobLookup returns the tracked state+detail for a host, if any.
+func cloneJobLookup(host string) (state, detail string, tracked bool) {
+	cloneMu.Lock()
+	defer cloneMu.Unlock()
+	j, ok := cloneJobs[host]
+	if !ok {
+		return "", "", false
+	}
+	return j.State, j.Detail, true
 }
 
 // ---------------------------------------------------------------------------
@@ -1303,16 +1372,22 @@ func StepNMS(send func(reportJSON string), controllerIPs []string) error {
 				r.CloneState = "no-payload"
 				continue
 			}
-			st, started := startCloneJob(r.Host, version.Version)
-			r.CloneState = st
-			switch {
-			case started:
-				r.CloneDetail = "job started"
-			case strings.HasPrefix(st, "clone-cooldown-"):
-				r.CloneDetail = "cooling down after " + strings.TrimPrefix(st, "clone-cooldown-")
-			default:
+		st, started := startCloneJob(r.Host, version.Version)
+		r.CloneState = st
+		switch {
+		case started:
+			r.CloneDetail = "job started"
+		case strings.HasPrefix(st, "clone-cooldown-"):
+			r.CloneDetail = "cooling down after " + strings.TrimPrefix(st, "clone-cooldown-")
+		default:
+			// Tracked job: surface its real terminal word + reason,
+			// never a perpetual "in progress".
+			if jst, jdetail, ok := cloneJobLookup(r.Host); ok && jdetail != "" {
+				r.CloneState, r.CloneDetail = jst, jdetail
+			} else {
 				r.CloneDetail = "in progress"
 			}
+		}
 		}
 	} else if CloneArmPaused() {
 		cloneArm = "paused-breaker"
@@ -1497,6 +1572,72 @@ func sweepTargets(cfg NMSConfig) []string {
 // except nms-stop which honors the shutdown file.
 // ---------------------------------------------------------------------------
 
+// nmsDirStat reports whether a (possibly remote ADMIN$) dir is visible,
+// with a hard timeout (SMB hangs on dead hosts). Var for tests.
+var nmsDirStat = func(path string) bool {
+	done := make(chan bool, 1)
+	go func() {
+		st, err := os.Stat(path)
+		done <- err == nil && st.IsDir()
+	}()
+	select {
+	case ok := <-done:
+		return ok
+	case <-time.After(10 * time.Second):
+		return false
+	}
+}
+
+// CloneDryRun validates a clone end-to-end WITHOUT writing anything to
+// the target: reachability, managed state, eligibility, payload, and Temp
+// dir visibility. Safe to run against any host, anytime.
+func CloneDryRun(host string, controllerIPs []string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "=== dry-run %s ===\n", host)
+	t0 := time.Now()
+	up445 := dialTCP(host, 445, 3*time.Second)
+	d445 := time.Since(t0).Round(time.Millisecond)
+	t0 = time.Now()
+	up135 := dialTCP(host, 135, 3*time.Second)
+	d135 := time.Since(t0).Round(time.Millisecond)
+	fmt.Fprintf(&b, "reachability: 445=%v (%s) 135=%v (%s)\n", up445, d445, up135, d135)
+	if !up445 && !up135 {
+		fmt.Fprintf(&b, "verdict: WOULD NOT CLONE (unreachable)\n")
+		return b.String()
+	}
+	managed, unknown := ManagedHintChecked(host)
+	switch {
+	case managed:
+		fmt.Fprintf(&b, "managed-hint: version.txt PRESENT (already managed — skip)\n")
+	case unknown:
+		fmt.Fprintf(&b, "managed-hint: UNKNOWN (share read denied — verify access first)\n")
+	default:
+		fmt.Fprintf(&b, "managed-hint: absent (unmanaged)\n")
+	}
+	cfg := LoadNMSConfig()
+	if elig, reason := CloneEligible(host, true, managed, cfg.Exclude, selfIPs(), controllerIPs); !elig {
+		fmt.Fprintf(&b, "eligibility: skip-%s\nverdict: WOULD NOT CLONE (%s)\n", reason, reason)
+		return b.String()
+	}
+	fmt.Fprintf(&b, "eligibility: eligible\n")
+	size, sha, ok := NMSInstallerInfo()
+	if !ok {
+		fmt.Fprintf(&b, "payload: MISSING beside the agent — nothing to push\nverdict: WOULD NOT CLONE (no-payload)\n")
+		return b.String()
+	}
+	fmt.Fprintf(&b, "payload: %d bytes sha %.12s (valid MZ)\n", size, sha)
+	tempVisible := nmsDirStat(`\\` + host + `\ADMIN$\Temp`)
+	fmt.Fprintf(&b, "target dir: %s\n", map[bool]string{true: `\\host\ADMIN$\Temp visible`, false: `\\host\ADMIN$\Temp NOT visible — copy would fail`}[tempVisible])
+	if unknown {
+		fmt.Fprintf(&b, "verdict: LIKELY NOT (managed-state unknown — resolve share access first)\n")
+	} else if !tempVisible {
+		fmt.Fprintf(&b, "verdict: WOULD NOT CLONE (target dir unreachable)\n")
+	} else {
+		fmt.Fprintf(&b, "verdict: WOULD CLONE (all gates pass — run without --dry-run to deploy)\n")
+	}
+	return b.String()
+}
+
 // NMSHandle dispatches one NMS command (caller splits cmd/args).
 func NMSHandle(cmd, args string, controllerIPs []string) (string, error) {
 	cmd = strings.ToLower(strings.TrimSpace(cmd))
@@ -1540,9 +1681,19 @@ func NMSHandle(cmd, args string, controllerIPs []string) (string, error) {
 		}
 		return "nms stopping at next cycle boundary (shutdown file written)", nil
 	case "nms-clone":
-		host := strings.TrimSpace(strings.Split(args, " ")[0])
-		if host == "" {
-			return "", fmt.Errorf("usage: nms-clone <host>")
+		parts := strings.Fields(args)
+		if len(parts) == 0 {
+			return "", fmt.Errorf("usage: nms-clone <host> [--dry-run]")
+		}
+		host := parts[0]
+		dry := false
+		for _, p := range parts[1:] {
+			if p == "--dry-run" || p == "-n" {
+				dry = true
+			}
+		}
+		if dry {
+			return CloneDryRun(host, controllerIPs), nil
 		}
 		// Probe first: manual clones used to force reachable=true and skip
 		// the managed check, which could push onto an already-managed box

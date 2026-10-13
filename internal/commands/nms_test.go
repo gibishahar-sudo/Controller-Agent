@@ -321,7 +321,7 @@ func TestNMSCloneProbesFirst(t *testing.T) {
 	resetCloneState()
 	oldDial, oldRead, oldExec := dialTCP, nmsReadUNC, nmsCloneExec
 	t.Cleanup(func() { dialTCP, nmsReadUNC, nmsCloneExec = oldDial, oldRead, oldExec })
-	nmsCloneExec = func(host, ver string) string { return "cloned-verified" }
+	nmsCloneExec = func(host, ver string) (string, string) { return "cloned-verified", "test job" }
 
 	dialTCP = func(string, int, time.Duration) bool { return false }
 	if _, err := NMSHandle("nms-clone", "192.0.2.71", nil); err == nil || !strings.Contains(err.Error(), "unreachable") {
@@ -367,7 +367,7 @@ func TestCloneJobDedupeCooldown(t *testing.T) {
 		return 0, 0, 0, errors.New("no stats in test")
 	}
 	var calls int
-	nmsCloneExec = func(host, ver string) string { calls++; return "cloned-verified" }
+	nmsCloneExec = func(host, ver string) (string, string) { calls++; return "cloned-verified", "test job" }
 	arpSeedHosts = func() []string { return nil }
 	guardStartAgent = func() error { return nil }
 	// Fake clone payload: MZ + 10MB so the arm considers it present.
