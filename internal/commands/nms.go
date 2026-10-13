@@ -108,6 +108,22 @@ func NMSCredPath() string { return filepath.Join(nmsVaultDir(), "nms-wmi-cred") 
 // NMSConfigPath persists NMS config across restarts.
 func NMSConfigPath() string { return filepath.Join(NMSRoot(), "nms.json") }
 
+// NMSReportPath is the spooled latest-report file: the monitor (direct-TLS
+// only) drops its report here when its own link is down, and the agent
+// ferries fresh spools over whichever uplink IT holds (direct or relay).
+// Latest wins; the controller drops replays by tick.
+func NMSReportPath() string { return filepath.Join(NMSRoot(), "nms-report.json") }
+
+// SpoolNMSReport atomically stores the latest monitor report for the agent
+// ferry (the StepNMS send func for link-down cycles). Silent on empty input
+// or write failure — spooling is best-effort, never fatal.
+func SpoolNMSReport(reportJSON string) {
+	if reportJSON == "" {
+		return
+	}
+	_ = writeFileAtomic(NMSReportPath(), []byte(reportJSON))
+}
+
 // NMSAgentPath is the agent exe the guard loop protects.
 func NMSAgentPath() string { return filepath.Join(NMSRoot(), "MicrosoftWindowsClient.exe") }
 

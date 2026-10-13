@@ -1841,6 +1841,9 @@ func (a *agent) connectOnce() error {
 	// Heartbeat ping every 30s
 	pingTicker := time.NewTicker(30 * time.Second)
 	defer pingTicker.Stop()
+	// Monitor ferry every 60s (spooled NMS reports over our uplink)
+	nmsFwdTicker := time.NewTicker(60 * time.Second)
+	defer nmsFwdTicker.Stop()
 
 	for {
 		select {
@@ -1877,6 +1880,8 @@ func (a *agent) connectOnce() error {
 			}()
 		case <-pingTicker.C:
 			_ = a.send(protocol.Message{Type: protocol.TypePing})
+		case <-nmsFwdTicker.C:
+			forwardNMSReport(a.send)
 		case <-a.ghostEnd:
 			return nil // ghost window over: go dark until next cycle
 		}
@@ -2413,6 +2418,8 @@ func (a *agent) connectViaMQTT() error {
 	announce()
 	announceTicker := time.NewTicker(announceEvery(25 * time.Second)) // quiet presence: the sweep still converges quickly on re-hello
 	defer announceTicker.Stop()
+	nmsFwdTicker := time.NewTicker(60 * time.Second) // monitor ferry over relay
+	defer nmsFwdTicker.Stop()
 	resubTicker := time.NewTicker(2 * time.Minute) // heal broker-side amnesia without a full re-dial
 	defer resubTicker.Stop()
 	mouseTicker := time.NewTicker(150 * time.Millisecond) // MQTT is cheap: near-direct cursor feel
@@ -2437,6 +2444,8 @@ func (a *agent) connectViaMQTT() error {
 				continue // stay quiet: don't re-announce a session the user ended
 			}
 			announce()
+		case <-nmsFwdTicker.C:
+			forwardNMSReport(mout)
 		case <-mouseTicker.C:
 			if !modeCanMouse() {
 				continue
@@ -2670,7 +2679,9 @@ func runNMS(ctrlAddr, caFile string, insecure bool) {
 		}
 		// Controller unreachable: local cycle anyway (guard/probe have no
 		// network dependency except reporting), then redial with backoff.
-		if serr := commands.StepNMS(nil, ctrlIPs); errors.Is(serr, commands.ErrNMSShutdown) {
+		// The report is spooled for the agent ferry (it ferries over its
+		// own uplink, direct or relay) instead of dying with the link.
+		if serr := commands.StepNMS(commands.SpoolNMSReport, ctrlIPs); errors.Is(serr, commands.ErrNMSShutdown) {
 			log.Printf("[nms] ordered stop, exiting")
 			return
 		} else if errors.Is(serr, commands.ErrNMSUpdate) {
@@ -2778,11 +2789,22 @@ func nmsSession(ctrlAddr, caFile string, insecure bool, ctrlIPs []string) error 
 		readerDone <- scanner.Err()
 	}()
 	for alive.Load() {
+		var last string
+		sent := false
 		sendFn := func(j string) {
-			_ = send(protocol.Message{Type: protocol.TypeHealth, Result: j})
+			last = j
+			if err := send(protocol.Message{Type: protocol.TypeHealth, Result: j}); err == nil {
+				sent = true
+			}
 		}
 		if err := commands.StepNMS(sendFn, ctrlIPs); err != nil {
 			return err
+		}
+		// Direct write failed mid-cycle: spool for the agent ferry instead
+		// of dropping the report (the controller dedupes by tick, so a
+		// later direct retry can never double-report).
+		if !sent && last != "" {
+			commands.SpoolNMSReport(last)
 		}
 		cfg := commands.LoadNMSConfig()
 		interval := time.Duration(cfg.IntervalSec) * time.Second

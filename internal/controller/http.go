@@ -726,6 +726,13 @@ func (s *Server) startHTTP(addr, dir string) {
 					hn, _ = a["hostname"].(string)
 				}
 			}
+			// Relayed reports key on "nms:<prober>" with no live row:
+			// fall back to the prober hostname inside the report itself.
+			if hn == "" {
+				if p, _ := parseHealthID(string(rec.report)); p != "" {
+					hn = p
+				}
+			}
 			reps = append(reps, repOut{ID: id, Hostname: hn, At: rec.at.UTC().Format(time.RFC3339), AgeSec: int64(time.Since(rec.at).Seconds()), Report: rec.report})
 		}
 		s.nmsHealthMu.Unlock()

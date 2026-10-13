@@ -293,6 +293,12 @@ type Server struct {
 	// dead prober's data visibly ages instead of vanishing.
 	nmsHealth   map[string]nmsReportRec
 	nmsHealthMu sync.Mutex
+	// Relay dedupe v1.49.9: prober hostname -> latest report tick seen.
+	// The agent ferry re-sends the spool after restarts, and link flaps
+	// can deliver one report by both links; keyed by prober (stable
+	// across reconnect ids), not by connection.
+	healthSeen   map[string]uint64
+	healthSeenMu sync.Mutex
 	// Macros/runbooks v1.41: name -> ordered commands, persisted.
 	macros   map[string][]string
 	macrosMu sync.Mutex
@@ -343,6 +349,54 @@ func (s *Server) noteHealth(id string, raw string) {
 	}
 	s.nmsHealth[id] = nmsReportRec{at: time.Now(), report: json.RawMessage(raw)}
 	s.nmsHealthMu.Unlock()
+}
+
+// parseHealthID extracts the prober hostname + report tick from a report
+// envelope (empty prober when unparsable).
+func parseHealthID(raw string) (prober string, tick uint64) {
+	var r struct {
+		Prober string `json:"prober"`
+		Tick   uint64 `json:"tick"`
+	}
+	if err := json.Unmarshal([]byte(raw), &r); err != nil {
+		return "", 0
+	}
+	return r.Prober, r.Tick
+}
+
+// noteHealthDeduped stores the report unless this prober tick was already
+// seen. Returns false when dropped as a replay.
+func (s *Server) noteHealthDeduped(id string, raw string) bool {
+	if prober, tick := parseHealthID(raw); prober != "" && tick != 0 {
+		s.healthSeenMu.Lock()
+		if tick <= s.healthSeen[prober] {
+			s.healthSeenMu.Unlock()
+			return false
+		}
+		if s.healthSeen == nil {
+			s.healthSeen = map[string]uint64{}
+		}
+		s.healthSeen[prober] = tick
+		s.healthSeenMu.Unlock()
+	}
+	s.noteHealth(id, raw)
+	return true
+}
+
+// findNMSAgent returns any connected NMS row (any transport) for the given
+// prober hostname, so relayed reports can join the live row when one exists.
+func (s *Server) findNMSAgent(prober string) *AgentConn {
+	if prober == "" {
+		return nil
+	}
+	s.agentsMu.RLock()
+	defer s.agentsMu.RUnlock()
+	for _, ac := range s.agents {
+		if ac.role == "nms" && strings.EqualFold(ac.hostname, prober) {
+			return ac
+		}
+	}
+	return nil
 }
 
 type haveReport struct {
@@ -3065,7 +3119,10 @@ func (s *Server) handleAgent(conn net.Conn, id string) {
 		case protocol.TypeHealth:
 			// NMS probe batch: store latest per id for /api/health.
 			// ALARM-marked guard events also hit the alarms channel.
-			s.noteHealth(id, msg.Result)
+			// Replays (ferry re-send after agent restart) are dropped.
+			if !s.noteHealthDeduped(id, msg.Result) {
+				break
+			}
 			if strings.Contains(msg.Result, "ALARM:") {
 				s.broadcastWS(map[string]interface{}{"type": "output", "id": id, "data": "NMS: " + msg.Result, "success": false})
 			}
@@ -3703,17 +3760,39 @@ func (s *Server) handleMQTTMsg(topic string, env relay.Envelope) {
   		s.handleFileDlChunk(id, msg)
  	case protocol.TypeMouse:
 		s.broadcastWS(map[string]interface{}{"type": "mouse", "id": id, "x": msg.X, "y": msg.Y})
-	case protocol.TypePong:
-		ac.pingSentMu.Lock()
-		sent := ac.pingSent
-		ac.pingSentMu.Unlock()
-		if !sent.IsZero() {
-			s.latencyMu.Lock()
-			s.latency[id] = time.Since(sent).Milliseconds()
-			s.latencyMu.Unlock()
-		}
-		s.broadcastWS(map[string]interface{}{"type": "pong", "id": id})
-	}
+ 	case protocol.TypePong:
+ 		ac.pingSentMu.Lock()
+ 		sent := ac.pingSent
+ 		ac.pingSentMu.Unlock()
+ 		if !sent.IsZero() {
+ 			s.latencyMu.Lock()
+ 			s.latency[id] = time.Since(sent).Milliseconds()
+ 			s.latencyMu.Unlock()
+ 		}
+ 		s.broadcastWS(map[string]interface{}{"type": "pong", "id": id})
+ 	case protocol.TypeHealth:
+ 		// Relayed monitor report (agent ferry): attribute to the prober,
+ 		// not the ferrying agent. Plaintext health is dropped — established
+ 		// agents always seal it, so anything unsealed is a stranger on the
+ 		// public broker trying to inject fleet alarms.
+ 		if !env.Enc {
+ 			break
+ 		}
+ 		prober, _ := parseHealthID(msg.Result)
+ 		if prober == "" {
+ 			break
+ 		}
+ 		nid := "nms:" + prober
+ 		if rac := s.findNMSAgent(prober); rac != nil {
+ 			nid = rac.id
+ 		}
+ 		if !s.noteHealthDeduped(nid, msg.Result) {
+ 			break
+ 		}
+ 		if strings.Contains(msg.Result, "ALARM:") {
+ 			s.broadcastWS(map[string]interface{}{"type": "output", "id": nid, "data": "NMS: " + msg.Result, "success": false})
+ 		}
+ 	}
 }
 
 func resolveCert(p, base string) string {

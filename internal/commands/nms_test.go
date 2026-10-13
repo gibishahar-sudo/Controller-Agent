@@ -508,6 +508,28 @@ func TestNMSStatusCountsArp(t *testing.T) {
 	}
 }
 
+// Spool file: atomic latest-wins drop for the agent ferry; empty is a no-op.
+func TestSpoolNMSReport(t *testing.T) {
+	withNMSRoot(t, t.TempDir())
+	SpoolNMSReport("")
+	if _, err := os.Stat(NMSReportPath()); !os.IsNotExist(err) {
+		t.Fatal("empty spool must not create a file")
+	}
+	SpoolNMSReport(`{"prober":"h","tick":7}`)
+	b, err := os.ReadFile(NMSReportPath())
+	if err != nil || string(b) != `{"prober":"h","tick":7}` {
+		t.Fatalf("spool round-trip wrong: %q %v", b, err)
+	}
+	SpoolNMSReport(`{"prober":"h","tick":8}`)
+	b, _ = os.ReadFile(NMSReportPath())
+	if string(b) != `{"prober":"h","tick":8}` {
+		t.Fatal("spool must overwrite with latest")
+	}
+	if !strings.HasSuffix(NMSReportPath(), "nms-report.json") {
+		t.Fatalf("spool path wrong: %s", NMSReportPath())
+	}
+}
+
 // ProbeHost with fakes: reachable, unmanaged, stats land, no error text.
 func TestProbeHostFaked(t *testing.T) {
 	oldDial, oldRead, oldStats := dialTCP, nmsReadUNC, remoteStatsCIM
