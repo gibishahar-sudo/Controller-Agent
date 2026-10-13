@@ -1198,6 +1198,7 @@ type cloneJob struct {
 	Detail string
 	At     time.Time
 	Done   bool
+	Forced bool
 }
 
 var cloneMu sync.Mutex
@@ -1226,8 +1227,9 @@ func drainCloneEvents() []string {
 
 // startCloneJob launches one tracked clone unless a job is already in flight
 // or a terminal state is still cooling down. Returns the CloneState word for
-// the report and whether a new job actually started.
-func startCloneJob(host, wantVer string) (state string, started bool) {
+// the report and whether a new job actually started. forced marks operator
+// overrides (audit trail only — the executor pipeline is identical).
+func startCloneJob(host, wantVer string, forced bool) (state string, started bool) {
 	now := time.Now()
 	cloneMu.Lock()
 	if j, ok := cloneJobs[host]; ok {
@@ -1241,7 +1243,7 @@ func startCloneJob(host, wantVer string) (state string, started bool) {
 			return "clone-cooldown-" + st, false
 		}
 	}
-	cloneJobs[host] = &cloneJob{State: "cloning", Detail: "job started", At: now}
+	cloneJobs[host] = &cloneJob{State: "cloning", Detail: "job started", At: now, Forced: forced}
 	// Opportunistic prune: drop cold terminal entries so the map can't grow
 	// with LAN churn.
 	for h, j := range cloneJobs {
@@ -1256,8 +1258,12 @@ func startCloneJob(host, wantVer string) (state string, started bool) {
 			detail = detail[:240] + "…"
 		}
 		cloneMu.Lock()
-		cloneJobs[host] = &cloneJob{State: st, Detail: detail, At: time.Now(), Done: true}
-		pushCloneEvent("clone " + host + ": " + st + " — " + detail)
+		cloneJobs[host] = &cloneJob{State: st, Detail: detail, At: time.Now(), Done: true, Forced: forced}
+		evt := "clone " + host + ": " + st + " — " + detail
+		if forced {
+			evt = "FORCED by operator: " + evt
+		}
+		pushCloneEvent(evt)
 		cloneMu.Unlock()
 		if st == "cloned-verified" {
 			nmsRecordSuccess()
@@ -1373,7 +1379,7 @@ func StepNMS(send func(reportJSON string), controllerIPs []string) error {
 				r.CloneState = "no-payload"
 				continue
 			}
-		st, started := startCloneJob(r.Host, version.Version)
+		st, started := startCloneJob(r.Host, version.Version, false)
 		r.CloneState = st
 		switch {
 		case started:
@@ -1633,6 +1639,7 @@ func CloneDryRun(host string, controllerIPs []string) string {
 	fmt.Fprintf(&b, "privileges:\n%s", remotePrivSection(host, tempVisible, unknown))
 	if unknown {
 		fmt.Fprintf(&b, "verdict: LIKELY NOT (managed-state unknown — resolve share access first)\n")
+		fmt.Fprintf(&b, "override available: nms-clone %s --force --confirm YES (operator asserts unmanaged; attempt audited)\n", host)
 	} else if !tempVisible {
 		fmt.Fprintf(&b, "verdict: WOULD NOT CLONE (target dir unreachable)\n")
 	} else {
@@ -1729,15 +1736,25 @@ func NMSHandle(cmd, args string, controllerIPs []string) (string, error) {
 			return "", fmt.Errorf("usage: nms-clone <host> [--dry-run]")
 		}
 		host := parts[0]
-		dry := false
+		dry, force, hasConfirmFlag, hasYes := false, false, false, false
 		for _, p := range parts[1:] {
-			if p == "--dry-run" || p == "-n" {
+			switch {
+			case p == "--dry-run" || p == "-n":
 				dry = true
+			case p == "--force":
+				force = true
+			case strings.EqualFold(p, "--confirm"):
+				hasConfirmFlag = true
+			case strings.EqualFold(p, "YES"):
+				hasYes = true
 			}
 		}
 		if dry {
 			return CloneDryRun(host, controllerIPs), nil
 		}
+		// Two explicit signals required (house rule, same as nms-stop):
+		// --force alone never suffices.
+		confirm := hasConfirmFlag && hasYes
 		// Probe first: manual clones used to force reachable=true and skip
 		// the managed check, which could push onto an already-managed box
 		// or a dead address.
@@ -1746,15 +1763,20 @@ func NMSHandle(cmd, args string, controllerIPs []string) (string, error) {
 		}
 		if managed, unknown := ManagedHintChecked(host); managed {
 			return "", fmt.Errorf("clone refused: %s already managed", host)
-		} else if unknown {
-			return "", fmt.Errorf("clone refused: %s managed-state unknown (share denied) — verify access first", host)
+		} else if unknown && !force {
+			return "", fmt.Errorf("clone refused: %s managed-state unknown (share denied) — verify access first, or retry with --force --confirm YES", host)
+		} else if unknown && !confirm {
+			return "", fmt.Errorf("clone refused: --force needs --confirm YES alongside it (usage: nms-clone <host> --force --confirm YES)")
 		}
 		cfg := LoadNMSConfig()
 		if elig, reason := CloneEligible(host, true, false, cfg.Exclude, selfIPs(), controllerIPs); !elig {
 			return "", fmt.Errorf("clone refused: %s", reason)
 		}
-		if st, started := startCloneJob(host, version.Version); !started {
+		if st, started := startCloneJob(host, version.Version, force); !started {
 			return "clone " + host + ": " + st + " (already tracked)", nil
+		}
+		if force {
+			return "FORCED clone job started for " + host + " (operator override — audited)", nil
 		}
 		return "clone job started for " + host, nil
 	default:
