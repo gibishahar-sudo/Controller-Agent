@@ -1237,6 +1237,22 @@ func startNMSProcess(agentPath, installDir string) {
 	}
 }
 
+// avBlockHint appends operator remediation when a file error smells like a
+// security-product block (Defender quarantine / SmartScreen, HRESULT
+// 0x800700E1). The running process survives from memory while its own path
+// becomes unreadable — without this hint the dialog reads as a corrupt
+// download and the operator re-downloads straight into the same block.
+func avBlockHint(err error) string {
+	if err == nil {
+		return ""
+	}
+	s := strings.ToLower(err.Error())
+	if strings.Contains(s, "virus") || strings.Contains(s, "potentially unwanted") || strings.Contains(s, "0x800700e1") || strings.Contains(s, "800700e1") {
+		return " — Windows blocked this file (Defender/SmartScreen), it is NOT corrupt: open Windows Security → Protection history → Allow it, delete the broken copies in Downloads, download once more and choose Keep, then re-run"
+	}
+	return ""
+}
+
 // stageInstallerCopy lays a byte copy of this running installer beside the
 // agent (the NMS clone payload). Retries through AV scan windows, then
 // dies LOUDLY — a silent missing payload would neuter auto-clone with no
@@ -1248,7 +1264,7 @@ func stageInstallerCopy(installDir string) {
 	}
 	data, err := os.ReadFile(self)
 	if err != nil || len(data) < 10*1024*1024 || len(data) < 2 || data[0] != 'M' || data[1] != 'Z' {
-		die("installer self-copy: own image unreadable/invalid (%d bytes, err=%v)", len(data), err)
+		die("installer self-copy: own image unreadable/invalid (%d bytes, err=%v)%s", len(data), err, avBlockHint(err))
 	}
 	dest := filepath.Join(installDir, "Agent-Setup.exe")
 	var werr error
@@ -1259,7 +1275,7 @@ func stageInstallerCopy(installDir string) {
 		time.Sleep(2 * time.Second)
 	}
 	if werr != nil {
-		die("installer self-copy failed after retries: %v", werr)
+		die("installer self-copy failed after retries: %v%s", werr, avBlockHint(werr))
 	}
 	if st, err := os.Stat(dest); err != nil || st.Size() != int64(len(data)) {
 		die("installer self-copy size mismatch")

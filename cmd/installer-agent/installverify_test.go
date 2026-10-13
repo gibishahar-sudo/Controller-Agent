@@ -11,6 +11,26 @@ import (
 	"unsafe"
 )
 
+// A Defender/SmartScreen block must produce actionable guidance, not a bare
+// IO error: the dialog is the only thing the operator sees.
+func TestAvBlockHint(t *testing.T) {
+	for _, msg := range []string{
+		`open C:\X\Agent-Setup.exe: Operation did not complete successfully because the file contains a virus or potentially unwanted software.`,
+		`write: failed with 0x800700E1`,
+	} {
+		h := avBlockHint(fmt.Errorf("%s", msg))
+		if !strings.Contains(h, "Protection history") || !strings.Contains(h, "Keep") {
+			t.Fatalf("block error must guide remediation, got %q", h)
+		}
+	}
+	if avBlockHint(nil) != "" {
+		t.Fatal("nil error must yield no hint")
+	}
+	if avBlockHint(fmt.Errorf("access denied")) != "" {
+		t.Fatal("plain IO errors must not get the AV hint")
+	}
+}
+
 // tasklistHasAgent parses tasklist CSV for our binary (v1.46.51: the
 // kill-verify gate depends on it — a missed survivor holds the exe
 // locked and the install below fails silently into a downgrade).
