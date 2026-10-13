@@ -2873,6 +2873,15 @@ func main() {
 		runNMS(*addr, *caFile, *insecure)
 		return
 	}
+	// Heal "stamped but unswapped" drift first (a failed swap orphans the
+	// claim and the version stamp): correct the papers so the monitor +
+	// controller queue unwedge. No-op when markers agree or a live update
+	// is in flight.
+	if xed, xerr := os.Executable(); xerr == nil {
+		if act := commands.ReconcileVersionStamp(filepath.Dir(xed), version.DesktopAgentVersion); act != "" {
+			log.Printf("[*] version stamp %s", act)
+		}
+	}
 	// Self-apply a staged update when running elevated (standard-user
 	// runs return false silently; watcher/WMI/service handle those).
 	if commands.ApplyStagedUpdate() {

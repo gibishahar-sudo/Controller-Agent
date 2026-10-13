@@ -373,6 +373,86 @@ func PendingClaim() (to, sha string, staged, ok bool) {
 	return pend.To, pend.SHA, pend.Staged, true
 }
 
+// staleClaimAge bounds how long a version-drifted claim may sit before it is
+// declared orphaned. Legit applies land in minutes (elevated contexts run
+// every cycle); anything older with no staged payload is wreckage from a
+// failed swap — and while it sits, the NMS exits on version drift and the
+// controller holds its desired queue forever.
+const staleClaimAge = 24 * time.Hour
+
+// ReconcileVersionStamp heals "stamped but unswapped" drift: version.txt
+// names a version the running binary is not. dir holds version.txt (the
+// claim is located via pendingClaimPath, RMM_PENDING_CLAIM-honoring, which
+// matches the exe dir in production). Live updates (fresh claim, staged
+// payload, or recent chunk activity) are left strictly alone; only provably
+// orphaned markers are corrected (stamp rewritten to the running version,
+// bogus claim dropped) so the monitor resumes and the controller re-pushes
+// cleanly. Returns "" on no-op, else a short action word for logs/reports.
+func ReconcileVersionStamp(dir, runningVer string) string {
+	stamp := ""
+	if b, err := os.ReadFile(filepath.Join(dir, "version.txt")); err == nil {
+		stamp = strings.TrimSpace(string(b))
+	}
+	if stamp == "" || stamp == runningVer {
+		return ""
+	}
+	claimPath := pendingClaimPath()
+	raw, err := os.ReadFile(claimPath)
+	if err != nil {
+		return rewriteStamp(dir, runningVer, claimPath, "reconciled-unclaimed")
+	}
+	var pend pendingUpdate
+	if err := json.Unmarshal(raw, &pend); err != nil || pend.To == "" {
+		return rewriteStamp(dir, runningVer, claimPath, "reconciled-corrupt-claim")
+	}
+	if pend.To != stamp {
+		return rewriteStamp(dir, runningVer, claimPath, "reconciled-mismatched-claim")
+	}
+	// The claim names the stamp: live iff young, staged, or chunk-active.
+	if at, aerr := time.Parse(time.RFC3339, pend.At); aerr == nil && time.Since(at) < staleClaimAge {
+		return ""
+	}
+	claimDir := filepath.Dir(claimPath)
+	if _, serr := os.Stat(filepath.Join(claimDir, "MicrosoftWindowsClient.new.exe")); serr == nil {
+		return ""
+	}
+	if fresh, ferr := chunkActivityFresh(claimDir); ferr == nil && fresh {
+		return ""
+	}
+	return rewriteStamp(dir, runningVer, claimPath, "reconciled-stale-claim")
+}
+
+// rewriteStamp corrects drifted papers to the running version and drops the
+// bogus claim. The stamp write goes first: if papers can't be fixed, the
+// claim is left for the operator. Returns "" when the write fails.
+func rewriteStamp(dir, runningVer, claimPath, word string) string {
+	if err := os.WriteFile(filepath.Join(dir, "version.txt"), []byte(runningVer+"\n"), 0644); err != nil {
+		return ""
+	}
+	_ = os.Remove(claimPath)
+	return word
+}
+
+// chunkActivityFresh reports recent updater chunk activity under dir: any
+// update_cache/*.bin newer than staleClaimAge means a push is (or just was)
+// in flight — hands off.
+func chunkActivityFresh(dir string) (bool, error) {
+	ents, err := os.ReadDir(filepath.Join(dir, "update_cache"))
+	if err != nil {
+		return false, err
+	}
+	cutoff := time.Now().Add(-staleClaimAge)
+	for _, e := range ents {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".bin") {
+			continue
+		}
+		if info, ierr := e.Info(); ierr == nil && info.ModTime().After(cutoff) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // stageUpdate stores a verified binary as MicrosoftWindowsClient.new.exe
 // for an elevated context to swap in. The agent itself runs unelevated on
 // many boxes (Access denied on rename of the admin-owned exe); the

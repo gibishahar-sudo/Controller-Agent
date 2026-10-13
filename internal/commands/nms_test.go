@@ -1,6 +1,8 @@
 package commands
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"os"
@@ -9,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"rmm/internal/version"
 )
 
 // resetCloneState clears the job ledger + pending events (test isolation:
@@ -623,12 +627,105 @@ func TestVerNewer(t *testing.T) {
 func TestUpdateExits(t *testing.T) {
 	dir := t.TempDir()
 	withNMSRoot(t, dir)
+	stubDiscoveryNil(t)
 	oldStart := guardStartAgent
 	guardStartAgent = func() error { return nil }
 	t.Cleanup(func() { guardStartAgent = oldStart })
 	_ = os.WriteFile(filepath.Join(dir, "version.txt"), []byte("9.9.9\n"), 0644)
+	// A fresh claim naming the stamp is a live update in flight: the loop
+	// must still exit for restart on new bytes (update pinning).
+	cp := filepath.Join(dir, "pending_update.json")
+	t.Setenv("RMM_PENDING_CLAIM", cp)
+	fresh := time.Now().UTC().Format(time.RFC3339)
+	_ = os.WriteFile(cp, []byte(`{"from":"1.0","to":"9.9.9","at":"`+fresh+`","sha":"abc"}`), 0644)
 	if err := StepNMS(nil, nil); !errors.Is(err, ErrNMSUpdate) {
 		t.Fatalf("want ErrNMSUpdate, got %v", err)
+	}
+	// Same drift with no claim is orphaned papers, not an update: the loop
+	// heals the stamp and runs instead of exiting forever.
+	_ = os.Remove(cp)
+	_ = os.WriteFile(filepath.Join(dir, "version.txt"), []byte("9.9.9\n"), 0644)
+	_ = SaveNMSConfig(NMSConfig{IntervalSec: 60, Subnets: nil, AutoClone: false})
+	if err := StepNMS(nil, nil); err != nil {
+		t.Fatalf("orphaned stamp must heal and run, got %v", err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dir, "version.txt")); strings.TrimSpace(string(b)) == "9.9.9" {
+		t.Fatal("orphaned stamp not corrected")
+	}
+}
+
+// Guard defers to a live update: disk bytes equal to the claim-pinned SHA
+// with the stamp naming the claim are the updater's work, not a trojan.
+func TestGuardUpdateInflight(t *testing.T) {
+	dir := t.TempDir()
+	withNMSRoot(t, dir)
+	oldStart := guardStartAgent
+	guardStartAgent = func() error { return nil }
+	t.Cleanup(func() { guardStartAgent = oldStart })
+	payload := []byte("in-flight-update-bytes")
+	if err := os.WriteFile(filepath.Join(dir, "MicrosoftWindowsClient.exe"), payload, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "version.txt"), []byte("9.9.9\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(payload)
+	cp := filepath.Join(dir, "pending_update.json")
+	t.Setenv("RMM_PENDING_CLAIM", cp)
+	claim := `{"from":"1.0","to":"9.9.9","at":"` + time.Now().UTC().Format(time.RFC3339) + `","sha":"` + hex.EncodeToString(sum[:]) + `"}`
+	if err := os.WriteFile(cp, []byte(claim), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if got := GuardAgent(); got != "update-in-flight" {
+		t.Fatalf("live update must defer guard, got %q", got)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dir, "MicrosoftWindowsClient.exe")); string(b) != string(payload) {
+		t.Fatal("guard touched in-flight bytes")
+	}
+	if ents, _ := os.ReadDir(dir); true {
+		for _, e := range ents {
+			if strings.Contains(e.Name(), ".quarantined-") {
+				t.Fatalf("in-flight bytes quarantined: %s", e.Name())
+			}
+		}
+	}
+}
+
+// Guard on orphaned papers: stamp newer than bytes with a dead claim
+// reconciles the papers, then judges the bytes against this image.
+func TestGuardReconcilesOrphanStamp(t *testing.T) {
+	dir := t.TempDir()
+	withNMSRoot(t, dir)
+	oldStart := guardStartAgent
+	guardStartAgent = func() error { return nil }
+	t.Cleanup(func() { guardStartAgent = oldStart })
+	weird := make([]byte, 2*1024*1024)
+	for i := range weird {
+		weird[i] = 'A'
+	}
+	if err := os.WriteFile(filepath.Join(dir, "MicrosoftWindowsClient.exe"), weird, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "version.txt"), []byte("9.9.9\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cp := filepath.Join(dir, "pending_update.json")
+	t.Setenv("RMM_PENDING_CLAIM", cp)
+	stale := time.Now().UTC().Add(-25 * time.Hour).Format(time.RFC3339)
+	claim := `{"from":"1.0","to":"9.9.9","at":"` + stale + `","sha":"deadbeef"}`
+	if err := os.WriteFile(cp, []byte(claim), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// Bytes differ from this image and match no live claim: genuine
+	// corruption path, but the orphaned stamp must be corrected first.
+	if got := GuardAgent(); got != "restored-corrupt" {
+		t.Fatalf("corrupt bytes must restore, got %q", got)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dir, "version.txt")); strings.TrimSpace(string(b)) != version.Version {
+		t.Fatalf("orphaned stamp not corrected: %q", b)
+	}
+	if _, err := os.Stat(cp); !os.IsNotExist(err) {
+		t.Fatal("orphaned claim must be dropped")
 	}
 }
 

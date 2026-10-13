@@ -28,6 +28,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"path/filepath"
@@ -846,7 +847,7 @@ func goldenImage() ([]byte, string, bool) {
 // GuardAgent verifies the agent exe (exists + matches our own image bytes)
 // and its process; restores + restarts on any deviation. Returns a short
 // action word for the report ("ok", "restored-missing", "restored-corrupt",
-// "started-process", "no-golden").
+// "started-process", "no-golden", "update-in-flight").
 func GuardAgent() string {
 	agentPath := NMSAgentPath()
 	golden, goldenSHA, ok := goldenImage()
@@ -861,20 +862,41 @@ func GuardAgent() string {
 		_ = guardStartAgent()
 		return "restored-missing"
 	}
-	if curSHA != goldenSHA {
-		q := fmt.Sprintf("%s.quarantined-%d", agentPath, time.Now().Unix())
-		_ = os.Rename(agentPath, q)
-		if werr := writeFileAtomic(agentPath, golden); werr != nil {
-			return "restore-failed:" + werr.Error()
+	if curSHA == goldenSHA {
+		if !agentProcAlive() {
+			_ = guardStartAgent()
+			return "started-process"
 		}
-		_ = guardStartAgent()
-		return "restored-corrupt"
+		return "ok"
 	}
-	if !agentProcAlive() {
-		_ = guardStartAgent()
-		return "started-process"
+	// Mismatch: update in flight? A live claim naming the stamped version
+	// with disk bytes equal to the pinned SHA is the updater's work, not a
+	// trojan — hands off. (The watcher has arbitrated this way since
+	// v1.44.1; the monitor lacked it and "repaired" updates backward.)
+	if to, sha, _, claimOK := PendingClaim(); claimOK && to != "" && sha != "" {
+		if want, rerr := os.ReadFile(filepath.Join(NMSRoot(), "version.txt")); rerr == nil && strings.TrimSpace(string(want)) == to && curSHA == sha {
+			return "update-in-flight"
+		}
 	}
-	return "ok"
+	// Orphaned stamp? Papers can lie newer than bytes after a failed swap;
+	// restoring "backward" then fights the updater forever. Reconcile the
+	// papers first: if the installed bytes match this image, they ARE the
+	// good set — adopt them, don't restore.
+	if act := ReconcileVersionStamp(NMSRoot(), version.Version); act != "" && shaFile(agentPath) == goldenSHA {
+		log.Printf("[nms] guard: %s — installed bytes match this image, no restore", act)
+		if !agentProcAlive() {
+			_ = guardStartAgent()
+			return "started-process"
+		}
+		return "ok"
+	}
+	q := fmt.Sprintf("%s.quarantined-%d", agentPath, time.Now().Unix())
+	_ = os.Rename(agentPath, q)
+	if werr := writeFileAtomic(agentPath, golden); werr != nil {
+		return "restore-failed:" + werr.Error()
+	}
+	_ = guardStartAgent()
+	return "restored-corrupt"
 }
 
 // ---------------------------------------------------------------------------
@@ -1205,6 +1227,10 @@ func StepNMS(send func(reportJSON string), controllerIPs []string) error {
 		_ = os.Remove(NMSPidPath())
 		return ErrNMSShutdown
 	}
+	// Heal drifted papers BEFORE the version check below: a failed swap can
+	// leave version.txt newer than these bytes, which would otherwise exit
+	// the loop here forever (the "stamped but unswapped" wedge).
+	reconciledEvt := ReconcileVersionStamp(NMSRoot(), version.Version)
 	if want, ok := nmsUpdateAvailable(); ok {
 		_ = os.Remove(NMSPidPath())
 		return fmt.Errorf("%w (%s)", ErrNMSUpdate, want)
@@ -1212,6 +1238,9 @@ func StepNMS(send func(reportJSON string), controllerIPs []string) error {
 	tick := atomic.AddUint64(&nmsTick, 1)
 	cfg := LoadNMSConfig()
 	var events []string
+	if reconciledEvt != "" {
+		events = append(events, "version stamp "+reconciledEvt+" (papers lied newer than bytes)")
+	}
 
 	targets := sweepTargets(cfg)
 
