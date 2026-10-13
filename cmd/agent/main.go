@@ -1985,7 +1985,10 @@ func relayListenOnce(a *agent, hn, user, me, caFile string) error {
 		if env.Enc {
 			plain, ok := commands.E2EOpen(payload)
 			if !ok {
-				log.Printf("[e2e] listen: sealed message without key, dropped")
+				// Keyless window (pre-key-exchange relay traffic): throttle
+				// to one line per window with a repeat count — the raw
+				// line used to fire every ~5s and bury real log signal.
+				repairLogf("e2e-nokey", "[e2e] listen: sealed message without key, dropped")
 				return
 			}
 			payload = plain
