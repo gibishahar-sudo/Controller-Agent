@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -262,7 +263,86 @@ func tasklistAgentPIDs(out string) []int {
 	return pids
 }
 
-// killResult classifies one per-PID taskkill outcome.
+// installT0 marks this installer's own start: any agent-image process born
+// before it is definitionally stale (old bytes), no matter what the
+// pre-write kill reported. Set once in main, read by verifyFreshAgent.
+var installT0 = time.Now()
+
+// pidBirthQuery lists agent-image PIDs with UTC filetime births, one
+// "pid,birth" per line. Single CIM round-trip (sequential WMI only).
+func pidBirthQuery() string {
+	out, err := hiddenExec("powershell", "-NoProfile", "-Command",
+		`Get-CimInstance Win32_Process -Filter "Name='MicrosoftWindowsClient.exe'" | ForEach-Object { "$($_.ProcessId),$($_.CreationDate.ToFileTimeUtc())" }`).CombinedOutput()
+	if err != nil {
+		return ""
+	}
+	return string(out)
+}
+
+// parsePidBirths parses pidBirthQuery output. Pure for unit tests.
+func parsePidBirths(out string) map[int]time.Time {
+	res := map[int]time.Time{}
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Split(strings.TrimSpace(line), ",")
+		if len(f) != 2 {
+			continue
+		}
+		pid, err1 := strconv.Atoi(strings.TrimSpace(f[0]))
+		ft, err2 := strconv.ParseInt(strings.TrimSpace(f[1]), 10, 64)
+		if err1 != nil || err2 != nil || pid <= 0 || ft <= 0 {
+			continue
+		}
+		// FileTime: 100ns ticks since 1601-01-01; Unix epoch starts
+		// 116444736000000000 ticks later.
+		res[pid] = time.Unix(0, (ft-116444736000000000)*100)
+	}
+	return res
+}
+
+// filterStale returns PIDs born before t (PID reuse can never misfire:
+// only provably pre-install births qualify). Pure for unit tests.
+func filterStale(births map[int]time.Time, t time.Time) []int {
+	var out []int
+	for pid, born := range births {
+		if born.Before(t) {
+			out = append(out, pid)
+		}
+	}
+	sort.Ints(out)
+	return out
+}
+
+// staleAgentPIDs returns agent-image PIDs born before t (pre-install
+// survivors holding old bytes). Birth-dated, so PID reuse can never
+// misfire onto the fresh process.
+func staleAgentPIDs(t time.Time) []int {
+	return filterStale(parsePidBirths(pidBirthQuery()), t)
+}
+
+// verifyFreshAgent closes the reinstall-stays-old hole: disk is new, but a
+// wedged survivor keeps reporting the old version (and the new process may
+// even yield to the healthy holder). Every pre-install PID gets the full
+// kill stack; leftovers die LOUDLY with PIDs named instead of silently
+// reporting old forever. CIM-blind boxes warn and continue (the pre-write
+// kill remains the primary guard).
+func verifyFreshAgent() {
+	stale := staleAgentPIDs(installT0)
+	if len(stale) == 0 {
+		return
+	}
+	log.Printf("[*] %d pre-install agent PIDs present, clearing stale holders %v", len(stale), stale)
+	for _, pid := range stale {
+		ko, _ := hiddenExec("taskkill", "/F", "/PID", strconv.Itoa(pid)).CombinedOutput()
+		if classifyKillResult(string(ko)) == killAlive {
+			wmiTerminatePID(pid)
+		}
+	}
+	time.Sleep(2 * time.Second)
+	if left := staleAgentPIDs(installT0); len(left) > 0 {
+		die("stale agent PIDs survive reinstall (old version keeps reporting): %v — reboot the box, then reinstall", left)
+	}
+	log.Printf("[*] stale agent holders cleared, fresh agent owns the box")
+}
 type killResult int
 
 const (
@@ -971,6 +1051,10 @@ func install() {
 		CreationFlags: 0x08000000,
 	}
 	_ = cmd.Start()
+	// No silent old-version survivors: any pre-install holder still alive
+	// now dies loudly with PIDs named (else the dashboard reports old
+	// forever while disk sits new).
+	verifyFreshAgent()
 
 	// Honeypot legacy homes (64-bit + 32-bit twin): wipe any pre-1.40.9
 	// install, then rebuild the dirs as DECOYS (stub agent.exe + cert

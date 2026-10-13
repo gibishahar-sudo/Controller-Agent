@@ -31,6 +31,35 @@ func TestAvBlockHint(t *testing.T) {
 	}
 }
 
+// Stale-holder detection is birth-dated: only pre-install PIDs qualify, so
+// PID reuse can never misfire the kill onto the fresh process.
+func TestParsePidBirths(t *testing.T) {
+	// 134747712000000000 = 2028-01-01T00:00:00Z in filetime ticks.
+	got := parsePidBirths("1234,134747712000000000\r\n5678,0\r\nbogus\r\n9,134747712000000001\r\n")
+	if len(got) != 2 || got[1234].Year() != 2028 || got[9].Year() != 2028 {
+		t.Fatalf("births parsed wrong: %v", got)
+	}
+	if len(parsePidBirths("")) != 0 {
+		t.Fatal("empty must parse empty")
+	}
+}
+
+func TestFilterStale(t *testing.T) {
+	t0 := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+	births := map[int]time.Time{
+		100: t0.Add(-time.Hour),   // stale survivor
+		200: t0.Add(time.Minute),  // fresh (or reused PID): hands off
+		300: t0.Add(-time.Second), // barely stale still counts
+	}
+	got := filterStale(births, t0)
+	if len(got) != 2 || got[0] != 100 || got[1] != 300 {
+		t.Fatalf("stale filter wrong: %v", got)
+	}
+	if len(filterStale(nil, t0)) != 0 {
+		t.Fatal("nil must filter empty")
+	}
+}
+
 // tasklistHasAgent parses tasklist CSV for our binary (v1.46.51: the
 // kill-verify gate depends on it — a missed survivor holds the exe
 // locked and the install below fails silently into a downgrade).
