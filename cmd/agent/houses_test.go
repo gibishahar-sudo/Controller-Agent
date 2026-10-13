@@ -1,6 +1,11 @@
 package main
 
-import "testing"
+import (
+	"net"
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 func TestParseHouseLines(t *testing.T) {
 	got := parseHouseLines("# comment\n\n10.0.0.5\n10.0.0.6:4443\n")
@@ -9,8 +14,7 @@ func TestParseHouseLines(t *testing.T) {
 	}
 }
 
-func TestDialAddrsMultiHouse(t *testing.T) {
-	houses := []string{"10.0.0.5:4444", "10.0.0.6:4444"}
+func TestDialAddrsMultiHouse(t *testing.T) {	houses := []string{"10.0.0.5:4444", "10.0.0.6:4444"}
 	addrs := dialAddrs("10.0.0.9:4444", houses)
 	if len(addrs) == 0 || addrs[0] != "10.0.0.9:4444" {
 		t.Fatalf("primary must come first: %q", addrs)
@@ -26,5 +30,41 @@ func TestDialAddrsMultiHouse(t *testing.T) {
 		if !seen[want] {
 			t.Fatalf("missing %s in %q", want, addrs)
 		}
+	}
+}
+
+// Stale lastgood must never lead the race: closed port and garbage file
+// read empty; a live loopback listener reads back.
+func TestLoadLastGoodValidates(t *testing.T) {
+	dir := t.TempDir()
+	old := lastGoodFileOverride
+	lastGoodFileOverride = filepath.Join(dir, "lastgood.txt")
+	t.Cleanup(func() { lastGoodFileOverride = old })
+
+	if got := loadLastGood(); got != "" {
+		t.Fatalf("missing file must read empty, got %q", got)
+	}
+	if err := os.WriteFile(lastGoodFileOverride, []byte("garbage-no-port\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if got := loadLastGood(); got != "" {
+		t.Fatalf("garbage must read empty, got %q", got)
+	}
+	if err := os.WriteFile(lastGoodFileOverride, []byte("127.0.0.1:9\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if got := loadLastGood(); got != "" {
+		t.Fatalf("closed port must read empty, got %q", got)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	if err := os.WriteFile(lastGoodFileOverride, []byte(ln.Addr().String()+"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if got := loadLastGood(); got != ln.Addr().String() {
+		t.Fatalf("live port must read back, got %q", got)
 	}
 }

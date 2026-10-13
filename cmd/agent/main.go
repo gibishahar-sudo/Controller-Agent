@@ -1504,14 +1504,39 @@ func lastGoodPath() string {
 }
 
 func loadLastGood() string {
-	b, err := os.ReadFile(lastGoodPath())
+	path := lastGoodPath()
+	if lastGoodFileOverride != "" {
+		path = lastGoodFileOverride
+	}
+	b, err := os.ReadFile(path)
 	if err != nil {
 		return ""
 	}
-	if lg := strings.TrimSpace(strings.Split(string(b), "\n")[0]); lg != "" {
-		return lg
+	lg := strings.TrimSpace(strings.Split(string(b), "\n")[0])
+	if lg == "" {
+		return ""
 	}
-	return ""
+	// Validate-then-trust (v1.49.12): a stale winner (dead port,
+	// renumbered box) must never lead the race — 127.0.0.1:443 sat in
+	// lastgood.txt poisoning every reconnect's first dial. A 500ms plain
+	// TCP probe is the whole check; failure just skips the cache.
+	if !lastGoodProbe(lg) {
+		return ""
+	}
+	return lg
+}
+
+// lastGoodFileOverride swaps the cache path in tests.
+var lastGoodFileOverride = ""
+
+// lastGoodProbe fast-probes a cached addr. Var so tests cut the network.
+var lastGoodProbe = func(addr string) bool {
+	c, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	c.Close()
+	return true
 }
 
 func saveLastGood(addr string) {

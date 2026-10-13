@@ -11,9 +11,13 @@ import (
 	"syscall"
 
 	"rmm/internal/controller"
+	"rmm/internal/version"
 )
 
 func main() {
+	shutdown := controller.SetupControllerLog("controller-ui", version.Version, "browser")
+	defer controller.LogCrash("controller-ui")
+	defer shutdown("signal")
 	opts := controller.Options{
 		EnableNtfy:     true,
 		EnableTCPRelay: true,

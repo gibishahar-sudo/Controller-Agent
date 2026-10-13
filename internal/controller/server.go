@@ -365,12 +365,15 @@ func parseHealthID(raw string) (prober string, tick uint64) {
 }
 
 // noteHealthDeduped stores the report unless this prober tick was already
-// seen. Returns false when dropped as a replay.
+// seen. Returns false when dropped as a replay. Replays are ferry
+// duplicates (same tick arriving over two uplinks) — logged, because a
+// dropped replay is positive proof the ferry path carried the report.
 func (s *Server) noteHealthDeduped(id string, raw string) bool {
 	if prober, tick := parseHealthID(raw); prober != "" && tick != 0 {
 		s.healthSeenMu.Lock()
 		if tick <= s.healthSeen[prober] {
 			s.healthSeenMu.Unlock()
+			log.Printf("[health] replay dropped %s tick %d (ferry duplicate of live row)", prober, tick)
 			return false
 		}
 		if s.healthSeen == nil {

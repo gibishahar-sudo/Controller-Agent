@@ -19,6 +19,9 @@ import (
 )
 
 func main() {
+	shutdown := controller.SetupControllerLog("controller-native", version.Version, "webview2")
+	defer controller.LogCrash("controller-native")
+	defer shutdown("exit")
 	opts := controller.Options{
 		EnableNtfy:     true,
 		EnableTCPRelay: true,
