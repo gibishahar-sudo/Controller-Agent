@@ -143,3 +143,25 @@ func TestNMSExecParsing(t *testing.T) {
 		t.Fatalf("bad timeout must fail, got %v", err)
 	}
 }
+
+// Usage errors carry a working example (operators hit bare invocations).
+func TestNMSExecUsageExample(t *testing.T) {
+	withNMSRoot(t, t.TempDir())
+	if _, err := NMSHandle("nms-exec", "192.0.2.108 --force --confirm YES", nil); err == nil ||
+		!strings.Contains(err.Error(), "nms-exec 192.168.1.5 --force --confirm YES -- hostname") {
+		t.Fatalf("usage must show example, got %v", err)
+	}
+}
+
+// The NMS answers ping/version itself (misaddressed agent verbs land here).
+func TestNMSPingVersion(t *testing.T) {
+	if res, err := NMSHandle("ping", "", nil); err != nil || !strings.HasPrefix(res, "pong") {
+		t.Fatalf("ping: %q %v", res, err)
+	}
+	for _, v := range []string{"version", "get-version"} {
+		res, err := NMSHandle(v, "", nil)
+		if err != nil || !strings.Contains(res, "nms ") {
+			t.Fatalf("%s: %q %v", v, res, err)
+		}
+	}
+}

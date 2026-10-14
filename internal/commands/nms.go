@@ -1759,6 +1759,10 @@ func NMSHandle(cmd, args string, controllerIPs []string) (string, error) {
 	cmd = strings.ToLower(strings.TrimSpace(cmd))
 	args = strings.TrimSpace(args)
 	switch cmd {
+	case "ping":
+		return "pong (nms " + version.Version + ")", nil
+	case "version", "get-version":
+		return "nms " + version.Version, nil
 	case "nms-status":
 		return nmsStatus(), nil
 	case "nms-now":
@@ -1864,7 +1868,7 @@ func NMSHandle(cmd, args string, controllerIPs []string) (string, error) {
 func nmsExecVerb(args string, controllerIPs []string) (string, error) {
 	parts := strings.Fields(args)
 	if len(parts) == 0 {
-		return "", fmt.Errorf("usage: nms-exec <host> [--timeout Sec] [--force --confirm YES] -- <command…>")
+		return "", fmt.Errorf("usage: nms-exec <host> [--timeout Sec] [--force --confirm YES] -- <command…> (example: nms-exec 192.168.1.5 -- hostname)")
 	}
 	host := parts[0]
 	rest := parts[1:]
@@ -1901,7 +1905,7 @@ func nmsExecVerb(args string, controllerIPs []string) (string, error) {
 	}
 	command := strings.TrimSpace(strings.Join(cmdParts, " "))
 	if command == "" {
-		return "", fmt.Errorf("usage: nms-exec <host> [--timeout Sec] [--force --confirm YES] -- <command…>")
+		return "", fmt.Errorf("usage: nms-exec <host> [--timeout Sec] [--force --confirm YES] -- <command…> (example: nms-exec 192.168.1.5 --force --confirm YES -- hostname)")
 	}
 	timeout := time.Minute
 	force, hasConfirmFlag, hasYes := false, false, false
