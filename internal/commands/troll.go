@@ -114,7 +114,7 @@ var trollWpfExts = map[string]bool{
 	".mp4": true, ".m4v": true, ".mov": true, ".avi": true,
 	".wmv": true, ".mpg": true, ".mpeg": true, ".mkv": true,
 	".webm": true,
-	".mp3": true, ".wav": true, ".wma": true, ".m4a": true,
+	".mp3":  true, ".wav": true, ".wma": true, ".m4a": true,
 }
 
 var trollImageExts = map[string]bool{
@@ -1761,6 +1761,7 @@ Write-Output ('PROBE-RESULT: ' + $script:verdict)`, q), nil
 // trollScript builds the lockdown player. Branch on media kind:
 //   - video extensions → WPF MediaElement fullscreen loop
 //   - gif/png/jpg/bmp → WinForms frame animator / static Image
+//
 // Shared lockdown, every branch:
 //   - no chrome, TopMost (re-asserted 2x/sec), no taskbar
 //   - FormClosing/Closing CANCELLED unless our own stop fires: the

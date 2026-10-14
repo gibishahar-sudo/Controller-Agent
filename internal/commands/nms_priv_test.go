@@ -73,6 +73,7 @@ func TestPrivSurfaced(t *testing.T) {
 	dir := t.TempDir()
 	withNMSRoot(t, dir)
 	stubDiscoveryNil(t)
+	stubElevatedTrue(t)
 	freezeSweepCache(t)
 	oldStart := guardStartAgent
 	guardStartAgent = func() error { return nil }

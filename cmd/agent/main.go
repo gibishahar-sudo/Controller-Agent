@@ -2702,6 +2702,10 @@ func runNMS(ctrlAddr, caFile string, insecure bool) {
 			log.Printf("[nms] %v, exiting for restart on new bytes", err)
 			os.Exit(0)
 		}
+		if errors.Is(err, commands.ErrNMSElevate) {
+			log.Printf("[nms] handed off to elevated copy, exiting")
+			os.Exit(0)
+		}
 		if err != nil {
 			log.Printf("[-] NMS session ended: %v", err)
 		}
@@ -2714,6 +2718,9 @@ func runNMS(ctrlAddr, caFile string, insecure bool) {
 			return
 		} else if errors.Is(serr, commands.ErrNMSUpdate) {
 			log.Printf("[nms] %v, exiting for restart on new bytes", serr)
+			os.Exit(0)
+		} else if errors.Is(serr, commands.ErrNMSElevate) {
+			log.Printf("[nms] handed off to elevated copy, exiting")
 			os.Exit(0)
 		}
 		time.Sleep(backoff)

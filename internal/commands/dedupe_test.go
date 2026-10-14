@@ -4,6 +4,7 @@ import "testing"
 
 // Same id twice: second run must be suppressed (two-controller dedupe).
 func TestExecuteCheckedDedupe(t *testing.T) {
+	ResetSeenCmdsForTest()
 	id := "test-dedupe-id-1"
 	r1, s1, err1 := ExecuteChecked(id, "get-hostname", "")
 	if err1 != nil || s1 || r1 == "" {
@@ -17,6 +18,7 @@ func TestExecuteCheckedDedupe(t *testing.T) {
 
 // Empty id always runs (old controllers).
 func TestExecuteCheckedNoID(t *testing.T) {
+	ResetSeenCmdsForTest()
 	if _, s, _ := ExecuteChecked("", "get-hostname", ""); s {
 		t.Fatalf("empty id must never suppress")
 	}

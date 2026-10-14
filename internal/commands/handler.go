@@ -88,6 +88,13 @@ var (
 	seenCmds   = map[string]int64{} // cmd id -> unixnano (two-controller dedupe)
 )
 
+// ResetSeenCmdsForTest clears the dedupe cache for test isolation.
+func ResetSeenCmdsForTest() {
+	seenCmdsMu.Lock()
+	seenCmds = map[string]int64{}
+	seenCmdsMu.Unlock()
+}
+
 // ExecuteChecked runs a command unless its id already ran in the last
 // minute (two controllers delivering the same command). Empty id always
 // runs (old controllers). Suppressed calls return suppressed=true so the

