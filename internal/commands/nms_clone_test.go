@@ -193,6 +193,42 @@ func TestCloneSelfNeverTargeted(t *testing.T) {
 	}
 }
 
+// isSelfHostIn matches own addresses (loopback always counts).
+func TestIsSelfHostIn(t *testing.T) {
+	self := []string{"192.168.1.5", "127.0.0.1"}
+	if !isSelfHostIn("127.0.0.1", self) || !isSelfHostIn("192.168.1.5", self) {
+		t.Fatal("own addresses must match")
+	}
+	if isSelfHostIn("192.168.1.6", self) || isSelfHostIn("", self) {
+		t.Fatal("foreign/empty must miss")
+	}
+	if !isSelfHost("127.0.0.1") {
+		t.Fatal("loopback is always self")
+	}
+}
+
+// Self-IP probes carry local gopsutil numbers with no CIM attempt (the
+// loopback CIM query only painted red-herring errors on green cards).
+func TestProbeHostSelfStats(t *testing.T) {
+	withNMSRoot(t, t.TempDir())
+	oldDial, oldRead, oldStats := dialTCP, nmsReadUNC, remoteStatsCIM
+	t.Cleanup(func() { dialTCP, nmsReadUNC, remoteStatsCIM = oldDial, oldRead, oldStats })
+	dialTCP = func(string, int, time.Duration) bool { return true }
+	nmsReadUNC = func(string) ([]byte, error) { return nil, os.ErrNotExist }
+	called := false
+	remoteStatsCIM = func(string, time.Duration) (float64, float64, float64, error) {
+		called = true
+		return 0, 0, 0, errors.New("must not run for self")
+	}
+	r := ProbeHost("127.0.0.1")
+	if !r.Reachable || r.StatsErr != "" {
+		t.Fatalf("self probe: reachable=%v err=%q", r.Reachable, r.StatsErr)
+	}
+	if called {
+		t.Fatal("CIM must not run for self addresses")
+	}
+}
+
 // Auto arm collects self hosts into self_skipped and starts nothing for them.
 func TestAutoArmSelfSkipped(t *testing.T) {
 	dir := t.TempDir()

