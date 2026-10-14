@@ -1035,7 +1035,7 @@ func classifySMBErr(err error) string {
 	if errors.As(err, &errno) {
 		switch int(errno) {
 		case 5:
-			return "access denied (SMB creds lack ADMIN$ write — check target Administrators; workgroup target: LocalAccountTokenFilterPolicy)"
+			return "access denied (SMB creds lack ADMIN$ write - check target Administrators; workgroup target: LocalAccountTokenFilterPolicy)"
 		case 53:
 			return "bad network path (no route or SMB disabled on target)"
 		case 64:
@@ -1133,13 +1133,13 @@ func wmiReturnText(code string) string {
 	case "0":
 		return "ok"
 	case "2":
-		return "access denied (WMI 2 — DCOM/RPC rights or TrustedHosts)"
+		return "access denied (WMI 2 - DCOM/RPC rights or TrustedHosts)"
 	case "3":
-		return "insufficient privilege (WMI 3 — account needs remote-launch rights)"
+		return "insufficient privilege (WMI 3 - account needs remote-launch rights)"
 	case "8":
-		return "unknown failure (WMI 8 — provider error on target)"
+		return "unknown failure (WMI 8 - provider error on target)"
 	case "9":
-		return "path not found (WMI 9 — installer copy missing on target)"
+		return "path not found (WMI 9 - installer copy missing on target)"
 	case "21":
 		return "invalid parameter (WMI 21)"
 	default:
@@ -1321,11 +1321,11 @@ func startCloneJob(host, wantVer string, forced bool) (state string, started boo
 	go func() {
 		st, detail := nmsCloneExec(host, wantVer)
 		if len(detail) > 240 {
-			detail = detail[:240] + "…"
+			detail = detail[:240] + "..."
 		}
 		cloneMu.Lock()
 		cloneJobs[host] = &cloneJob{State: st, Detail: detail, At: time.Now(), Done: true, Forced: forced}
-		evt := "clone " + host + ": " + st + " — " + detail
+		evt := "clone " + host + ": " + st + " - " + detail
 		if forced {
 			evt = "FORCED by operator: " + evt
 		}
@@ -1437,7 +1437,7 @@ func StepNMS(send func(reportJSON string), controllerIPs []string) error {
 			}
 			if r.ManagedUnknown {
 				r.CloneState = "skip-managed-unknown"
-				r.CloneDetail = "share read denied — refusing to guess"
+				r.CloneDetail = "share read denied - refusing to guess"
 				continue
 			}
 			elig, reason := CloneEligible(r.Host, r.Reachable, r.ManagedHint, cfg.Exclude, self, controllerIPs)
@@ -1447,7 +1447,7 @@ func StepNMS(send func(reportJSON string), controllerIPs []string) error {
 				// in the report, never silently dropped. A self-clone
 				// attempt is a P0 by definition.
 				if reason == "self" {
-					r.CloneDetail = "this box — never targeted"
+					r.CloneDetail = "this box - never targeted"
 					selfSkipped = append(selfSkipped, r.Host)
 				}
 				continue

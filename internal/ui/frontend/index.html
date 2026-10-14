@@ -3241,7 +3241,7 @@ function renderNMS(j){
   const byIP=j.managedByIP||{}, byHost=j.managedByHost||{};
   const isManaged=h=>byIP[h]||byHost[String(h).toLowerCase()];
   cards.innerHTML=reps.map(rep=>{
-    let r={}; try{ r=JSON.parse(rep.report); }catch(e){ r={}; }
+    let r={}; try{ r=(typeof rep.report==="string")?JSON.parse(rep.report):(rep.report||{}); }catch(e){ r={}; }
     const hosts=r.results||[];
     const up=hosts.filter(h=>h.reachable).length;
     const sleep=r.sleep?`<span style="color:#CE9178">💤 agent asleep (${r.sleep.reason||""})</span>`:`<span style="color:#8BC34A">awake</span>`;

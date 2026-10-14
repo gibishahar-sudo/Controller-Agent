@@ -79,7 +79,7 @@ func appendPrivDetail(d, s string) string {
 func privShortErr(err error) string {
 	s := strings.TrimSpace(err.Error())
 	if len(s) > 120 {
-		s = s[:120] + "…"
+		s = s[:120] + "..."
 	}
 	return s
 }
