@@ -1003,23 +1003,28 @@ func readInstallerBytes() ([]byte, bool) {
 	return b, true
 }
 
-// nmsSMBCopy / nmsRemoteExec / nmsCloneVerify are vars so tests cut the LAN.
-var nmsSMBCopy = func(host string, data []byte) error {
-	dest := `\\` + host + `\ADMIN$\Temp\Agent-Setup.exe`
+// nmsSMBWriteFile writes bytes to any UNC path with a hard timeout (raw
+// error — callers classify). Var so tests cut the LAN.
+var nmsSMBWriteFile = func(dest string, data []byte) error {
 	done := make(chan error, 1)
-	go func() {
-		if err := os.WriteFile(dest, data, 0644); err != nil {
-			done <- fmt.Errorf("smb copy: %s", classifySMBErr(err))
-			return
-		}
-		done <- nil
-	}()
+	go func() { done <- os.WriteFile(dest, data, 0644) }()
 	select {
 	case err := <-done:
 		return err
 	case <-time.After(120 * time.Second):
-		return fmt.Errorf("smb copy: stalled over 120s (link down mid-transfer?)")
+		return fmt.Errorf("stalled over 120s (link down mid-transfer?)")
 	}
+}
+
+// nmsSMBCopy / nmsRemoteExec / nmsCloneVerify are vars so tests cut the LAN.
+var nmsSMBCopy = func(host string, data []byte) error {
+	if err := nmsSMBWriteFile(`\\`+host+`\ADMIN$\Temp\Agent-Setup.exe`, data); err != nil {
+		if strings.HasPrefix(err.Error(), "stalled") {
+			return fmt.Errorf("smb copy: %s", err.Error())
+		}
+		return fmt.Errorf("smb copy: %s", classifySMBErr(err))
+	}
+	return nil
 }
 
 // classifySMBErr turns UNC write failures into actionable words (paths
@@ -1048,9 +1053,23 @@ func classifySMBErr(err error) string {
 	return strings.TrimSpace(err.Error())
 }
 
-var nmsRemoteExec = func(host string) error {
-	cmd := `C:\Windows\Temp\Agent-Setup.exe --silent`
-	script := `(Get-CimInstance Win32_Process -Filter "Name='MicrosoftWindowsClient.exe'" | Measure-Object).Count; Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine='` + strings.ReplaceAll(cmd, "'", "''") + `'} | Select-Object -ExpandProperty ReturnValue`
+// nmsRemoteDelete removes a UNC path (best-effort cleanup). Var for tests.
+var nmsRemoteDelete = func(path string) error {
+	done := make(chan error, 1)
+	go func() { done <- os.Remove(path) }()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(30 * time.Second):
+		return fmt.Errorf("delete timed out")
+	}
+}
+
+// nmsRemoteCreate runs an arbitrary command line on host via WMI (hidden,
+// non-interactive). nmsRemoteExec is the installer specialization below.
+// Var so tests record instead of touching the LAN.
+var nmsRemoteCreate = func(host, commandLine string) error {
+	script := `Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine='` + strings.ReplaceAll(commandLine, "'", "''") + `'} | Select-Object -ExpandProperty ReturnValue`
 	out, err := runWithTimeout(60*time.Second, "powershell", "-NoProfile", "-Command", "$s=New-CimSession -ComputerName '"+strings.ReplaceAll(host, "'", "''")+"';"+script+";Remove-CimSession -CimSession $s")
 	if err != nil {
 		return err
@@ -1059,6 +1078,53 @@ var nmsRemoteExec = func(host string) error {
 		return fmt.Errorf("remote create: %s", wmiReturnText(code))
 	}
 	return nil
+}
+
+var nmsRemoteExec = func(host string) error {
+	return nmsRemoteCreate(host, `C:\Windows\Temp\Agent-Setup.exe --silent`)
+}
+
+// NMSRemoteRun stages a batch script on host, runs it hidden via WMI, collects
+// capped output, and cleans up both remote files (best-effort). One-shot,
+// non-interactive, no passwords on any command line. Returns output
+// (possibly partial with a timeout error).
+func NMSRemoteRun(host, command string, timeout time.Duration) (string, error) {
+	if timeout <= 0 {
+		timeout = time.Minute
+	}
+	if timeout > 5*time.Minute {
+		timeout = 5 * time.Minute
+	}
+	tag := fmt.Sprintf("rme-%d", time.Now().UnixNano())
+	bat := `\\` + host + `\ADMIN$\Temp\` + tag + `.bat`
+	out := `\\` + host + `\ADMIN$\Temp\` + tag + `.out`
+	cleanup := func() {
+		_ = nmsRemoteDelete(bat)
+		_ = nmsRemoteDelete(out)
+	}
+	if err := nmsSMBWriteFile(bat, []byte("@echo off\r\n"+command+"\r\n")); err != nil {
+		return "", fmt.Errorf("stage: %s", classifySMBErr(err))
+	}
+	remote := `cmd.exe /c "` + `C:\Windows\Temp\` + tag + `.bat > ` + `C:\Windows\Temp\` + tag + `.out 2>&1"`
+	if err := nmsRemoteCreate(host, remote); err != nil {
+		cleanup()
+		return "", fmt.Errorf("launch: %s", strings.TrimSpace(err.Error()))
+	}
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if b, err := nmsReadUNC(out); err == nil {
+			cleanup()
+			return string(truncateOut(b)), nil
+		}
+		time.Sleep(5 * time.Second)
+	}
+	// Timeout: harvest partial output if any, then clean up.
+	if b, err := nmsReadUNC(out); err == nil && len(b) > 0 {
+		cleanup()
+		return string(truncateOut(b)), fmt.Errorf("timed out after %s (partial output)", timeout)
+	}
+	cleanup()
+	return "", fmt.Errorf("timed out after %s (no output file)", timeout)
 }
 
 // wmiReturnText translates Win32_Process.Create ReturnValues (pure, tested).
@@ -1779,9 +1845,106 @@ func NMSHandle(cmd, args string, controllerIPs []string) (string, error) {
 			return "FORCED clone job started for " + host + " (operator override — audited)", nil
 		}
 		return "clone job started for " + host, nil
+	case "nms-exec":
+		// Remote one-shot on unmanaged hosts: nms-exec <host> -- <command…>
+		// [--timeout Sec] [--force --confirm YES]. Managed boxes refuse
+		// with a redirect to their own agent verbs; unknown needs force
+		// like clone (same reinstall-risk class); gates never bypassed.
+		return nmsExecVerb(args, controllerIPs)
 	default:
-		return "", fmt.Errorf("unknown NMS command: %s (nms-status, nms-now, set-nms, agent-sleep, agent-wake-up, nms-stop, nms-clone)", cmd)
+		return "", fmt.Errorf("unknown NMS command: %s (nms-status, nms-now, set-nms, agent-sleep, agent-wake-up, nms-stop, nms-clone, nms-exec)", cmd)
 	}
+}
+
+// nmsExecVerb implements `nms-exec <host> [--timeout Sec] [--force
+// --confirm YES] -- <command…>`: gates identical to clone (managed
+// redirects to that box's agent, unknown needs force), then one staged
+// batch run with capped output. Flags go BEFORE the -- separator —
+// everything after it is the remote command verbatim (flags included).
+func nmsExecVerb(args string, controllerIPs []string) (string, error) {
+	parts := strings.Fields(args)
+	if len(parts) == 0 {
+		return "", fmt.Errorf("usage: nms-exec <host> [--timeout Sec] [--force --confirm YES] -- <command…>")
+	}
+	host := parts[0]
+	rest := parts[1:]
+	// Split flags from the command at the first "--" (everything after is
+	// the remote command verbatim, flags included).
+	var flags, cmdParts []string
+	seenSep := false
+	for _, p := range rest {
+		if !seenSep && p == "--" {
+			seenSep = true
+			continue
+		}
+		if seenSep {
+			cmdParts = append(cmdParts, p)
+		} else {
+			flags = append(flags, p)
+		}
+	}
+	if !seenSep {
+		// No separator: leading --flags allowed, remainder is the command.
+		var cmd []string
+		for i := 0; i < len(rest); i++ {
+			p := rest[i]
+			if p == "--timeout" && i+1 < len(rest) {
+				flags = append(flags, p, rest[i+1])
+				i++
+			} else if p == "--force" || strings.EqualFold(p, "--confirm") || strings.EqualFold(p, "YES") {
+				flags = append(flags, p)
+			} else {
+				cmd = append(cmd, p)
+			}
+		}
+		cmdParts = cmd
+	}
+	command := strings.TrimSpace(strings.Join(cmdParts, " "))
+	if command == "" {
+		return "", fmt.Errorf("usage: nms-exec <host> [--timeout Sec] [--force --confirm YES] -- <command…>")
+	}
+	timeout := time.Minute
+	force, hasConfirmFlag, hasYes := false, false, false
+	for i := 0; i < len(flags); i++ {
+		switch {
+		case flags[i] == "--timeout" && i+1 < len(flags):
+			n, err := strconv.Atoi(flags[i+1])
+			if err != nil || n < 5 || n > 300 {
+				return "", fmt.Errorf("--timeout must be 5..300 (seconds)")
+			}
+			timeout = time.Duration(n) * time.Second
+			i++
+		case flags[i] == "--force":
+			force = true
+		case strings.EqualFold(flags[i], "--confirm"):
+			hasConfirmFlag = true
+		case strings.EqualFold(flags[i], "YES"):
+			hasYes = true
+		}
+	}
+	if !TCPReachable(host) {
+		return "", fmt.Errorf("exec refused: %s unreachable (no 445/135/3389)", host)
+	}
+	if managed, unknown := ManagedHintChecked(host); managed {
+		return "", fmt.Errorf("exec refused: %s already managed — send commands to its own agent row, not here", host)
+	} else if unknown && !(force && hasConfirmFlag && hasYes) {
+		return "", fmt.Errorf("exec refused: %s managed-state unknown — verify access first, or retry with --force --confirm YES", host)
+	}
+	cfg := LoadNMSConfig()
+	if elig, reason := CloneEligible(host, true, false, cfg.Exclude, selfIPs(), controllerIPs); !elig {
+		return "", fmt.Errorf("exec refused: %s", reason)
+	}
+	out, err := NMSRemoteRun(host, command, timeout)
+	if err != nil {
+		return "", fmt.Errorf("exec %s: %v", host, err)
+	}
+	if out == "" {
+		return "(no output)", nil
+	}
+	if len(out) > 64*1024 {
+		out = out[:64*1024] + "\n…[truncated at 64KB]"
+	}
+	return out, nil
 }
 
 func currentSweep() []string {

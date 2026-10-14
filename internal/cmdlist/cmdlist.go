@@ -184,4 +184,5 @@ var Known = map[string]string{
 	"set-nms":                  "NMS: config - set-nms key=value ... (interval, subnets, extra_hosts, exclude, autoclone, max_parallel)",
 	"nms-stop":                 "NMS: stop the monitor (send to the hostname/nms row) - nms-stop --confirm YES",
 	"nms-clone":                "NMS: one-shot clone to a host (send to the hostname/nms row) - nms-clone <host> [--dry-run validates without writing; --force --confirm YES overrides unknown-state refusal]",
+	"nms-exec":                 "NMS: one-shot remote command on an unmanaged host (send to the hostname/nms row) - nms-exec <host> [--timeout Sec] [--force --confirm YES] -- <command…>",
 }
