@@ -1,6 +1,8 @@
 package commands
 
 import (
+	"encoding/json"
+	"errors"
 	"os"
 	"strings"
 	"syscall"
@@ -164,5 +166,80 @@ func TestCloneForceMatrix(t *testing.T) {
 	if _, err := NMSHandle("nms-clone", "192.0.2.97 --force --confirm YES", nil); err == nil ||
 		!strings.Contains(err.Error(), "already managed") {
 		t.Fatalf("force on managed host must refuse, got %v", err)
+	}
+}
+
+// Self is untouchable: even --force --confirm YES refuses loopback, and the
+// auto arm names it in self_skipped instead of starting a job. A self-clone
+// is a P0 by definition.
+func TestCloneSelfNeverTargeted(t *testing.T) {
+	dir := t.TempDir()
+	withNMSRoot(t, dir)
+	resetCloneState()
+	nmsClearBreaker()
+	oldDial, oldRead := dialTCP, nmsReadUNC
+	t.Cleanup(func() { dialTCP, nmsReadUNC = oldDial, oldRead })
+	dialTCP = func(string, int, time.Duration) bool { return true }
+	nmsReadUNC = func(string) ([]byte, error) { return nil, os.ErrNotExist }
+	// Dummy exclusion (non-empty, matches nothing): the default config
+	// seeds loopback exclusion, which would fire before the SELF gate.
+	_ = SaveNMSConfig(NMSConfig{IntervalSec: 60, Exclude: []string{"nonexistent.invalid"}})
+	if _, err := NMSHandle("nms-clone", "127.0.0.1 --force --confirm YES", nil); err == nil ||
+		!strings.Contains(err.Error(), "self") {
+		t.Fatalf("force on self must refuse naming self, got %v", err)
+	}
+	if out := CloneDryRun("127.0.0.1", nil); !strings.Contains(out, "NEVER TARGETED") {
+		t.Fatalf("dry-run on self must declare never-targeted:\n%s", out)
+	}
+}
+
+// Auto arm collects self hosts into self_skipped and starts nothing for them.
+func TestAutoArmSelfSkipped(t *testing.T) {
+	dir := t.TempDir()
+	withNMSRoot(t, dir)
+	resetCloneState()
+	nmsClearBreaker()
+	freezeSweepCache(t)
+	oldDial, oldRead, oldExec, oldSeed, oldStart, oldStats := dialTCP, nmsReadUNC, nmsCloneExec, arpSeedHosts, guardStartAgent, remoteStatsCIM
+	t.Cleanup(func() {
+		dialTCP, nmsReadUNC, nmsCloneExec, arpSeedHosts, guardStartAgent, remoteStatsCIM = oldDial, oldRead, oldExec, oldSeed, oldStart, oldStats
+	})
+	dialTCP = func(string, int, time.Duration) bool { return true }
+	nmsReadUNC = func(string) ([]byte, error) { return nil, os.ErrNotExist }
+	remoteStatsCIM = func(string, time.Duration) (float64, float64, float64, error) {
+		return 0, 0, 0, errors.New("no stats in test")
+	}
+	nmsCloneExec = func(host, ver string) (string, string) { return "copy-failed", "test must not run" }
+	arpSeedHosts = func() []string { return nil }
+	guardStartAgent = func() error { return nil }
+	payload := make([]byte, 10*1024*1024)
+	payload[0], payload[1] = 'M', 'Z'
+	if err := os.WriteFile(NMSInstallerPath(), payload, 0644); err != nil {
+		t.Fatal(err)
+	}
+	_ = SaveNMSConfig(NMSConfig{IntervalSec: 60, Subnets: []string{}, ExtraHosts: []string{"127.0.0.1"}, Exclude: []string{"nonexistent.invalid"}, AutoClone: true})
+	var got string
+	if err := StepNMS(func(j string) { got = j }, nil); err != nil {
+		t.Fatal(err)
+	}
+	var rep map[string]interface{}
+	if err := json.Unmarshal([]byte(got), &rep); err != nil {
+		t.Fatal(err)
+	}
+	skipped, _ := rep["self_skipped"].([]interface{})
+	found := false
+	for _, s := range skipped {
+		if s == "127.0.0.1" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("report must name 127.0.0.1 in self_skipped: %v", rep["self_skipped"])
+	}
+	cloneMu.Lock()
+	_, tracked := cloneJobs["127.0.0.1"]
+	cloneMu.Unlock()
+	if tracked {
+		t.Fatal("auto arm must never track a job on self")
 	}
 }

@@ -3263,7 +3263,8 @@ function renderNMS(j){
       return `<div class="audio-card">${dot} <b>${h.host}</b>${stat}${mg}${h.clone_detail?`<div style="color:#666">${h.clone_detail}</div>`:""}${h.stats_err?`<div style="color:#666">${h.stats_err}</div>`:""}</div>`;
     }).join("");
     const evts=(r.events||[]).map(e=>`<div>• ${e}</div>`).join("");
-    return `<div class="audio-card" style="grid-column:1/-1">🛡 <b>${rep.hostname||rep.id}</b> tick ${r.tick||0} guard ${r.guard||"?"} arm ${r.clone_arm||"?"} ${sleep} — ${up}/${hosts.length} up${evts?`<div style="margin-top:6px;font-size:11px;color:#FFD54F">${evts}</div>`:""}<div style="margin-top:6px;display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:8px">${cards2}</div></div>`;
+    const selfLine=(r.self_skipped||[]).length?`<div style="margin-top:6px;font-size:11px;color:#888">self — never targeted: ${(r.self_skipped||[]).join(", ")}</div>`:"";
+    return `<div class="audio-card" style="grid-column:1/-1">🛡 <b>${rep.hostname||rep.id}</b> tick ${r.tick||0} guard ${r.guard||"?"} arm ${r.clone_arm||"?"} ${sleep} — ${up}/${hosts.length} up${evts?`<div style="margin-top:6px;font-size:11px;color:#FFD54F">${evts}</div>`:""}${selfLine}<div style="margin-top:6px;display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:8px">${cards2}</div></div>`;
   }).join("");
   if(age){
     age.textContent=reps.length===1?"":"(" + reps.length + " probers)";

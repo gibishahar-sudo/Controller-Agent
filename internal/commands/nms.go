@@ -1367,6 +1367,9 @@ type NMSReport struct {
 	Priv      *NMSPriv        `json:"priv,omitempty"`
 	Results   []NMSHostResult `json:"results"`
 	Events    []string        `json:"events,omitempty"`
+	// SelfSkipped names own-box addresses seen this cycle: explicit proof
+	// the prober never targets itself (a self-clone is a P0 by definition).
+	SelfSkipped []string `json:"self_skipped,omitempty"`
 }
 
 var nmsTick uint64
@@ -1421,6 +1424,7 @@ func StepNMS(send func(reportJSON string), controllerIPs []string) error {
 	// Clone arm (auto): eligible reachable unmanaged hosts, one tracked job
 	// per host (in-flight dedupe + cooldown, honest terminal states).
 	cloneArm := "idle"
+	var selfSkipped []string
 	if cfg.AutoClone && !CloneArmPaused() {
 		cloneArm = "scanning"
 		self := selfIPs()
@@ -1439,6 +1443,13 @@ func StepNMS(send func(reportJSON string), controllerIPs []string) error {
 			elig, reason := CloneEligible(r.Host, r.Reachable, r.ManagedHint, cfg.Exclude, self, controllerIPs)
 			if !elig {
 				r.CloneState = "skip-" + reason
+				// Self-exclusion is explicit and loud: own box is named
+				// in the report, never silently dropped. A self-clone
+				// attempt is a P0 by definition.
+				if reason == "self" {
+					r.CloneDetail = "this box — never targeted"
+					selfSkipped = append(selfSkipped, r.Host)
+				}
 				continue
 			}
 			if !ok {
@@ -1482,7 +1493,7 @@ func StepNMS(send func(reportJSON string), controllerIPs []string) error {
 		Prober: hn, At: time.Now().UTC().Format(time.RFC3339),
 		Tick: tick, Version: version.Version, Interval: cfg.IntervalSec,
 		Sleep: sleep, Guard: guard, CloneArm: cloneArm, Priv: &priv,
-		Results: results, Events: events,
+		Results: results, Events: events, SelfSkipped: selfSkipped,
 	}
 	b, _ := json.Marshal(rep)
 	_ = tick
@@ -1690,7 +1701,11 @@ func CloneDryRun(host string, controllerIPs []string) string {
 	}
 	cfg := LoadNMSConfig()
 	if elig, reason := CloneEligible(host, true, managed, cfg.Exclude, selfIPs(), controllerIPs); !elig {
-		fmt.Fprintf(&b, "eligibility: skip-%s\nverdict: WOULD NOT CLONE (%s)\n", reason, reason)
+		if reason == "self" {
+			fmt.Fprintf(&b, "eligibility: skip-self\nverdict: NEVER TARGETED (this box — self-clone is refused even with --force)\n")
+		} else {
+			fmt.Fprintf(&b, "eligibility: skip-%s\nverdict: WOULD NOT CLONE (%s)\n", reason, reason)
+		}
 		return b.String()
 	}
 	fmt.Fprintf(&b, "eligibility: eligible\n")
