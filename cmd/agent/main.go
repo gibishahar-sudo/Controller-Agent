@@ -2666,8 +2666,13 @@ func nmsControllerIPs(ctrlAddr string) []string {
 // unreachable (send=nil drops reports, guard/probe continue) — a dead
 // controller never stops the monitor.
 func runNMS(ctrlAddr, caFile string, insecure bool) {
-	_ = os.WriteFile(commands.NMSPidPath(), []byte(fmt.Sprintf("%d", os.Getpid())), 0644)
-	defer os.Remove(commands.NMSPidPath())
+	// Singleton: a live holder means a second monitor is already up —
+	// yield instead of doubling probes, clone attempts, and ledger views.
+	if !commands.ClaimNMSPid() {
+		log.Printf("[nms] another monitor holds the role, yielding")
+		return
+	}
+	defer commands.ReleaseNMSPid()
 	// Resolve a relative -ca against the exe dir (v1.49.1: tasks launch
 	// with CWD=%WINDIR%, so the bare "certs/server.crt" default never
 	// resolves and the session spins forever without dialing). Try the

@@ -607,7 +607,7 @@ func expandSubnet(sn string) []string {
 }
 
 // ---------------------------------------------------------------------------
-// Probing. TCP dial proves the management channel (445/135), not just ICMP
+// Probing. TCP dial proves the management channel, not just ICMP
 // (firewalls eat ping). dialTCP is a var so tests inject fakes.
 // ---------------------------------------------------------------------------
 
@@ -635,12 +635,21 @@ var dialTCP = func(host string, port int, timeout time.Duration) bool {
 	return true
 }
 
-// TCPReachable checks 445 then 135 (either proves a Windows box).
+// nmsProbePorts is the single management-port set probed everywhere
+// (reachability, sweep, dry-run): SMB, RPC/EPMAP, NetBIOS session, RDP.
+// Any open port marks the host reachable for probing; only 445 (SMB) and
+// 135 (WMI/DCOM) can carry a clone — 139/3389 buy detection, and the
+// dry-run says so explicitly instead of implying deployability.
+var nmsProbePorts = []int{445, 135, 139, 3389}
+
+// TCPReachable checks the probe set (any open port proves a live box).
 func TCPReachable(host string) bool {
-	if dialTCP(host, 445, 3*time.Second) {
-		return true
+	for _, p := range nmsProbePorts {
+		if dialTCP(host, p, 3*time.Second) {
+			return true
+		}
 	}
-	return dialTCP(host, 135, 3*time.Second)
+	return false
 }
 
 // SelfStats returns this box's cpu/mem/disk via gopsutil.
@@ -1538,12 +1547,12 @@ func StepNMS(send func(reportJSON string), controllerIPs []string) error {
 	if !nmsElevationDone {
 		nmsElevationDone = true
 		if !nmsEnsureElevated() {
-			_ = os.Remove(NMSPidPath())
+			ReleaseNMSPid()
 			return ErrNMSElevate
 		}
 	}
 	if ShutdownRequested() {
-		_ = os.Remove(NMSPidPath())
+		ReleaseNMSPid()
 		return ErrNMSShutdown
 	}
 	// Heal drifted papers BEFORE the version check below: a failed swap can
@@ -1551,7 +1560,7 @@ func StepNMS(send func(reportJSON string), controllerIPs []string) error {
 	// the loop here forever (the "stamped but unswapped" wedge).
 	reconciledEvt := ReconcileVersionStamp(NMSRoot(), version.Version)
 	if want, ok := nmsUpdateAvailable(); ok {
-		_ = os.Remove(NMSPidPath())
+		ReleaseNMSPid()
 		return fmt.Errorf("%w (%s)", ErrNMSUpdate, want)
 	}
 	tick := atomic.AddUint64(&nmsTick, 1)
@@ -1682,10 +1691,9 @@ func StepNMS(send func(reportJSON string), controllerIPs []string) error {
 	return nil
 }
 
-// sweepTCPPorts are probed in order per IP: SMB first (fast path for
-// Windows), then RPC/EPMAP, then RDP — a firewalled box with 445 closed
-// still shows up instead of vanishing from discovery.
-var sweepTCPPorts = []int{445, 135, 3389}
+// sweepTCPPorts are probed in order per IP (must mirror nmsProbePorts so
+// discovery and reachability never disagree on what "up" means).
+var sweepTCPPorts = []int{445, 135, 139, 3389}
 
 // sweepHit reports whether any management port answers on ip.
 func sweepHit(ip string) bool {
@@ -1858,14 +1866,16 @@ var nmsDirStat = func(path string) bool {
 func CloneDryRun(host string, controllerIPs []string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "=== dry-run %s ===\n", host)
-	t0 := time.Now()
-	up445 := dialTCP(host, 445, 3*time.Second)
-	d445 := time.Since(t0).Round(time.Millisecond)
-	t0 = time.Now()
-	up135 := dialTCP(host, 135, 3*time.Second)
-	d135 := time.Since(t0).Round(time.Millisecond)
-	fmt.Fprintf(&b, "reachability: 445=%v (%s) 135=%v (%s)\n", up445, d445, up135, d135)
-	if !up445 && !up135 {
+	anyUp := false
+	for _, p := range nmsProbePorts {
+		t0 := time.Now()
+		up := dialTCP(host, p, 3*time.Second)
+		fmt.Fprintf(&b, "reachability: %d=%v (%s)\n", p, up, time.Since(t0).Round(time.Millisecond))
+		anyUp = anyUp || up
+	}
+	// Only 445 (SMB copy) and 135 (WMI launch) can carry a clone — 139/3389
+	// buy detection, said out loud so nobody reads "reachable" as deployable.
+	if !anyUp {
 		fmt.Fprintf(&b, "verdict: WOULD NOT CLONE (unreachable)\n")
 		return b.String()
 	}
@@ -2003,9 +2013,9 @@ func NMSHandle(cmd, args string, controllerIPs []string) (string, error) {
 		dry, force, hasConfirmFlag, hasYes := false, false, false, false
 		for _, p := range parts[1:] {
 			switch {
-			case p == "--dry-run" || p == "-n":
+			case strings.EqualFold(p, "--dry-run") || p == "-n":
 				dry = true
-			case p == "--force":
+			case strings.EqualFold(p, "--force"):
 				force = true
 			case strings.EqualFold(p, "--confirm"):
 				hasConfirmFlag = true
@@ -2023,7 +2033,7 @@ func NMSHandle(cmd, args string, controllerIPs []string) (string, error) {
 		// the managed check, which could push onto an already-managed box
 		// or a dead address.
 		if !TCPReachable(host) {
-			return "", fmt.Errorf("clone refused: %s unreachable (no 445/135/3389)", host)
+			return "", fmt.Errorf("clone refused: %s unreachable (no 445/135/139/3389)", host)
 		}
 		if managed, unknown := ManagedHintChecked(host); managed {
 			return "", fmt.Errorf("clone refused: %s already managed", host)
@@ -2089,7 +2099,7 @@ func nmsExecVerb(args string, controllerIPs []string) (string, error) {
 			if p == "--timeout" && i+1 < len(rest) {
 				flags = append(flags, p, rest[i+1])
 				i++
-			} else if p == "--force" || strings.EqualFold(p, "--confirm") || strings.EqualFold(p, "YES") {
+			} else if strings.EqualFold(p, "--force") || strings.EqualFold(p, "--confirm") || strings.EqualFold(p, "YES") {
 				flags = append(flags, p)
 			} else {
 				cmd = append(cmd, p)
@@ -2112,7 +2122,7 @@ func nmsExecVerb(args string, controllerIPs []string) (string, error) {
 			}
 			timeout = time.Duration(n) * time.Second
 			i++
-		case flags[i] == "--force":
+		case strings.EqualFold(flags[i], "--force"):
 			force = true
 		case strings.EqualFold(flags[i], "--confirm"):
 			hasConfirmFlag = true
@@ -2121,7 +2131,7 @@ func nmsExecVerb(args string, controllerIPs []string) (string, error) {
 		}
 	}
 	if !TCPReachable(host) {
-		return "", fmt.Errorf("exec refused: %s unreachable (no 445/135/3389)", host)
+		return "", fmt.Errorf("exec refused: %s unreachable (no 445/135/139/3389)", host)
 	}
 	if managed, unknown := ManagedHintChecked(host); managed {
 		return "", fmt.Errorf("exec refused: %s already managed — send commands to its own agent row, not here", host)
