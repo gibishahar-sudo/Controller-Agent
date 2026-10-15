@@ -704,10 +704,12 @@ func (s *Server) startHTTP(addr, dir string) {
 		}
 	s.nmsHealthMu.Lock()
 	// Prune tombstoned probers (reinstalls mint new row ids): drop reports
-	// older than 24h so the map can't grow with fleet churn.
+	// older than 24h so the map can't grow with fleet churn. Plus freshness
+	// expiry: a silent prober's row must age out instead of haunting the
+	// Dashboard next to its live successor (duplicate-NMS eras proved it).
 	cutoff := time.Now().Add(-24 * time.Hour)
 	for id, rec := range s.nmsHealth {
-		if rec.at.Before(cutoff) {
+		if rec.at.Before(cutoff) || healthReportStale(rec.report, time.Now()) {
 			delete(s.nmsHealth, id)
 		}
 	}

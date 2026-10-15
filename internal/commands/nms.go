@@ -1590,9 +1590,13 @@ func StepNMS(send func(reportJSON string), controllerIPs []string) error {
 
 	// Clone arm (auto): eligible reachable unmanaged hosts, one tracked job
 	// per host (in-flight dedupe + cooldown, honest terminal states).
+	// Effective arm = AutoClone OR AutoForce: setting autoforce=on starts
+	// the arm even with autoclone off (a FORCE badge beside an idle arm
+	// was a lie — v1.49.21).
 	cloneArm := "idle"
+	armOn := (cfg.AutoClone || cfg.AutoForce) && !CloneArmPaused()
 	var selfSkipped []string
-	if cfg.AutoClone && !CloneArmPaused() {
+	if armOn {
 		cloneArm = "scanning"
 		if cfg.AutoForce {
 			cloneArm = "scanning+force"
@@ -2174,7 +2178,7 @@ func nmsStatus() string {
 	}
 	arm := "off"
 	autoforce := "autoforce=off"
-	if cfg.AutoClone {
+	if cfg.AutoClone || cfg.AutoForce {
 		arm = "scanning"
 		if cfg.AutoForce {
 			arm = "scanning+force"

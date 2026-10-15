@@ -364,6 +364,32 @@ func parseHealthID(raw string) (prober string, tick uint64) {
 	return r.Prober, r.Tick
 }
 
+// healthReportStale reports whether a stored report is too old to display:
+// older than 3× its own interval plus 2 minutes grace (5-minute floor).
+// Unparsable reports never stale on content (arrival-time pruning in the
+// caller covers them). Pure, tested.
+func healthReportStale(report json.RawMessage, now time.Time) bool {
+	var r struct {
+		At       string `json:"at"`
+		Interval int    `json:"interval_sec"`
+	}
+	at := now.Add(-time.Hour)
+	if err := json.Unmarshal(report, &r); err == nil && r.At != "" {
+		if t, perr := time.Parse(time.RFC3339, r.At); perr == nil {
+			at = t
+		}
+	} else {
+		// Unparsable envelope: fall back to arrival-time freshness handled
+		// by the caller (never stale on content here).
+		return false
+	}
+	interval := time.Duration(r.Interval) * time.Second
+	if interval < time.Minute {
+		interval = time.Minute
+	}
+	return now.Sub(at) > 3*interval+2*time.Minute
+}
+
 // noteHealthDeduped stores the report unless this prober tick was already
 // seen. Returns false when dropped as a replay. Replays are ferry
 // duplicates (same tick arriving over two uplinks) — logged, because a

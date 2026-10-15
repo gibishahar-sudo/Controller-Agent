@@ -15,13 +15,19 @@ import (
 // own guard. Generation-safe: the pid file carries pid + process create
 // time, so PID recycling can never impersonate a live holder.
 
-// ClaimNMSPid takes the monitor role: true = we own it. A live matching
-// holder means yield (exit quietly); anything else (missing/garbled/dead/
-// mismatched) means take over. Best-effort file write: an unwritable pid
-// file proceeds (a missing guard is better than no monitor).
+// ClaimNMSPid takes the monitor role: true = we own it. The initial
+// create is atomic (O_EXCL: exactly one starter in the same second wins),
+// so the old check-then-write race that doubled the rows is structurally
+// impossible. A live matching holder means yield; stale/garbled/dead/
+// mismatched means clear-and-retry (loser of the retry respects the
+// winner); unreadable either way means run (a missing guard beats no
+// monitor).
 func ClaimNMSPid() bool {
 	ours, err := ownPidRecord()
 	if err != nil {
+		return true
+	}
+	if err := createNMSPidExcl(ours); err == nil {
 		return true
 	}
 	if holder, ok := readNMSPid(); ok {
@@ -32,8 +38,32 @@ func ClaimNMSPid() bool {
 			return false
 		}
 	}
-	_ = writeNMSPid(ours)
+	_ = os.Remove(NMSPidPath())
+	if err := createNMSPidExcl(ours); err == nil {
+		return true
+	}
+	if holder, ok := readNMSPid(); ok && nmsPidAlive(holder) {
+		return holder.pid == ours.pid && holder.createMs == ours.createMs
+	}
 	return true
+}
+
+// createNMSPidExcl creates the pid file atomically (fails if present).
+func createNMSPidExcl(r nmsPidRec) error {
+	f, err := os.OpenFile(NMSPidPath(), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	if _, werr := fmt.Fprintf(f, "%d\n%d\n", r.pid, r.createMs); werr != nil {
+		f.Close()
+		_ = os.Remove(NMSPidPath())
+		return werr
+	}
+	if cerr := f.Close(); cerr != nil {
+		_ = os.Remove(NMSPidPath())
+		return cerr
+	}
+	return nil
 }
 
 // ReleaseNMSPid drops the role, but only if we still own it (never delete
@@ -81,10 +111,6 @@ func readNMSPid() (nmsPidRec, bool) {
 		return nmsPidRec{}, false
 	}
 	return nmsPidRec{pid: pid, createMs: ms}, true
-}
-
-func writeNMSPid(r nmsPidRec) error {
-	return os.WriteFile(NMSPidPath(), []byte(fmt.Sprintf("%d\n%d\n", r.pid, r.createMs)), 0644)
 }
 
 // nmsPidAlive reports whether the recorded holder is that same process

@@ -4,6 +4,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -133,5 +134,34 @@ func TestTCPReachableAllPorts(t *testing.T) {
 	dialTCP = func(string, int, time.Duration) bool { return false }
 	if TCPReachable("192.0.2.102") {
 		t.Fatal("dark host must read unreachable")
+	}
+}
+
+// Concurrent starters: exactly one O_EXCL create wins (the check-then-
+// write race that doubled the Dashboard rows is structurally impossible).
+// Distinct records stand in for distinct processes.
+func TestClaimNMSPidConcurrent(t *testing.T) {
+	dir := t.TempDir()
+	withNMSRoot(t, dir)
+	const racers = 32
+	wins := make(chan bool, racers)
+	var wg sync.WaitGroup
+	for i := 0; i < racers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			wins <- createNMSPidExcl(nmsPidRec{pid: 1000 + i, createMs: 2000 + int64(i)}) == nil
+		}(i)
+	}
+	wg.Wait()
+	close(wins)
+	owned := 0
+	for w := range wins {
+		if w {
+			owned++
+		}
+	}
+	if owned != 1 {
+		t.Fatalf("exactly one O_EXCL create must win, got %d/%d", owned, racers)
 	}
 }

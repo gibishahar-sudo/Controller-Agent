@@ -203,6 +203,40 @@ func TestCloneSelfNeverTargeted(t *testing.T) {
 	}
 }
 
+// Autoforce implies the arm: autoclone=off + autoforce=on still scans
+// (a FORCE badge beside an idle arm was a lie). Proven-managed still vetoed.
+func TestAutoForceImpliesArm(t *testing.T) {
+	dir := t.TempDir()
+	withNMSRoot(t, dir)
+	stubElevatedTrue(t)
+	freezeSweepCache(t)
+	resetCloneState()
+	nmsClearBreaker()
+	oldDial, oldRead, oldStats, oldStart := dialTCP, nmsReadUNC, remoteStatsCIM, guardStartAgent
+	t.Cleanup(func() { dialTCP, nmsReadUNC, remoteStatsCIM, guardStartAgent = oldDial, oldRead, oldStats, oldStart })
+	dialTCP = func(string, int, time.Duration) bool { return false }
+	nmsReadUNC = func(string) ([]byte, error) { return nil, os.ErrNotExist }
+	remoteStatsCIM = func(string, time.Duration) (float64, float64, float64, error) {
+		return 0, 0, 0, errors.New("no stats in test")
+	}
+	guardStartAgent = func() error { return nil }
+	_ = SaveNMSConfig(NMSConfig{IntervalSec: 60, Subnets: []string{}, AutoClone: false, AutoForce: true})
+	var got string
+	if err := StepNMS(func(j string) { got = j }, nil); err != nil {
+		t.Fatal(err)
+	}
+	var rep map[string]interface{}
+	if err := json.Unmarshal([]byte(got), &rep); err != nil {
+		t.Fatal(err)
+	}
+	if rep["clone_arm"] != "scanning+force" {
+		t.Fatalf("arm must read scanning+force, got %v", rep["clone_arm"])
+	}
+	if rep["autoforce"] != true {
+		t.Fatalf("report must carry autoforce=true, got %v", rep["autoforce"])
+	}
+}
+
 // isSelfHostIn matches own addresses (loopback always counts).
 func TestIsSelfHostIn(t *testing.T) {
 	self := []string{"192.168.1.5", "127.0.0.1"}

@@ -1,7 +1,9 @@
 package controller
 
 import (
+	"encoding/json"
 	"testing"
+	"time"
 )
 
 func TestParseHealthID(t *testing.T) {
@@ -55,5 +57,32 @@ func TestFindNMSAgent(t *testing.T) {
 	}
 	if ac := s.findNMSAgent(""); ac != nil {
 		t.Fatal("empty prober must miss")
+	}
+}
+
+// Staleness: 3x interval + 2min grace; unparsable never stale on content.
+func TestHealthReportStale(t *testing.T) {
+	now := time.Now()
+	mk := func(at time.Time, interval int) json.RawMessage {
+		b, _ := json.Marshal(map[string]interface{}{
+			"at":           at.UTC().Format(time.RFC3339),
+			"interval_sec": interval,
+		})
+		return b
+	}
+	if healthReportStale(mk(now, 60), now) {
+		t.Fatal("fresh 60s report must keep")
+	}
+	if !healthReportStale(mk(now.Add(-10*time.Minute), 60), now) {
+		t.Fatal("10min-old 60s report must expire")
+	}
+	if healthReportStale(mk(now.Add(-10*time.Minute), 300), now) {
+		t.Fatal("10min-old 300s report must keep (grace 17min)")
+	}
+	if !healthReportStale(mk(now.Add(-20*time.Minute), 300), now) {
+		t.Fatal("20min-old 300s report must expire")
+	}
+	if healthReportStale(json.RawMessage("{"), now) {
+		t.Fatal("unparsable report must not stale on content")
 	}
 }
