@@ -3260,7 +3260,7 @@ function renderNMS(j){
       const dot=h.reachable?`<span style="color:#8BC34A">🟢</span>`:`<span style="color:#FF5252">🔴</span>`;
       const mg=isManaged(h.host)?`<div style="color:#888">managed</div>`:(h.managed_unknown?`<div style="color:#FFD54F">❓ unknown — skipped</div>`:`<div style="color:#FFD54F">${cloneLabel(h.clone)}</div>`);
       const stat=h.reachable?`<div>CPU ${Math.round(h.cpu||0)}% MEM ${Math.round(h.mem||0)}% DISK ${Math.round(h.disk||0)}%</div>`:`<div style="color:#666">unreachable</div>`;
-      return `<div class="audio-card">${dot} <b>${h.host}</b>${stat}${mg}${h.clone_detail?`<div style="color:#666">${h.clone_detail}</div>`:""}${h.stats_err?`<div style="color:#666" title="${h.stats_err}">${h.stats_err.length>140?h.stats_err.slice(0,140)+"...":h.stats_err}</div>`:""}</div>`;
+      return `<div class="audio-card">${dot} <b>${h.host}</b>${stat}${mg}${h.fingerprint?`<div style="color:#888">FP: ${h.fingerprint}${h.open_ports?` :`+h.open_ports.join(","):""}</div>`:""}${h.clone_detail?`<div style="color:#666">${h.clone_detail}</div>`:""}${h.stats_err?`<div style="color:#666" title="${h.stats_err}">${h.stats_err.length>140?h.stats_err.slice(0,140)+"...":h.stats_err}</div>`:""}</div>`;
     }).join("");
     const forceBadge=r.autoforce?`<span style="color:#FF5252;font-weight:700" title="Whole-LAN auto-force is ON: unknown hosts clone automatically"> FORCE</span>`:"";
     const evts=(r.events||[]).map(e=>`<div>• ${e}</div>`).join("");

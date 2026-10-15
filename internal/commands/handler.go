@@ -131,7 +131,7 @@ func ExecuteChecked(cmdID, cmd, args string) (result string, suppressed bool, er
 		switch lowerCmd {
 		case "ping", "version", "get-version", "get-mode", "set-mode",
 			"agent-sleep", "agent-wake-up",
-			"nms-status", "nms-now", "set-nms", "nms-stop", "nms-clone", "nms-exec":
+			"nms-status", "nms-now", "set-nms", "nms-stop", "nms-clone", "nms-exec", "nms-scan":
 		default:
 			return "", false, fmt.Errorf("agent is asleep (send agent-wake-up to the NMS)")
 		}
@@ -142,7 +142,7 @@ func ExecuteChecked(cmdID, cmd, args string) (result string, suppressed bool, er
 	switch strings.ToLower(strings.TrimSpace(cmd)) {
 	case "ping", "version", "get-version", "get-mode", "set-mode",
 		"agent-sleep", "agent-wake-up",
-		"nms-status", "nms-now", "set-nms", "nms-stop", "nms-clone", "nms-exec":
+		"nms-status", "nms-now", "set-nms", "nms-stop", "nms-clone", "nms-exec", "nms-scan":
 	default:
 		if m := AgentMode(); !modeAllows(m, cmd) {
 			return "", false, fmt.Errorf("%s", ModeDenied(m))
@@ -655,7 +655,9 @@ func Execute(cmd, args string) (string, error) {
 		return hex.EncodeToString(h[:]), nil
 	case "screenshot-now":
 		return "use screenshot button", nil
-	case "agent-sleep", "agent-wake-up", "nms-status", "nms-now", "set-nms", "nms-stop", "nms-clone", "nms-exec":
+	case "agent-sleep", "agent-wake-up", "nms-status", "nms-now", "set-nms", "nms-stop", "nms-clone", "nms-exec", "nms-scan":
+		// NMS verbs live on the monitor row (hostname/nms), never here:
+		// answer with a redirect instead of falling through to cmd.exe.
 		// NMS verbs live on the monitor row (hostname/nms), never here:
 		// answer with a redirect instead of falling through to cmd.exe.
 		return cmd + " lives on the NMS — send it to the hostname/nms row, not the agent", nil

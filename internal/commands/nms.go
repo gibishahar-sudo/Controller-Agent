@@ -1,6 +1,6 @@
 package commands
 
-// NMS — network management system monitor.
+// NMS - network management system monitor.
 //
 // The NMS is the same agent binary in --nms mode: own process, own vault
 // path, own controller identity (hostname/nms), own 7-verb command set.
@@ -27,7 +27,7 @@ package commands
 // FIX 5 (new invariant): the NMS guarantees its own elevation. An
 // unelevated instance hands off to an elevated copy via a one-shot
 // /RL HIGHEST task and exits. Elevated is the steady state, never the
-// exception — the "runs unelevated, guard/restore and remote pushes
+// exception - the "runs unelevated, guard/restore and remote pushes
 // will fail" warning can no longer be the permanent condition.
 import (
 	"crypto/sha256"
@@ -125,7 +125,7 @@ func NMSReportPath() string { return filepath.Join(NMSRoot(), "nms-report.json")
 
 // SpoolNMSReport atomically stores the latest monitor report for the agent
 // ferry (the StepNMS send func for link-down cycles). Silent on empty input
-// or write failure — spooling is best-effort, never fatal.
+// or write failure - spooling is best-effort, never fatal.
 func SpoolNMSReport(reportJSON string) {
 	if reportJSON == "" {
 		return
@@ -220,7 +220,7 @@ var ErrNMSShutdown = fmt.Errorf("nms shutdown file present")
 // ErrNMSUpdate is returned by StepNMS when the install dir carries a newer
 // version than this running image: the NMS exits cleanly and persistence
 // restarts it on new bytes (otherwise the monitor would pin old code
-// forever — the vault/install sync only replaces files, never processes).
+// forever - the vault/install sync only replaces files, never processes).
 var ErrNMSUpdate = fmt.Errorf("nms update available")
 
 // FIX: ErrNMSElevate is returned by StepNMS when this process was unelevated
@@ -302,7 +302,7 @@ func ensureElevated() bool {
 	if CurrentNMSPriv().Elevated {
 		return true
 	}
-	// Another NMS already alive? It is the elevated one — just bow out.
+	// Another NMS already alive? It is the elevated one - just bow out.
 	if b, err := os.ReadFile(NMSPidPath()); err == nil {
 		if pid, _ := strconv.Atoi(strings.TrimSpace(string(b))); pid > 0 {
 			if p, err := process.NewProcess(int32(pid)); err == nil {
@@ -341,7 +341,7 @@ type NMSConfig struct {
 	Exclude       []string `json:"exclude"`
 	AutoClone     bool     `json:"autoclone"`
 	// AutoForce extends the auto arm to managed-unknown hosts (default
-	// off — explicit opt-in per NMS; unknown stays skipped otherwise).
+	// off - explicit opt-in per NMS; unknown stays skipped otherwise).
 	AutoForce     bool `json:"autoforce"`
 	MaxParallel   int  `json:"max_parallel"`
 	FailThreshold int  `json:"fail_threshold"`
@@ -623,6 +623,11 @@ type NMSHostResult struct {
 	CloneState     string  `json:"clone"`
 	CloneDetail    string  `json:"clone_detail,omitempty"`
 	StatsErr       string  `json:"stats_err,omitempty"`
+	// Fingerprint classifies Tier-2 findings (windows/unix-like/
+	// appliance-mgmt-ui/gateway/unknown-device/dark). Empty = not profiled.
+	Fingerprint string `json:"fingerprint,omitempty"`
+	// OpenPorts lists Tier-2 open ports backing the fingerprint.
+	OpenPorts []int `json:"open_ports,omitempty"`
 }
 
 // dialTCP dials host:port with timeout. Var for tests.
@@ -638,7 +643,7 @@ var dialTCP = func(host string, port int, timeout time.Duration) bool {
 // nmsProbePorts is the single management-port set probed everywhere
 // (reachability, sweep, dry-run): SMB, RPC/EPMAP, NetBIOS session, RDP.
 // Any open port marks the host reachable for probing; only 445 (SMB) and
-// 135 (WMI/DCOM) can carry a clone — 139/3389 buy detection, and the
+// 135 (WMI/DCOM) can carry a clone - 139/3389 buy detection, and the
 // dry-run says so explicitly instead of implying deployability.
 var nmsProbePorts = []int{445, 135, 139, 3389}
 
@@ -714,7 +719,7 @@ var nmsFileStat = func(path string) (string, bool) {
 }
 
 // ManagedHint reports whether host already has an agent install (its own
-// NMS owns repair there — never reinstall a managed box).
+// NMS owns repair there - never reinstall a managed box).
 func ManagedHint(host string) bool {
 	managed, _ := ManagedHintChecked(host)
 	return managed
@@ -722,7 +727,7 @@ func ManagedHint(host string) bool {
 
 // ManagedHintChecked is ManagedHint with the ambiguous third state: unknown
 // is true when the check itself failed (denied/timed out/off-Windows)
-// instead of proving absence. The clone arm treats unknown as a veto — a
+// instead of proving absence. The clone arm treats unknown as a veto - a
 // managed box that refuses the share read must never look "unmanaged".
 func ManagedHintChecked(host string) (managed, unknown bool) {
 	p := managedHintPath(host)
@@ -960,7 +965,7 @@ func writeFileAtomic(path string, data []byte) error {
 
 // goldenCache avoids re-reading our own multi-MB image every cycle. Keyed on
 // the live file's size+mtime: an update replacing bytes under us must NOT
-// keep restoring a stale image — the guard always compares against current
+// keep restoring a stale image - the guard always compares against current
 // bytes (nmsUpdateAvailable exits the loop on version drift regardless).
 var goldenMu sync.Mutex
 var goldenPath string
@@ -1021,7 +1026,7 @@ func GuardAgent() string {
 	}
 	// Mismatch: update in flight? A live claim naming the stamped version
 	// with disk bytes equal to the pinned SHA is the updater's work, not a
-	// trojan — hands off. (The watcher has arbitrated this way since
+	// trojan - hands off. (The watcher has arbitrated this way since
 	// v1.44.1; the monitor lacked it and "repaired" updates backward.)
 	if to, sha, _, claimOK := PendingClaim(); claimOK && to != "" && sha != "" {
 		if want, rerr := os.ReadFile(filepath.Join(NMSRoot(), "version.txt")); rerr == nil && strings.TrimSpace(string(want)) == to && curSHA == sha {
@@ -1031,9 +1036,9 @@ func GuardAgent() string {
 	// Orphaned stamp? Papers can lie newer than bytes after a failed swap;
 	// restoring "backward" then fights the updater forever. Reconcile the
 	// papers first: if the installed bytes match this image, they ARE the
-	// good set — adopt them, don't restore.
+	// good set - adopt them, don't restore.
 	if act := ReconcileVersionStamp(NMSRoot(), version.Version); act != "" && shaFile(agentPath) == goldenSHA {
-		log.Printf("[nms] guard: %s — installed bytes match this image, no restore", act)
+		log.Printf("[nms] guard: %s - installed bytes match this image, no restore", act)
 		if !agentProcAlive() {
 			_ = guardStartAgent()
 			return "started-process"
@@ -1104,13 +1109,13 @@ func selfIPs() []string {
 }
 
 // NMSInstallerPath is the installer copy the installer lays beside the
-// agent at install time (a byte copy of its own image — no embed
+// agent at install time (a byte copy of its own image - no embed
 // circularity: installer embeds agent, agent never embeds installer).
 // Clone jobs deploy from these bytes after MZ+size validation.
 func NMSInstallerPath() string { return filepath.Join(NMSRoot(), "Agent-Setup.exe") }
 
 // NMSInstallerInfo reports the clone payload on disk (size, sha, PE sanity).
-// Missing/undersized/non-MZ reads as absent — the clone arm then reports
+// Missing/undersized/non-MZ reads as absent - the clone arm then reports
 // no-payload honestly instead of pushing garbage.
 func NMSInstallerInfo() (size int64, sha string, ok bool) {
 	b, err := os.ReadFile(NMSInstallerPath())
@@ -1136,7 +1141,7 @@ func readInstallerBytes() ([]byte, bool) {
 }
 
 // nmsSMBWriteFile writes bytes to any UNC path with a hard timeout (raw
-// error — callers classify). Var so tests cut the LAN.
+// error - callers classify). Var so tests cut the LAN.
 var nmsSMBWriteFile = func(dest string, data []byte) error {
 	done := make(chan error, 1)
 	go func() { done <- os.WriteFile(dest, data, 0644) }()
@@ -1160,7 +1165,7 @@ var nmsSMBCopy = func(host string, data []byte) error {
 }
 
 // classifySMBErr turns UNC write failures into actionable words (paths
-// carry host+share only — never credentials — so the text is log-safe).
+// carry host+share only - never credentials - so the text is log-safe).
 // Pure, tested.
 func classifySMBErr(err error) string {
 	var errno syscall.Errno
@@ -1301,7 +1306,7 @@ var nmsCloneVerify = func(host, wantVer string, timeout time.Duration) bool {
 
 // CloneToHost pushes the installer and launches it remotely. Returns the
 // clone-state word plus a human detail line (surfaced in clone_detail and
-// the ledger event — bare words never again).
+// the ledger event - bare words never again).
 //
 // FIX: launched-unverified now records a breaker failure. Before, a box that
 // launched but never confirmed looped forever after cooldown and never
@@ -1439,7 +1444,7 @@ func drainCloneEvents() []string {
 // startCloneJob launches one tracked clone unless a job is already in flight
 // or a terminal state is still cooling down. Returns the CloneState word for
 // the report and whether a new job actually started. forced marks operator
-// overrides (audit trail only — the executor pipeline is identical).
+// overrides (audit trail only - the executor pipeline is identical).
 func startCloneJob(host, wantVer string, forced bool) (state string, started bool) {
 	now := time.Now()
 	cloneMu.Lock()
@@ -1500,9 +1505,68 @@ func cloneJobLookup(host string) (state, detail string, tracked bool) {
 }
 
 // ---------------------------------------------------------------------------
-// StepNMS: one full cycle. No stop channel, no mode/sleep reads —
-// structurally unstoppable. Returns ErrNMSShutdown only on the stop file.
+// Deep-scan jobs: full TCP range on explicit demand only (never sweep,
+// never auto). Async ledger mirroring the clone pattern: tracked state,
+// cooldown, terminal event.
 // ---------------------------------------------------------------------------
+
+// scanCooldown spaces repeat deep scans per host (read-only, but noisy).
+const scanCooldown = 10 * time.Minute
+
+type scanJob struct {
+	State  string
+	Detail string
+	At     time.Time
+	Done   bool
+}
+
+var scanMu sync.Mutex
+var scanJobs = map[string]*scanJob{}
+
+// startScanJob launches one tracked full-range scan unless in flight or
+// cooling down. Returns display state + whether it started.
+func startScanJob(host string) (state string, started bool) {
+	now := time.Now()
+	scanMu.Lock()
+	if j, ok := scanJobs[host]; ok {
+		if !j.Done {
+			scanMu.Unlock()
+			return "scanning", false
+		}
+		if now.Sub(j.At) < scanCooldown {
+			scanMu.Unlock()
+			return "scan-cooldown", false
+		}
+	}
+	scanJobs[host] = &scanJob{State: "scanning", Detail: "full-range scan running", At: now}
+	scanMu.Unlock()
+	go func() {
+		ports := make([]int, 0, 65535)
+		for p := 1; p <= 65535; p++ {
+			ports = append(ports, p)
+		}
+		open := probeOpenPorts(host, ports, 300*time.Millisecond, 256)
+		fp, why := fingerprintHost(open)
+		detail := "open: none"
+		if len(open) > 0 {
+			shown := open
+			if len(shown) > 40 {
+				detail = fmt.Sprintf("open: %v... +%d more", shown[:40], len(shown)-40)
+			} else {
+				detail = fmt.Sprintf("open: %v", shown)
+			}
+		}
+		detail += " => " + fp + " (" + why + ")"
+		if len(detail) > 400 {
+			detail = detail[:400] + "..."
+		}
+		scanMu.Lock()
+		scanJobs[host] = &scanJob{State: "scan-complete", Detail: detail, At: time.Now(), Done: true}
+		pushCloneEvent("scan " + host + ": " + detail)
+		scanMu.Unlock()
+	}()
+	return "scanning", true
+}
 
 // NMSReport is the per-cycle JSON the controller stores and serves.
 type NMSReport struct {
@@ -1579,6 +1643,10 @@ func StepNMS(send func(reportJSON string), controllerIPs []string) error {
 	if len(targets) > 0 {
 		results = append(results, ProbeRound(targets, cfg.MaxParallel)...)
 	}
+	// Tier-2 auto-profile: ARP-present hosts dark on Tier-1 get identified
+	// (bounded per cycle, 30-min cache) so appliances stop reading as
+	// "nothing" - and so the auto arm below can veto non-Windows kinds.
+	profileDarkHosts(results, arpSeedHosts())
 
 	// Guard the agent.
 	guard := GuardAgent()
@@ -1592,7 +1660,7 @@ func StepNMS(send func(reportJSON string), controllerIPs []string) error {
 	// per host (in-flight dedupe + cooldown, honest terminal states).
 	// Effective arm = AutoClone OR AutoForce: setting autoforce=on starts
 	// the arm even with autoclone off (a FORCE badge beside an idle arm
-	// was a lie — v1.49.21).
+	// was a lie - v1.49.21).
 	cloneArm := "idle"
 	armOn := (cfg.AutoClone || cfg.AutoForce) && !CloneArmPaused()
 	var selfSkipped []string
@@ -1629,6 +1697,14 @@ func StepNMS(send func(reportJSON string), controllerIPs []string) error {
 				if !cfg.AutoForce {
 					r.CloneState = "skip-managed-unknown"
 					r.CloneDetail = "share read denied - refusing to guess"
+					continue
+				}
+				// Fingerprinted non-Windows never auto-clones (an appliance
+				// with open SMB-looking ports still can't run our bytes;
+				// manual --force remains the operator's override).
+				if fpVetoAuto(r.Fingerprint) {
+					r.CloneState = "skip-non-windows"
+					r.CloneDetail = "fingerprinted " + r.Fingerprint + " - not a Windows target"
 					continue
 				}
 				if !ok {
@@ -1699,6 +1775,79 @@ func StepNMS(send func(reportJSON string), controllerIPs []string) error {
 // discovery and reachability never disagree on what "up" means).
 var sweepTCPPorts = []int{445, 135, 139, 3389}
 
+// nmsProbePortsTier2 is the extended fingerprint set: well-known service
+// ports dialed ONLY for hosts dark on Tier-1 (or on explicit demand).
+// Never part of sweep/reachability fast paths - 20+ dials per host would
+// turn a /24 sweep into minutes. Detection only, except 139 (NetBIOS SMB
+// fallback rides the normal copy path automatically).
+var nmsProbePortsTier2 = []int{445, 135, 139, 3389, 21, 22, 23, 53, 80, 389, 443, 1433, 3306, 5432, 5900, 5985, 5986, 6379, 8080, 8443, 9020, 27017}
+
+// probeOpenPorts dials ports with bounded parallelism, returning the open
+// subset sorted ascending. Timeout per port; total bounded by parallelism.
+func probeOpenPorts(host string, ports []int, timeout time.Duration, maxParallel int) []int {
+	if maxParallel < 1 {
+		maxParallel = 1
+	}
+	var mu sync.Mutex
+	var open []int
+	sem := make(chan struct{}, maxParallel)
+	var wg sync.WaitGroup
+	for _, p := range ports {
+		wg.Add(1)
+		go func(p int) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			if dialTCP(host, p, timeout) {
+				mu.Lock()
+				open = append(open, p)
+				mu.Unlock()
+			}
+		}(p)
+	}
+	wg.Wait()
+	sort.Ints(open)
+	return open
+}
+
+// fingerprintHost classifies an open-port set into a box kind. Pure,
+// tested - 192.168.68.54's exact signature (8443-only) is the reference.
+func fingerprintHost(open []int) (label, detail string) {
+	has := map[int]bool{}
+	for _, p := range open {
+		has[p] = true
+	}
+	switch {
+	case len(open) == 0:
+		return "dark", "no probed ports answer"
+	case has[445] || has[135]:
+		return "windows", "SMB/RPC answers"
+	case has[3389]:
+		return "windows-rdp", "RDP answers, no SMB/RPC"
+	case has[22] && (has[80] || has[443]):
+		return "unix-like", "SSH + web answers"
+	case has[5900]:
+		return "vnc-console", "VNC answers"
+	case has[8443] && len(open) == 1:
+		return "appliance-mgmt-ui", "only an mgmt-UI port answers"
+	case has[53] && has[80]:
+		return "gateway", "DNS + web answers"
+	default:
+		return "unknown-device", fmt.Sprintf("open: %v", open)
+	}
+}
+
+// fpVetoAuto reports whether a fingerprint bars AUTOMATIC cloning.
+// Confident-non-Windows kinds never auto-clone (explicit --force still
+// allowed - operator's funeral, fully audited). Pure, tested.
+func fpVetoAuto(fp string) bool {
+	switch fp {
+	case "unix-like", "appliance-mgmt-ui", "gateway":
+		return true
+	}
+	return false
+}
+
 // sweepHit reports whether any management port answers on ip.
 func sweepHit(ip string) bool {
 	for _, p := range sweepTCPPorts {
@@ -1721,7 +1870,7 @@ var arpSeedExec = func() ([]byte, error) {
 
 // arpSeedHosts lists IPs from the local ARP/neighbor cache: no probes, so a
 // firewalled house PC is visible here while answering zero TCP ports.
-// Best-effort — empty on any failure. Var so tests stay hermetic.
+// Best-effort - empty on any failure. Var so tests stay hermetic.
 var arpSeedHosts = func() []string {
 	b, err := arpSeedExec()
 	if err != nil || len(b) == 0 {
@@ -1781,6 +1930,62 @@ func sweepSubnets(subnets []string) []string {
 	return out
 }
 
+// profileCacheMu guards cached Tier-2 fingerprints (30-min TTL: sweep cadence).
+var profileCacheMu sync.Mutex
+var profileCache = map[string]profileRec{}
+
+type profileRec struct {
+	at    time.Time
+	fp    string
+	ports []int
+}
+
+// profileDarkHosts fingerprints Tier-1-dark, ARP-present hosts (max 8 per
+// cycle; cached 30min). Never touches reachable hosts or the self entry.
+func profileDarkHosts(results []NMSHostResult, arpHosts []string) {
+	arpSet := map[string]bool{}
+	for _, h := range arpHosts {
+		arpSet[strings.TrimSpace(h)] = true
+	}
+	type job struct {
+		idx  int
+		host string
+	}
+	var jobs []job
+	now := time.Now()
+	profileCacheMu.Lock()
+	for i := range results {
+		r := &results[i]
+		if r.Reachable || strings.HasSuffix(r.Host, "(self)") || !arpSet[r.Host] {
+			continue
+		}
+		if rec, ok := profileCache[r.Host]; ok && now.Sub(rec.at) < 30*time.Minute {
+			r.Fingerprint, r.OpenPorts = rec.fp, rec.ports
+			continue
+		}
+		if len(jobs) < 8 {
+			jobs = append(jobs, job{i, r.Host})
+		}
+	}
+	profileCacheMu.Unlock()
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 4)
+	for _, j := range jobs {
+		wg.Add(1)
+		go func(j job) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			open := probeOpenPorts(j.host, nmsProbePortsTier2, 400*time.Millisecond, 8)
+			fp, _ := fingerprintHost(open)
+			profileCacheMu.Lock()
+			profileCache[j.host] = profileRec{at: time.Now(), fp: fp, ports: open}
+			results[j.idx].Fingerprint, results[j.idx].OpenPorts = fp, open
+			profileCacheMu.Unlock()
+		}(j)
+	}
+	wg.Wait()
+}
 // ipLess orders dotted quads numerically (plain sort.Strings ranks
 // 192.168.1.100 before 192.168.1.20). Non-IP strings sort after IPs,
 // lexically among themselves.
@@ -1844,7 +2049,7 @@ func sweepTargets(cfg NMSConfig) []string {
 
 // ---------------------------------------------------------------------------
 // NMSHandle: the monitor's own 7-verb command set. No modes, no sleep
-// concept applies to the NMS itself — these verbs act outward only,
+// concept applies to the NMS itself - these verbs act outward only,
 // except nms-stop which honors the shutdown file.
 // ---------------------------------------------------------------------------
 
@@ -1877,7 +2082,7 @@ func CloneDryRun(host string, controllerIPs []string) string {
 		fmt.Fprintf(&b, "reachability: %d=%v (%s)\n", p, up, time.Since(t0).Round(time.Millisecond))
 		anyUp = anyUp || up
 	}
-	// Only 445 (SMB copy) and 135 (WMI launch) can carry a clone — 139/3389
+	// Only 445 (SMB copy) and 135 (WMI launch) can carry a clone - 139/3389
 	// buy detection, said out loud so nobody reads "reachable" as deployable.
 	if !anyUp {
 		fmt.Fprintf(&b, "verdict: WOULD NOT CLONE (unreachable)\n")
@@ -1886,16 +2091,16 @@ func CloneDryRun(host string, controllerIPs []string) string {
 	managed, unknown := ManagedHintChecked(host)
 	switch {
 	case managed:
-		fmt.Fprintf(&b, "managed-hint: version.txt PRESENT (already managed — skip)\n")
+		fmt.Fprintf(&b, "managed-hint: version.txt PRESENT (already managed - skip)\n")
 	case unknown:
-		fmt.Fprintf(&b, "managed-hint: UNKNOWN (share read denied — verify access first)\n")
+		fmt.Fprintf(&b, "managed-hint: UNKNOWN (share read denied - verify access first)\n")
 	default:
 		fmt.Fprintf(&b, "managed-hint: absent (unmanaged)\n")
 	}
 	cfg := LoadNMSConfig()
 	if elig, reason := CloneEligible(host, true, managed, cfg.Exclude, selfIPs(), controllerIPs); !elig {
 		if reason == "self" {
-			fmt.Fprintf(&b, "eligibility: skip-self\nverdict: NEVER TARGETED (this box — self-clone is refused even with --force)\n")
+			fmt.Fprintf(&b, "eligibility: skip-self\nverdict: NEVER TARGETED (this box - self-clone is refused even with --force)\n")
 		} else {
 			fmt.Fprintf(&b, "eligibility: skip-%s\nverdict: WOULD NOT CLONE (%s)\n", reason, reason)
 		}
@@ -1904,25 +2109,25 @@ func CloneDryRun(host string, controllerIPs []string) string {
 	fmt.Fprintf(&b, "eligibility: eligible\n")
 	size, sha, ok := NMSInstallerInfo()
 	if !ok {
-		fmt.Fprintf(&b, "payload: MISSING beside the agent — nothing to push\nverdict: WOULD NOT CLONE (no-payload)\n")
+		fmt.Fprintf(&b, "payload: MISSING beside the agent - nothing to push\nverdict: WOULD NOT CLONE (no-payload)\n")
 		return b.String()
 	}
 	fmt.Fprintf(&b, "payload: %d bytes sha %.12s (valid MZ)\n", size, sha)
 	tempVisible := nmsDirStat(`\\` + host + `\ADMIN$\Temp`)
-	fmt.Fprintf(&b, "target dir: %s\n", map[bool]string{true: `\\host\ADMIN$\Temp visible`, false: `\\host\ADMIN$\Temp NOT visible — copy would fail`}[tempVisible])
+	fmt.Fprintf(&b, "target dir: %s\n", map[bool]string{true: `\\host\ADMIN$\Temp visible`, false: `\\host\ADMIN$\Temp NOT visible - copy would fail`}[tempVisible])
 	fmt.Fprintf(&b, "privileges:\n%s", remotePrivSection(host, tempVisible, unknown))
 	if unknown {
-		fmt.Fprintf(&b, "verdict: LIKELY NOT (managed-state unknown — resolve share access first)\n")
+		fmt.Fprintf(&b, "verdict: LIKELY NOT (managed-state unknown - resolve share access first)\n")
 		fmt.Fprintf(&b, "override available: nms-clone %s --force --confirm YES (operator asserts unmanaged; attempt audited)\n", host)
 	} else if !tempVisible {
 		fmt.Fprintf(&b, "verdict: WOULD NOT CLONE (target dir unreachable)\n")
 	} else {
-		fmt.Fprintf(&b, "verdict: WOULD CLONE (all gates pass — run without --dry-run to deploy)\n")
+		fmt.Fprintf(&b, "verdict: WOULD CLONE (all gates pass - run without --dry-run to deploy)\n")
 	}
 	return b.String()
 }
 
-// nmsCredUser names the stored-credential account (username only — the
+// nmsCredUser names the stored-credential account (username only - the
 // secret never leaves the vault file). Empty when no cred file exists,
 // meaning SMB/WMI ride the current process context.
 func nmsCredUser() (string, bool) {
@@ -1944,7 +2149,7 @@ func remotePrivSection(host string, tempVisible, managedUnknown bool) string {
 	me := CurrentNMSPriv()
 	fmt.Fprintf(&b, "  local: %s elevated=%v integrity=%s admin=%v\n", me.User, me.Elevated, me.Integrity, me.IsAdmin)
 	if !me.Elevated {
-		b.WriteString("  WARNING: this NMS runs unelevated — local guard/restore and remote pushes will fail. Reinstall or run the task elevated.\n")
+		b.WriteString("  WARNING: this NMS runs unelevated - local guard/restore and remote pushes will fail. Reinstall or run the task elevated.\n")
 	}
 	if u, ok := nmsCredUser(); ok {
 		fmt.Fprintf(&b, "  credential source: stored vault file (account %s)\n", u)
@@ -1952,7 +2157,7 @@ func remotePrivSection(host string, tempVisible, managedUnknown bool) string {
 		b.WriteString("  credential source: current process context (no stored vault creds)\n")
 	}
 	if !tempVisible || managedUnknown {
-		b.WriteString("  remote ADMIN$ denied — check on/against " + host + ":\n")
+		b.WriteString("  remote ADMIN$ denied - check on/against " + host + ":\n")
 		b.WriteString("    - account must be in target Administrators (net localgroup administrators)\n")
 		b.WriteString("    - workgroup target: HKLM\\SYSTEM\\CCS\\Control\\Lsa\\MSV1_0 RestrictReceivingNTLMTraffic / LocalAccountTokenFilterPolicy=1,\n")
 		b.WriteString("      else remote admin logons arrive filtered (UAC remote restrictions)\n")
@@ -1994,12 +2199,12 @@ func NMSHandle(cmd, args string, controllerIPs []string) (string, error) {
 		if err := WriteSleepFlag(reason); err != nil {
 			return "", fmt.Errorf("sleep refused: %v", err)
 		}
-		return "agent asleep (" + reason + ") — monitor, heartbeat and wake path continue", nil
+		return "agent asleep (" + reason + ") - monitor, heartbeat and wake path continue", nil
 	case "agent-wake-up":
 		if err := ClearSleepFlag(); err != nil {
 			return "", fmt.Errorf("wake refused: %v", err)
 		}
-		return "agent awake — sleep flag cleared", nil
+		return "agent awake - sleep flag cleared", nil
 	case "nms-stop":
 		if !strings.EqualFold(args, "--confirm YES") && !strings.EqualFold(args, "confirm YES") && !strings.EqualFold(args, "YES") {
 			return "", fmt.Errorf("refusing to stop without explicit confirmation (usage: nms-stop --confirm YES)")
@@ -2042,7 +2247,7 @@ func NMSHandle(cmd, args string, controllerIPs []string) (string, error) {
 		if managed, unknown := ManagedHintChecked(host); managed {
 			return "", fmt.Errorf("clone refused: %s already managed", host)
 		} else if unknown && !force {
-			return "", fmt.Errorf("clone refused: %s managed-state unknown (share denied) — verify access first, or retry with --force --confirm YES", host)
+			return "", fmt.Errorf("clone refused: %s managed-state unknown (share denied) - verify access first, or retry with --force --confirm YES", host)
 		} else if unknown && !confirm {
 			return "", fmt.Errorf("clone refused: --force needs --confirm YES alongside it (usage: nms-clone <host> --force --confirm YES)")
 		}
@@ -2054,29 +2259,34 @@ func NMSHandle(cmd, args string, controllerIPs []string) (string, error) {
 			return "clone " + host + ": " + st + " (already tracked)", nil
 		}
 		if force {
-			return "FORCED clone job started for " + host + " (operator override — audited)", nil
+			return "FORCED clone job started for " + host + " (operator override - audited)", nil
 		}
 		return "clone job started for " + host, nil
 	case "nms-exec":
-		// Remote one-shot on unmanaged hosts: nms-exec <host> -- <command…>
+		// Remote one-shot on unmanaged hosts: nms-exec <host> -- <command...>
 		// [--timeout Sec] [--force --confirm YES]. Managed boxes refuse
 		// with a redirect to their own agent verbs; unknown needs force
 		// like clone (same reinstall-risk class); gates never bypassed.
 		return nmsExecVerb(args, controllerIPs)
+	case "nms-scan":
+		// Full-range deep scan, async: nms-scan <host> --confirm YES.
+		// Manual only (never sweep, never auto). Excluded/self/controller
+		// never scan; dark-and-absent hosts refuse (nothing to scan).
+		return nmsScanVerb(args, controllerIPs)
 	default:
-		return "", fmt.Errorf("unknown NMS command: %s (nms-status, nms-now, set-nms, agent-sleep, agent-wake-up, nms-stop, nms-clone, nms-exec)", cmd)
+		return "", fmt.Errorf("unknown NMS command: %s (nms-status, nms-now, set-nms, agent-sleep, agent-wake-up, nms-stop, nms-clone, nms-exec, nms-scan)", cmd)
 	}
 }
 
 // nmsExecVerb implements `nms-exec <host> [--timeout Sec] [--force
-// --confirm YES] -- <command…>`: gates identical to clone (managed
+// --confirm YES] -- <command...>`: gates identical to clone (managed
 // redirects to that box's agent, unknown needs force), then one staged
 // batch run with capped output. Flags go BEFORE the -- separator —
 // everything after it is the remote command verbatim (flags included).
 func nmsExecVerb(args string, controllerIPs []string) (string, error) {
 	parts := strings.Fields(args)
 	if len(parts) == 0 {
-		return "", fmt.Errorf("usage: nms-exec <host> [--timeout Sec] [--force --confirm YES] -- <command…> (example: nms-exec 192.168.1.5 -- hostname)")
+		return "", fmt.Errorf("usage: nms-exec <host> [--timeout Sec] [--force --confirm YES] -- <command...> (example: nms-exec 192.168.1.5 -- hostname)")
 	}
 	host := parts[0]
 	rest := parts[1:]
@@ -2113,7 +2323,7 @@ func nmsExecVerb(args string, controllerIPs []string) (string, error) {
 	}
 	command := strings.TrimSpace(strings.Join(cmdParts, " "))
 	if command == "" {
-		return "", fmt.Errorf("usage: nms-exec <host> [--timeout Sec] [--force --confirm YES] -- <command…> (example: nms-exec 192.168.1.5 --force --confirm YES -- hostname)")
+		return "", fmt.Errorf("usage: nms-exec <host> [--timeout Sec] [--force --confirm YES] -- <command...> (example: nms-exec 192.168.1.5 --force --confirm YES -- hostname)")
 	}
 	timeout := time.Minute
 	force, hasConfirmFlag, hasYes := false, false, false
@@ -2138,9 +2348,9 @@ func nmsExecVerb(args string, controllerIPs []string) (string, error) {
 		return "", fmt.Errorf("exec refused: %s unreachable (no 445/135/139/3389)", host)
 	}
 	if managed, unknown := ManagedHintChecked(host); managed {
-		return "", fmt.Errorf("exec refused: %s already managed — send commands to its own agent row, not here", host)
+		return "", fmt.Errorf("exec refused: %s already managed - send commands to its own agent row, not here", host)
 	} else if unknown && !(force && hasConfirmFlag && hasYes) {
-		return "", fmt.Errorf("exec refused: %s managed-state unknown — verify access first, or retry with --force --confirm YES", host)
+		return "", fmt.Errorf("exec refused: %s managed-state unknown - verify access first, or retry with --force --confirm YES", host)
 	}
 	cfg := LoadNMSConfig()
 	if elig, reason := CloneEligible(host, true, false, cfg.Exclude, selfIPs(), controllerIPs); !elig {
@@ -2154,13 +2364,55 @@ func nmsExecVerb(args string, controllerIPs []string) (string, error) {
 		return "(no output)", nil
 	}
 	if len(out) > 64*1024 {
-		out = out[:64*1024] + "\n…[truncated at 64KB]"
+		out = out[:64*1024] + "\n...[truncated at 64KB]"
 	}
 	return out, nil
 }
 
-func currentSweep() []string {
-	nmsSweepCacheMu.Lock()
+// nmsScanVerb implements `nms-scan <host> --confirm YES`: full TCP range,
+// async with tracked state (scan-cooldown 10min). Manual only. Refuses
+// excluded/self/controller outright, and dark-and-absent hosts (neither
+// Tier-1 answers nor ARP presence - nothing to scan).
+func nmsScanVerb(args string, controllerIPs []string) (string, error) {
+	parts := strings.Fields(args)
+	if len(parts) == 0 {
+		return "", fmt.Errorf("usage: nms-scan <host> --confirm YES (example: nms-scan 192.168.1.5 --confirm YES)")
+	}
+	host := parts[0]
+	hasConfirmFlag, hasYes := false, false
+	for _, p := range parts[1:] {
+		switch {
+		case strings.EqualFold(p, "--confirm"):
+			hasConfirmFlag = true
+		case strings.EqualFold(p, "YES"):
+			hasYes = true
+		}
+	}
+	if !(hasConfirmFlag && hasYes) {
+		return "", fmt.Errorf("scan refused: full-range scans need --confirm YES (usage: nms-scan <host> --confirm YES)")
+	}
+	cfg := LoadNMSConfig()
+	if elig, reason := CloneEligible(host, true, false, cfg.Exclude, selfIPs(), controllerIPs); !elig {
+		return "", fmt.Errorf("scan refused: %s", reason)
+	}
+	present := TCPReachable(host)
+	if !present {
+		arpSet := map[string]bool{}
+		for _, h := range arpSeedHosts() {
+			arpSet[strings.TrimSpace(h)] = true
+		}
+		if !arpSet[host] {
+			return "", fmt.Errorf("scan refused: %s dark on Tier-1 and absent from ARP (nothing to scan)", host)
+		}
+	}
+	st, started := startScanJob(host)
+	if !started {
+		return "scan " + host + ": " + st + " (already tracked)", nil
+	}
+	return "scan started for " + host + " (full range, async - re-query for the terminal state)", nil
+}
+
+func currentSweep() []string {	nmsSweepCacheMu.Lock()
 	defer nmsSweepCacheMu.Unlock()
 	return append([]string{}, nmsSweepCache...)
 }

@@ -185,4 +185,5 @@ var Known = map[string]string{
 	"nms-stop":                 "NMS: stop the monitor (send to the hostname/nms row) - nms-stop --confirm YES",
 	"nms-clone":                "NMS: one-shot clone to a host (send to the hostname/nms row) - nms-clone <host> [--dry-run validates without writing; --force --confirm YES overrides unknown-state refusal]",
 	"nms-exec":                 "NMS: one-shot remote command on an unmanaged host (send to the hostname/nms row) - nms-exec <host> [--timeout Sec] [--force --confirm YES] -- <command…>",
+	"nms-scan":                 "NMS: full-range deep port scan, async (send to the hostname/nms row) - nms-scan <host> --confirm YES",
 }
