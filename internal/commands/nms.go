@@ -1920,7 +1920,15 @@ func StepNMS(send func(reportJSON string), controllerIPs []string) error {
 			case started:
 				r.CloneDetail = "auto-forced job started (operator opted in)"
 			default:
-				r.CloneDetail = "auto-forced job tracked"
+				// Tracked job: surface its real terminal word + reason
+				// (e.g. "copy-failed: bad network path (SMB disabled on
+				// target)"), never a perpetual "job tracked" that hides
+				// the one line the operator needs.
+				if jst, jdetail, ok := cloneJobLookup(r.Host); ok && jdetail != "" {
+					r.CloneState, r.CloneDetail = jst, jdetail
+				} else {
+					r.CloneDetail = "auto-forced job tracked"
+				}
 			}
 			continue
 		}
