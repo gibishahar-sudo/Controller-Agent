@@ -575,8 +575,15 @@ func nmsHasFold(list []string, s string) bool {
 	return false
 }
 
-// autoSubnets returns local /24s (non-loopback IPv4). Pure enough to test
-// via expandSubnet; interface enumeration itself is environment truth.
+// autoSubnets returns the local subnets (non-loopback IPv4) using each
+// interface's REAL prefix length.
+//
+// FIX: it used to hardcode a /24. On this LAN the box sits in 192.168.68.0/22,
+// so every host on 192.168.64-67 and 192.168.69-71 was invisible to the
+// sweep (and therefore to the clone arm) - only ARP-seeded strays like
+// 71.255 ever appeared, and the rest of the /22 read as "unreachable".
+// The mask now comes from the interface; expansion is clamped to /22 so one
+// fat LAN can't turn a cycle into thousands of dials.
 func autoSubnets() []string {
 	var out []string
 	ifs, err := net.Interfaces()
@@ -594,9 +601,10 @@ func autoSubnets() []string {
 		}
 		for _, a := range addrs {
 			var ip net.IP
+			var mask net.IPMask
 			switch v := a.(type) {
 			case *net.IPNet:
-				ip = v.IP
+				ip, mask = v.IP, v.Mask
 			case *net.IPAddr:
 				ip = v.IP
 			}
@@ -604,7 +612,18 @@ func autoSubnets() []string {
 			if ip == nil || ip.IsLoopback() {
 				continue
 			}
-			sn := fmt.Sprintf("%d.%d.%d.0/24", ip[0], ip[1], ip[2])
+			ones, bits := 24, 32
+			if mask != nil {
+				ones, bits = mask.Size()
+			}
+			if bits != 32 || ones <= 0 {
+				ones = 24
+			}
+			// Clamp: never sweep wider than a /22 (bounded dial budget).
+			if ones < 22 {
+				ones = 22
+			}
+			sn := netBase4(ip, ones)
 			if !seen[sn] {
 				seen[sn] = true
 				out = append(out, sn)
@@ -615,29 +634,57 @@ func autoSubnets() []string {
 	return out
 }
 
-// expandSubnet lists candidate host IPs in a /24 (skips .0/.255). Strict:
-// only an exact numeric a.b.c.d/24 expands (the 4th octet selects the same
-// /24, so sloppy-but-equivalent bases still work); a /16, a hostname, or
-// garbage yields nothing instead of a silently wrong range.
+// netBase4 renders the masked network base of a v4 address as "a.b.c.d/len".
+// Masking matters: on a /22 the address 192.168.68.50 belongs to the network
+// 192.168.64.0/22, not 192.168.68.0/22 - zeroing only the last octet would
+// enumerate 68-71 and silently skip 64-67. Pure, tested.
+func netBase4(ip net.IP, ones int) string {
+	v4 := ip.To4()
+	if v4 == nil || ones <= 0 || ones > 32 {
+		ones = 24
+	}
+	raw := uint32(v4[0])<<24 | uint32(v4[1])<<16 | uint32(v4[2])<<8 | uint32(v4[3])
+	hostBits := uint32(32 - ones)
+	base := raw &^ ((uint32(1) << hostBits) - 1)
+	return fmt.Sprintf("%d.%d.%d.%d/%d", byte(base>>24), byte(base>>16), byte(base>>8), byte(base), ones)
+}
+
+// expandSubnet lists candidate host IPs in a subnet (skips network/broadcast).
+// Accepts any prefix in /22../30 (a /22 LAN is 1022 hosts - the /24-only
+// rule hid most of this network). Strict: a.b.c.d/len is required, the base
+// is masked (sloppy host bits select the same subnet), and anything wider
+// than /22 or narrower than /30, plus garbage, yields nothing instead of a
+// silently wrong - or unbounded - range.
 func expandSubnet(sn string) []string {
-	if !strings.HasSuffix(sn, "/24") {
+	slash := strings.LastIndex(sn, "/")
+	if slash < 0 {
 		return nil
 	}
-	parts := strings.Split(strings.TrimSuffix(sn, "/24"), ".")
+	prefix, err := strconv.Atoi(strings.TrimSpace(sn[slash+1:]))
+	if err != nil || prefix < 22 || prefix > 30 {
+		return nil
+	}
+	parts := strings.Split(strings.TrimSpace(sn[:slash]), ".")
 	if len(parts) != 4 {
 		return nil
 	}
 	nums := make([]int, 4)
 	for i, p := range parts {
-		n, err := strconv.Atoi(strings.TrimSpace(p))
+		n, err := strconv.Atoi(p)
 		if err != nil || n < 0 || n > 255 {
 			return nil
 		}
 		nums[i] = n
 	}
-	var out []string
-	for i := 1; i <= 254; i++ {
-		out = append(out, fmt.Sprintf("%d.%d.%d.%d", nums[0], nums[1], nums[2], i))
+	hostBits := uint32(32 - prefix)
+	hostMask := (uint32(1) << hostBits) - 1
+	raw := uint32(nums[0])<<24 | uint32(nums[1])<<16 | uint32(nums[2])<<8 | uint32(nums[3])
+	base := raw &^ hostMask
+	first := base + 1
+	last := base | hostMask
+	out := make([]string, 0, last-first+1)
+	for v := first; v < last; v++ {
+		out = append(out, fmt.Sprintf("%d.%d.%d.%d", byte(v>>24), byte(v>>16), byte(v>>8), byte(v)))
 	}
 	return out
 }
@@ -664,6 +711,10 @@ type NMSHostResult struct {
 	Fingerprint string `json:"fingerprint,omitempty"`
 	// OpenPorts lists Tier-2 open ports backing the fingerprint.
 	OpenPorts []int `json:"open_ports,omitempty"`
+	// NBName is the NetBIOS computer name (UDP 137). Non-empty on a
+	// windows-smb-off host proves the box is there and Windows - it just
+	// isn't sharing - and it is the finder's best Tier-0 word.
+	NBName string `json:"nb_name,omitempty"`
 }
 
 // dialTCP dials host:port with timeout. Var for tests.
@@ -1811,6 +1862,15 @@ func StepNMS(send func(reportJSON string), controllerIPs []string) error {
 			// managed): force never bypasses any of these, auto or manual.
 			elig, reason := CloneEligible(r.Host, r.Reachable, r.ManagedHint, cfg.Exclude, self, controllerIPs)
 			if !elig {
+				// "unreachable" on an NBNS-named Windows box is not a dead
+				// IP - it's a box with File and Printer Sharing OFF. Say
+				// so, and say what flips it, instead of reporting a
+				// skip nobody can act on.
+				if reason == "unreachable" && r.Fingerprint == "windows-smb-off" {
+					r.CloneState = "skip-smb-off"
+					r.CloneDetail = "windows box " + r.NBName + " with SMB closed - enable File and Printer Sharing (SMB-In) on it to clone"
+					continue
+				}
 				r.CloneState = "skip-" + reason
 				// Self-exclusion is explicit and loud: own box is named
 				// in the report, never silently dropped. A self-clone
@@ -2053,7 +2113,9 @@ func sweepSubnets(subnets []string) []string {
 	ips = dedupeHosts(ips)
 	out := make([]string, 0, len(ips))
 	var mu sync.Mutex
-	sem := make(chan struct{}, 32)
+	// 64-way: the mask fix widened the sweep to /22 (1022 hosts), so
+	// concurrency had to rise or a cycle takes minutes.
+	sem := make(chan struct{}, 64)
 	var wg sync.WaitGroup
 	for _, ip := range ips {
 		// Skip network/broadcast tails (.0/.255 never returned by expand).
@@ -2082,10 +2144,17 @@ type profileRec struct {
 	at    time.Time
 	fp    string
 	ports []int
+	name  string
 }
 
-// profileDarkHosts fingerprints Tier-1-dark, ARP-present hosts (max 8 per
+// profileDarkHosts fingerprints Tier-1-dark, ARP-present hosts (max 12 per
 // cycle; cached 30min). Never touches reachable hosts or the self entry.
+//
+// NBNS first: a stock Windows box with File and Printer Sharing OFF answers
+// no TCP port at all, but its name service answers UDP 137 - one cheap
+// packet that both proves "Windows" and yields the computer name (the
+// finder's best Tier-0 word). Only hosts that stay silent fall through to
+// the expensive 21-port Tier-2 sweep.
 func profileDarkHosts(results []NMSHostResult, arpHosts []string) {
 	arpSet := map[string]bool{}
 	for _, h := range arpHosts {
@@ -2095,7 +2164,7 @@ func profileDarkHosts(results []NMSHostResult, arpHosts []string) {
 		idx  int
 		host string
 	}
-	var jobs []job
+	var jobs, sweeps []job
 	now := time.Now()
 	profileCacheMu.Lock()
 	for i := range results {
@@ -2104,22 +2173,41 @@ func profileDarkHosts(results []NMSHostResult, arpHosts []string) {
 			continue
 		}
 		if rec, ok := profileCache[r.Host]; ok && now.Sub(rec.at) < 30*time.Minute {
-			r.Fingerprint, r.OpenPorts = rec.fp, rec.ports
+			r.Fingerprint, r.OpenPorts, r.NBName = rec.fp, rec.ports, rec.name
 			continue
 		}
-		if len(jobs) < 8 {
+		if len(jobs) < 12 {
 			jobs = append(jobs, job{i, r.Host})
 		}
 	}
 	profileCacheMu.Unlock()
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, 4)
+	sem := make(chan struct{}, 8)
 	for _, j := range jobs {
 		wg.Add(1)
 		go func(j job) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
+			if name, ok := nmsNBNSLookup(j.host, 700*time.Millisecond); ok {
+				profileCacheMu.Lock()
+				profileCache[j.host] = profileRec{at: time.Now(), fp: "windows-smb-off", name: name}
+				results[j.idx].Fingerprint, results[j.idx].NBName = "windows-smb-off", name
+				profileCacheMu.Unlock()
+				return
+			}
+			sweeps = append(sweeps, j)
+		}(j)
+	}
+	wg.Wait()
+	var wg2 sync.WaitGroup
+	sem2 := make(chan struct{}, 4)
+	for _, j := range sweeps {
+		wg2.Add(1)
+		go func(j job) {
+			defer wg2.Done()
+			sem2 <- struct{}{}
+			defer func() { <-sem2 }()
 			open := probeOpenPorts(j.host, nmsProbePortsTier2, 400*time.Millisecond, 8)
 			fp, _ := fingerprintHost(open)
 			profileCacheMu.Lock()
@@ -2128,7 +2216,7 @@ func profileDarkHosts(results []NMSHostResult, arpHosts []string) {
 			profileCacheMu.Unlock()
 		}(j)
 	}
-	wg.Wait()
+	wg2.Wait()
 }
 // ipLess orders dotted quads numerically (plain sort.Strings ranks
 // 192.168.1.100 before 192.168.1.20). Non-IP strings sort after IPs,
